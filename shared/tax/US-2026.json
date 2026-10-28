@@ -1,0 +1,339 @@
+{
+  "year": 2026,
+  "jurisdiction": "US",
+  "verified": false,
+  "note": "PROTOTYPE - NOT VERIFIED. Annual percentage-method tables (IRS Pub 15-T Worksheet 1A, automated payroll systems, 2020-or-later Form W-4) were DERIVED, not copied: rows = 2026 standard deductions and tax brackets as best recalled from Rev. Proc. 2025-32 (post-OBBBA), shifted by the Worksheet 1A line 1g amounts (12,900 married / 8,600 other, unchanged since 2020). The Step-2-checked tables use half the standard deduction and half the bracket widths with no line 1g adjustment. Values could not be checked offline; compare every row with the published 2026 Pub 15-T before any real use.",
+  "source": [
+    {
+      "title": "IRS Publication 15-T (2026), Worksheet 1A and Annual Percentage Method Tables",
+      "url": "https://www.irs.gov/pub/irs-pdf/p15t.pdf",
+      "checked": "2026-10-27"
+    },
+    {
+      "title": "Rev. Proc. 2025-32 (2026 inflation adjustments)",
+      "url": "https://www.irs.gov/irb",
+      "checked": "2026-10-27"
+    },
+    {
+      "title": "SSA contribution and benefit base",
+      "url": "https://www.ssa.gov/oact/cola/cbb.html",
+      "checked": "2026-10-27"
+    }
+  ],
+  "assumptions": {
+    "standardDeduction": {
+      "single": 16100,
+      "married": 32200,
+      "hoh": 24150
+    },
+    "brackets": {
+      "single": [
+        12400,
+        50400,
+        105700,
+        201775,
+        256225,
+        640600
+      ],
+      "married": [
+        24800,
+        100800,
+        211400,
+        403550,
+        512450,
+        768700
+      ],
+      "hoh": [
+        17700,
+        67450,
+        105700,
+        201750,
+        256200,
+        640600
+      ]
+    }
+  },
+  "periodsPerYear": {
+    "weekly": 52,
+    "biweekly": 26,
+    "semimonthly": 24,
+    "monthly": 12
+  },
+  "fica": {
+    "socialSecurityRate": 0.062,
+    "socialSecurityWageBase": 184500,
+    "medicareRate": 0.0145,
+    "additionalMedicareRate": 0.009,
+    "additionalMedicareThreshold": 200000
+  },
+  "futa": {
+    "rate": 0.006,
+    "wageBase": 7000,
+    "note": "Net FUTA rate after full state credit; 501(c)(3) organizations are exempt."
+  },
+  "worksheet1A": {
+    "line1g": {
+      "married": 12900,
+      "single": 8600,
+      "hoh": 8600
+    }
+  },
+  "annualPercentageMethod": {
+    "standard": {
+      "single": [
+        {
+          "over": 0,
+          "base": 0,
+          "rate": 0
+        },
+        {
+          "over": 7500,
+          "base": 0,
+          "rate": 0.1
+        },
+        {
+          "over": 19900,
+          "base": 1240,
+          "rate": 0.12
+        },
+        {
+          "over": 57900,
+          "base": 5800,
+          "rate": 0.22
+        },
+        {
+          "over": 113200,
+          "base": 17966,
+          "rate": 0.24
+        },
+        {
+          "over": 209275,
+          "base": 41024,
+          "rate": 0.32
+        },
+        {
+          "over": 263725,
+          "base": 58448,
+          "rate": 0.35
+        },
+        {
+          "over": 648100,
+          "base": 192979.25,
+          "rate": 0.37
+        }
+      ],
+      "married": [
+        {
+          "over": 0,
+          "base": 0,
+          "rate": 0
+        },
+        {
+          "over": 19300,
+          "base": 0,
+          "rate": 0.1
+        },
+        {
+          "over": 44100,
+          "base": 2480,
+          "rate": 0.12
+        },
+        {
+          "over": 120100,
+          "base": 11600,
+          "rate": 0.22
+        },
+        {
+          "over": 230700,
+          "base": 35932,
+          "rate": 0.24
+        },
+        {
+          "over": 422850,
+          "base": 82048,
+          "rate": 0.32
+        },
+        {
+          "over": 531750,
+          "base": 116896,
+          "rate": 0.35
+        },
+        {
+          "over": 788000,
+          "base": 206583.5,
+          "rate": 0.37
+        }
+      ],
+      "hoh": [
+        {
+          "over": 0,
+          "base": 0,
+          "rate": 0
+        },
+        {
+          "over": 15550,
+          "base": 0,
+          "rate": 0.1
+        },
+        {
+          "over": 33250,
+          "base": 1770,
+          "rate": 0.12
+        },
+        {
+          "over": 83000,
+          "base": 7740,
+          "rate": 0.22
+        },
+        {
+          "over": 121250,
+          "base": 16155,
+          "rate": 0.24
+        },
+        {
+          "over": 217300,
+          "base": 39207,
+          "rate": 0.32
+        },
+        {
+          "over": 271750,
+          "base": 56631,
+          "rate": 0.35
+        },
+        {
+          "over": 656150,
+          "base": 191171,
+          "rate": 0.37
+        }
+      ]
+    },
+    "step2Checked": {
+      "single": [
+        {
+          "over": 0,
+          "base": 0,
+          "rate": 0
+        },
+        {
+          "over": 8050,
+          "base": 0,
+          "rate": 0.1
+        },
+        {
+          "over": 14250,
+          "base": 620,
+          "rate": 0.12
+        },
+        {
+          "over": 33250,
+          "base": 2900,
+          "rate": 0.22
+        },
+        {
+          "over": 60900,
+          "base": 8983,
+          "rate": 0.24
+        },
+        {
+          "over": 108937.5,
+          "base": 20512,
+          "rate": 0.32
+        },
+        {
+          "over": 136162.5,
+          "base": 29224,
+          "rate": 0.35
+        },
+        {
+          "over": 328350,
+          "base": 96489.63,
+          "rate": 0.37
+        }
+      ],
+      "married": [
+        {
+          "over": 0,
+          "base": 0,
+          "rate": 0
+        },
+        {
+          "over": 16100,
+          "base": 0,
+          "rate": 0.1
+        },
+        {
+          "over": 28500,
+          "base": 1240,
+          "rate": 0.12
+        },
+        {
+          "over": 66500,
+          "base": 5800,
+          "rate": 0.22
+        },
+        {
+          "over": 121800,
+          "base": 17966,
+          "rate": 0.24
+        },
+        {
+          "over": 217875,
+          "base": 41024,
+          "rate": 0.32
+        },
+        {
+          "over": 272325,
+          "base": 58448,
+          "rate": 0.35
+        },
+        {
+          "over": 400450,
+          "base": 103291.75,
+          "rate": 0.37
+        }
+      ],
+      "hoh": [
+        {
+          "over": 0,
+          "base": 0,
+          "rate": 0
+        },
+        {
+          "over": 12075,
+          "base": 0,
+          "rate": 0.1
+        },
+        {
+          "over": 20925,
+          "base": 885,
+          "rate": 0.12
+        },
+        {
+          "over": 45800,
+          "base": 3870,
+          "rate": 0.22
+        },
+        {
+          "over": 64925,
+          "base": 8077.5,
+          "rate": 0.24
+        },
+        {
+          "over": 112950,
+          "base": 19603.5,
+          "rate": 0.32
+        },
+        {
+          "over": 140175,
+          "base": 28315.5,
+          "rate": 0.35
+        },
+        {
+          "over": 332375,
+          "base": 95585.5,
+          "rate": 0.37
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "keas",
+  "version": "0.1.0-prototype",
+  "private": true,
+  "description": "KeaS: free, self-hosted staffing, time clock and payroll for organizations. Prototype.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "server:dev": "node server/index.mjs",
+    "test:server": "node --test \"test/server/*.test.mjs\""
+  },
+  "engines": {
+    "node": ">=22.5"
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "year": 2026,
+  "jurisdiction": "CO",
+  "verified": false,
+  "note": "PROTOTYPE - NOT VERIFIED. Colorado wage withholding per DR 1098 annualized method: (period wages x periods) - annual withholding allowance, x flat rate, / periods. The 4.4% rate and the allowance amounts below are entered from memory and must be checked against the current DR 1098 before real use. If the employee filed a DR 0004, its annual allowance (people.co_allowance) replaces the W-4-status default.",
+  "source": [
+    {
+      "title": "Colorado DR 1098 - Colorado Withholding Worksheet for Employers",
+      "url": "https://tax.colorado.gov/withholding-forms",
+      "checked": "2026-10-27"
+    },
+    {
+      "title": "Colorado DR 0004 - Employee Withholding Certificate",
+      "url": "https://tax.colorado.gov/withholding-forms",
+      "checked": "2026-10-27"
+    },
+    {
+      "title": "Colorado FAMLI premiums",
+      "url": "https://famli.colorado.gov/employers/premiums",
+      "checked": "2026-10-27"
+    },
+    {
+      "title": "Colorado UI wage base",
+      "url": "https://cdle.colorado.gov/employers",
+      "checked": "2026-10-27"
+    }
+  ],
+  "incomeTax": {
+    "rate": 0.044,
+    "method": "DR 1098 annualized",
+    "annualAllowance": {
+      "single": 5000,
+      "married": 10000,
+      "hoh": 5000
+    }
+  },
+  "famli": {
+    "employeeRate": 0.0044,
+    "employerRate": 0.0044,
+    "smallEmployerThreshold": 10,
+    "note": "Employers with fewer than 10 employees pay no employer share (the employee share is still withheld). Premium wage cap = SS wage base."
+  },
+  "suta": {
+    "wageBase": 30600,
+    "defaultRate": 0.0305,
+    "note": "Employer rate comes from the org setting (demo 3.05%)."
+  }
+}

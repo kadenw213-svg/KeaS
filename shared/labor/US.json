@@ -1,0 +1,40 @@
+{
+  "jurisdiction": "US",
+  "name": "United States (federal FLSA baseline)",
+  "overtime": { "weeklyHours": 40, "dailyHours": null, "consecutiveHours": null, "multiplier": 1.5 },
+  "meal": null,
+  "rest": null,
+  "minors": {
+    "minimumWorkAge": 14,
+    "summer": { "start": "06-01", "end": "labor-day" },
+    "schoolDays": "Mon-Fri outside summer, unless the org supplies a school calendar",
+    "ages": [
+      {
+        "min": 14, "max": 15,
+        "schoolDayMaxHours": 3, "schoolWeekMaxHours": 18,
+        "nonSchoolDayMaxHours": 8, "nonSchoolWeekMaxHours": 40,
+        "earliest": "07:00", "latest": "19:00", "latestSummer": "21:00",
+        "restrictedPositions": [
+          { "match": "lifeguard", "minAge": 15, "note": "29 CFR 570.34(l): 15-year-olds may work as lifeguards at traditional swimming pools when certified; 14-year-olds may not." }
+        ]
+      },
+      {
+        "min": 16, "max": 17,
+        "schoolDayMaxHours": null, "schoolWeekMaxHours": null,
+        "nonSchoolDayMaxHours": null, "nonSchoolWeekMaxHours": null,
+        "earliest": null, "latest": null, "latestSummer": null,
+        "restrictedPositions": []
+      }
+    ]
+  },
+  "minimumWage": { "standard": 7.25, "tipped": 2.13, "youthDiscountPct": null, "localOverrides": [] },
+  "sickLeave": null,
+  "notes": ["Federal floor only. States and cities may be stricter; mergeRules keeps the strictest value."],
+  "source": [
+    { "title": "29 U.S.C. 207 - Maximum hours (FLSA overtime)", "url": "https://www.law.cornell.edu/uscode/text/29/207", "checked": "2026-10-27" },
+    { "title": "29 CFR 570.35 - Hours of work for 14- and 15-year-olds", "url": "https://www.ecfr.gov/current/title-29/subtitle-B/chapter-V/subchapter-A/part-570/subpart-C/section-570.35", "checked": "2026-10-27" },
+    { "title": "29 CFR 570.34(l) - Lifeguard work by 15-year-olds", "url": "https://www.ecfr.gov/current/title-29/subtitle-B/chapter-V/subchapter-A/part-570/subpart-C/section-570.34", "checked": "2026-10-27" },
+    { "title": "US DOL - Minimum wage", "url": "https://www.dol.gov/agencies/whd/minimum-wage", "checked": "2026-10-27" }
+  ],
+  "verifiedFor": null
+}
