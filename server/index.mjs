@@ -3,6 +3,7 @@ import http from 'node:http';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { serveStatic, securityHeaders, DEFAULT_WEB_DIR } from './static.mjs';
 import { fileURLToPath } from 'node:url';
 import { openDb, DEFAULT_DB, rowToPerson, rowToOrg, rowToShift, rowToPosition, rowToCertType, rowToPunch, rowToRequest, rowToSwap } from './db.mjs';
 import { seed } from './seed.mjs';
@@ -15,6 +16,7 @@ export const VERSION = '0.1.0-prototype';
 const HOST = '127.0.0.1';
 const MAX_BODY = 1024 * 1024;
 const SESSION_HOURS = 12;
+export const COOKIE = 'keas_session';
 const SHARED = join(dirname(fileURLToPath(import.meta.url)), '..', 'shared');
 const readJson = (p) => JSON.parse(readFileSync(p, 'utf8'));
 
@@ -32,8 +34,26 @@ const V = {
   obj(v) { if (v == null) return {}; if (typeof v !== 'object' || Array.isArray(v)) bad('body must be a JSON object'); return v; },
 };
 
+// ---------- cookies & CSRF ----------
+const sessionCookie = (token, maxAge, secure) => `${COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}${secure ? '; Secure' : ''}`;
+function readCookie(header, name) {
+  for (const part of String(header || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === name) { const v = part.slice(i + 1).trim(); return /^[0-9a-f]{64}$/.test(v) ? v : null; }
+  }
+  return null;
+}
+/** True unless the browser tells us the request came from another site. Non-browser clients send neither header. */
+function sameOrigin(req, secure) {
+  const site = req.headers['sec-fetch-site'];
+  if (site && site !== 'same-origin' && site !== 'none') return false;
+  const origin = req.headers.origin;
+  if (origin == null) return true;
+  return origin === `${secure ? 'https' : 'http'}://${req.headers.host}`;
+}
+
 // ---------- server ----------
-export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, log = true, now = () => Date.now() } = {}) {
+export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = process.env.KEAS_WEB_DIR || DEFAULT_WEB_DIR, log = true, now = () => Date.now() } = {}) {
   const h = openDb(dbFile);
   if (h.isEmpty()) seed(h, { now: now() });
   const us = readJson(join(SHARED, 'labor', 'US.json'));
@@ -162,7 +182,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, log = tru
 
   route('GET', '/v1/auth/demo-users', () => h.all(`SELECT * FROM people ORDER BY id`).map(rowToPerson).map((p) => ({ id: p.id, name: p.name, roles: p.roles, positions: p.positions, status: p.status })), { auth: false });
 
-  route('POST', '/v1/auth/demo-login', ({ body }) => {
+  route('POST', '/v1/auth/demo-login', ({ body, secure }) => {
     const personId = V.id(body.personId, 'personId');
     const row = h.get('SELECT * FROM people WHERE id = ?', personId);
     if (!row) throw new HttpError(404, 'person not found');
@@ -171,10 +191,14 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, log = tru
     const expiresAt = iso(now() + SESSION_HOURS * 3600000);
     h.run('INSERT INTO sessions (token_hash,person_id,created_at,expires_at) VALUES (?,?,?,?)', createHash('sha256').update(token).digest('hex'), p.id, iso(now()), expiresAt);
     audit(p.orgId, p.id, 'login', p.id, { demo: true });
-    return { token, expiresAt, person: publicPerson(p, p, loadOrg(p.orgId)) };
+    return { token, expiresAt, person: publicPerson(p, p, loadOrg(p.orgId)), cookies: [sessionCookie(token, SESSION_HOURS * 3600, secure)] };
   }, { auth: false });
 
-  route('POST', '/v1/auth/logout', ({ token }) => { h.run('DELETE FROM sessions WHERE token_hash = ?', createHash('sha256').update(token).digest('hex')); return { ok: true }; });
+  // Logout always clears the cookie, even when the session has already expired.
+  route('POST', '/v1/auth/logout', ({ token, secure }) => {
+    if (token) h.run('DELETE FROM sessions WHERE token_hash = ?', createHash('sha256').update(token).digest('hex'));
+    return { ok: true, cookies: [sessionCookie('', 0, secure)] };
+  }, { auth: false });
 
   route('GET', '/v1/me', ({ me, org }) => ({ person: publicPerson(me, me, org), certs: certsOf(me.id), org: { id: org.id, name: org.name, state: org.state, tz: org.tz, lateThresholdMin: org.lateThresholdMin, workweekStart: org.workweekStart }, period: { current: currentPeriod(org), lastCompleted: lastCompleted(org) } }));
 
@@ -475,7 +499,14 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, log = tru
   async function handle(req, res) {
     const t0 = Date.now();
     let status = 200, payload;
+    let cookies = [];
     const url = new URL(req.url, 'http://localhost');
+    const secure = !!req.socket.encrypted || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+    if (url.pathname !== '/v1' && !url.pathname.startsWith('/v1/')) {
+      serveStatic(req, res, webDir);
+      if (log) console.log(`${new Date().toISOString()} ${req.method} ${url.pathname} ${res.statusCode} ${Date.now() - t0}ms`);
+      return;
+    }
     try {
       const r = routes.find((x) => x.method === req.method && x.re.test(url.pathname));
       if (!r) throw new HttpError(routes.some((x) => x.re.test(url.pathname)) ? 405 : 404, 'not found');
@@ -486,24 +517,40 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, log = tru
         if (raw.trim()) { try { body = JSON.parse(raw); } catch { bad('invalid JSON'); } }
         body = V.obj(body);
       }
-      const ctx = { params, body, query: Object.fromEntries(url.searchParams) };
+      const ctx = { params, body, query: Object.fromEntries(url.searchParams), secure };
+      // Credentials: a bearer header (apps, scripts) or the web app's HttpOnly cookie.
+      const auth = req.headers.authorization;
+      const bearer = auth ? /^Bearer ([0-9a-f]{64})$/.exec(auth)?.[1] ?? null : null;
+      if (auth && !bearer) throw new HttpError(401, 'missing or malformed bearer token');
+      const cookieToken = bearer ? null : readCookie(req.headers.cookie, COOKIE);
+      const viaCookie = !bearer && !!cookieToken;
+      // CSRF: anything a browser could send cross-site must prove it came from our own page.
+      if (req.method !== 'GET' && req.method !== 'HEAD' && !bearer) {
+        if (!sameOrigin(req, secure)) throw new HttpError(403, 'cross-site request refused');
+        if (viaCookie && req.headers['x-keas'] !== '1') throw new HttpError(403, 'missing X-KeaS header');
+      }
+      ctx.token = bearer || cookieToken;
       if (r.auth) {
-        const m2 = /^Bearer ([0-9a-f]{64})$/.exec(req.headers.authorization || '');
-        if (!m2) throw new HttpError(401, 'missing or malformed bearer token');
-        const sess = h.get('SELECT * FROM sessions WHERE token_hash = ?', createHash('sha256').update(m2[1]).digest('hex'));
-        if (!sess || toMs(sess.expires_at) <= now()) throw new HttpError(401, 'session expired or invalid');
+        if (!ctx.token) throw new HttpError(401, 'missing or malformed bearer token');
+        const sess = h.get('SELECT * FROM sessions WHERE token_hash = ?', createHash('sha256').update(ctx.token).digest('hex'));
+        if (!sess || toMs(sess.expires_at) <= now()) {
+          if (viaCookie) cookies = [sessionCookie('', 0, secure)];
+          throw new HttpError(401, 'session expired or invalid');
+        }
         ctx.me = rowToPerson(h.get('SELECT * FROM people WHERE id = ?', sess.person_id));
         ctx.org = loadOrg(ctx.me.orgId);
-        ctx.token = m2[1];
       }
-      const out = await r.handler(ctx);
+      let out = await r.handler(ctx);
+      if (out && Array.isArray(out.cookies)) { cookies = out.cookies; const { cookies: _c, ...rest } = out; out = rest; }
       if (out && typeof out.status === 'number' && 'body' in out) { status = out.status; payload = out.body; } else payload = out;
     } catch (e) {
       if (e instanceof HttpError) { status = e.status; payload = { error: e.message, ...(e.extra || {}) }; }
       else { status = 500; payload = { error: 'internal error' }; console.error(e); }
     }
     const text = JSON.stringify(payload ?? {});
-    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-kea-prototype': '1' });
+    const headers = { ...securityHeaders(), 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-kea-prototype': '1' };
+    if (cookies.length) headers['set-cookie'] = cookies;
+    res.writeHead(status, headers);
     res.end(text);
     if (log) console.log(`${new Date().toISOString()} ${req.method} ${url.pathname} ${status} ${Date.now() - t0}ms`);
   }

@@ -22,6 +22,11 @@ No dependencies: `node:http`, `node:sqlite`, `node:test` (Node 24).
 
 `POST /v1/auth/demo-login {personId}` → `{token, expiresAt, person}`. Send `Authorization: Bearer <token>` on every other call. Tokens are 32 random bytes (hex), stored as sha256, valid 12 h. Roles: `member`, `manager`, `payroll`, `owner` (owner passes every role check). Errors are `{error, ...}` with 400/401/403/404/409/413.
 
+**Web app (cookie session).** `demo-login` also sets `keas_session=<token>; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200` (plus `Secure` over https / `X-Forwarded-Proto: https`). Auth accepts the bearer header *or* that cookie. `POST /v1/auth/logout` deletes the session and clears the cookie (works even after expiry). CSRF: a cookie-authenticated POST must send `X-KeaS: 1`; any non-bearer POST (including demo-login) with a cross-site `Origin` or `Sec-Fetch-Site` is refused with 403. Bearer clients are unaffected.
+
+**Static files.** Everything outside `/v1` is the built web app from `web/dist` (`KEAS_WEB_DIR` overrides): index.html fallback for extension-less client routes, strict CSP on HTML/SVG, `nosniff`, `no-referrer`, `X-Frame-Options: DENY`, `/assets/*` cached immutable, index.html / sw.js / manifest `no-cache`. Paths with `..`, `\`, NUL or anything resolving outside the folder are 404. If the app isn't built, pages return 503 with a hint to run `npm run web:build`.
+
+
 ## Endpoints (all JSON, under /v1)
 
 | Method | Path | Who | Notes |

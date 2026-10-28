@@ -1,0 +1,6 @@
+<!-- PLACEHOLDER app icon. The real KeaS logo is being designed separately: replace this one file
+     (it is the only icon the manifest, index.html and the app reference). -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="112" fill="#131314"/>
+  <text x="256" y="256" dy="0.35em" text-anchor="middle" font-family="Inter, 'Segoe UI', system-ui, -apple-system, sans-serif" font-size="320" font-weight="600" fill="#a8c7fa">S</text>
+</svg>

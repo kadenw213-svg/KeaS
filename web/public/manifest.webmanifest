@@ -1,0 +1,15 @@
+{
+  "name": "KeaS",
+  "short_name": "KeaS",
+  "description": "Schedule, time clock and timecards for your workplace.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "theme_color": "#131314",
+  "background_color": "#131314",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+  ]
+}

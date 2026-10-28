@@ -6,10 +6,25 @@
   "type": "module",
   "license": "MIT",
   "scripts": {
+    "dev": "node scripts/dev.mjs",
     "server:dev": "node server/index.mjs",
+    "web:dev": "vite web",
+    "web:build": "vite build web",
+    "typecheck": "tsc -p web",
     "test:server": "node --test \"test/server/*.test.mjs\""
   },
   "engines": {
     "node": ">=22.5"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "lucide-react": "^1.63.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.5",
+    "zustand": "^5.0.16"
   }
 }
