@@ -1,0 +1,730 @@
+// Kea Hub: accounts, classes, invites, class calendar, study sets and leaderboards.
+//
+// Two listeners, both bound to 127.0.0.1:
+//   - the public API (port 4860). The tunnel (Tailscale Funnel or Cloudflare Tunnel) forwards the internet to this one.
+//   - the owner console (port 4861). Never tunneled, so it can't be reached from the internet at all, and every call
+//     also needs the owner key from the Hub's data folder. Becoming an owner is only possible from this PC
+//     (`node hub/owner.mjs make-owner <email>`), never through the API.
+import http from 'node:http';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { openDb, DATA_DIR } from './db.mjs';
+import { hashPassword, verifyPassword, needsRehash, passwordProblem } from './lib/passwords.mjs';
+import { newSecret, checkCode, otpauthUri } from './lib/totp.mjs';
+import { loadOrCreateKey, signToken } from './lib/tokens.mjs';
+import { Windows, failures } from './lib/limiter.mjs';
+import { scoreAnswer, capped, levelOf, weekStart, dayKey, streak } from './lib/study.mjs';
+
+export const VERSION = '0.1.0';
+const HOST = '127.0.0.1';
+const MAX_BODY = 2 * 1024 * 1024;
+const SESSION_DAYS = 30;
+const TOKEN_MINUTES = 15;
+export const COOKIE = 'kea_hub';
+
+class HttpError extends Error { constructor(status, message, extra) { super(message); this.status = status; this.extra = extra; } }
+const bad = (m, extra) => { throw new HttpError(400, m, extra); };
+const forbidden = (m = 'Not allowed.') => { throw new HttpError(403, m); };
+const notFound = (m = 'Not found.') => { throw new HttpError(404, m); };
+
+const V = {
+  str(v, name, { optional = false, max = 500, min = 0 } = {}) {
+    if ((v == null || v === '') && optional) return null;
+    if (typeof v !== 'string') bad(`${name} must be text.`);
+    const t = v.trim();
+    if (t.length < min || t.length > max) bad(`${name} must be ${min}-${max} characters.`);
+    return t;
+  },
+  email(v) {
+    const e = V.str(v, 'Email', { max: 254, min: 3 }).toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) bad('Enter a valid email address.');
+    return e;
+  },
+  int(v, name, { optional = false, min = -Infinity, max = Infinity } = {}) {
+    if (v == null && optional) return null;
+    if (!Number.isInteger(v) || v < min || v > max) bad(`${name} must be a whole number from ${min} to ${max}.`);
+    return v;
+  },
+  bool(v, name, { optional = false } = {}) { if (v == null && optional) return null; if (typeof v !== 'boolean') bad(`${name} must be true or false.`); return v; },
+  enum(v, name, list, { optional = false } = {}) { if (v == null && optional) return null; if (!list.includes(v)) bad(`${name} must be one of: ${list.join(', ')}.`); return v; },
+  time(v, name) { const t = typeof v === 'number' ? v : Date.parse(v); if (!Number.isFinite(t)) bad(`${name} must be a date and time.`); return t; },
+  url(v, name) {
+    const s = V.str(v, name, { optional: true, max: 500 });
+    if (s == null) return null;
+    let u; try { u = new URL(s); } catch { bad(`${name} must be a full https:// link.`); }
+    if (u.protocol !== 'https:') bad(`${name} must be a full https:// link.`);
+    return u.toString();
+  },
+  obj(v) { if (v == null) return {}; if (typeof v !== 'object' || Array.isArray(v)) bad('Body must be a JSON object.'); return v; },
+};
+
+const sha = (s) => createHash('sha256').update(s).digest('hex');
+const nameHash = (email) => sha(`login:${email}`);
+const sessionCookie = (token, maxAge, secure) => `${COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}${secure ? '; Secure' : ''}`;
+function readCookie(header, name) {
+  for (const part of String(header || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === name) { const v = part.slice(i + 1).trim(); return /^[0-9a-f]{64}$/.test(v) ? v : null; }
+  }
+  return null;
+}
+function sameOrigin(req, secure) {
+  const site = req.headers['sec-fetch-site'];
+  if (site && site !== 'same-origin' && site !== 'none') return false;
+  const origin = req.headers.origin;
+  return origin == null || origin === `${secure ? 'https' : 'http'}://${req.headers.host}`;
+}
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0; const chunks = [];
+    req.on('data', (c) => { size += c.length; if (size > MAX_BODY) { reject(new HttpError(413, 'Request too large.')); req.destroy(); } else chunks.push(c); });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+// Codes people type: no 0/O/1/I/L confusion. 10 characters of 31 symbols is about 49 bits, and joining is rate-limited.
+const CODE_ALPHA = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+const newCode = () => [...randomBytes(10)].map((b) => CODE_ALPHA[b % CODE_ALPHA.length]).join('');
+const normCode = (c) => String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+function makeRouter() {
+  const routes = [];
+  const add = (method, path, handler, opts = {}) => {
+    const keys = [];
+    const re = new RegExp('^' + path.replace(/:(\w+)/g, (_, k) => { keys.push(k); return '([^/]+)'; }) + '$');
+    routes.push({ method, re, keys, handler, auth: opts.auth !== false });
+  };
+  const find = (method, pathname) => {
+    const r = routes.find((x) => x.method === method && x.re.test(pathname));
+    if (!r) throw new HttpError(routes.some((x) => x.re.test(pathname)) ? 405 : 404, 'Not found.');
+    const m = pathname.match(r.re); const params = {};
+    r.keys.forEach((k, i) => (params[k] = decodeURIComponent(m[i + 1])));
+    return { r, params };
+  };
+  return { add, find };
+}
+
+const send = (res, status, payload, cookies = []) => {
+  const headers = {
+    'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'x-frame-options': 'DENY',
+  };
+  if (cookies.length) headers['set-cookie'] = cookies;
+  res.writeHead(status, headers);
+  res.end(JSON.stringify(payload ?? {}));
+};
+
+export function createHub({
+  dataDir = DATA_DIR,
+  dbFile = join(dataDir, 'hub.db'),
+  now = () => Date.now(),
+  ipHeader = process.env.KEA_HUB_IP_HEADER || null, // e.g. 'cf-connecting-ip' behind Cloudflare, 'x-forwarded-for' behind Funnel
+  limits = {},
+  log = true,
+} = {}) {
+  mkdirSync(dataDir, { recursive: true });
+  const h = openDb(dbFile);
+  const key = loadOrCreateKey(join(dataDir, 'hub-signing-key.pem'));
+  const ownerKeyFile = join(dataDir, 'owner.key');
+  if (!existsSync(ownerKeyFile)) writeFileSync(ownerKeyFile, randomBytes(32).toString('hex'), { mode: 0o600 });
+  const ownerKey = Buffer.from(readFileSync(ownerKeyFile, 'utf8').trim());
+  const windows = new Windows();
+  const fails = failures(h, now);
+  const L = { login: [30, 10 * 60_000], register: [5, 60 * 60_000], join: [20, 10 * 60_000], answer: [240, 60_000], ...limits };
+  const limit = (kind, who) => {
+    const [n, ms] = L[kind];
+    const wait = windows.hit(`${kind}:${who}`, n, ms, now());
+    if (wait > 0) throw new HttpError(429, `Too many tries. Wait ${Math.ceil(wait / 1000)} seconds.`, { retryAfter: Math.ceil(wait / 1000) });
+  };
+  const audit = (actor, action, target, detail, ip) =>
+    h.run('INSERT INTO audit (at,actor,action,target,detail,ip) VALUES (?,?,?,?,?,?)', now(), actor ?? null, action, target ?? null, detail == null ? null : JSON.stringify(detail), ip ?? null);
+
+  const publicAccount = (a) => ({
+    id: a.id, email: a.email, displayName: a.display_name, role: a.role, status: a.status,
+    emailVerified: !!a.email_verified, verifiedBy: a.verified_by, identityVerified: !!a.identity_verified,
+    canHost: !!a.can_host || a.role === 'owner', totpEnabled: !!a.totp_enabled, owner: a.role === 'owner', createdAt: a.created_at,
+  });
+  const newSession = (accountId, client) => {
+    const token = randomBytes(32).toString('hex');
+    const t = now();
+    h.run('INSERT INTO sessions (token_hash,account_id,created_at,expires_at,last_seen,client) VALUES (?,?,?,?,?,?)', sha(token), accountId, t, t + SESSION_DAYS * 86400_000, t, client ?? null);
+    return token;
+  };
+  const progressOf = (accountId, classId = null) => {
+    const where = classId ? 'account_id = ? AND class_id = ?' : 'account_id = ?';
+    const args = classId ? [accountId, classId] : [accountId];
+    const total = h.get(`SELECT COALESCE(SUM(points),0) AS s FROM xp_events WHERE ${where}`, ...args).s;
+    const today = h.get('SELECT COALESCE(SUM(points),0) AS s FROM xp_events WHERE account_id = ? AND day = ?', accountId, dayKey(now())).s;
+    const days = h.all('SELECT DISTINCT day FROM xp_events WHERE account_id = ? ORDER BY day DESC LIMIT 400', accountId).map((r) => r.day);
+    return { ...levelOf(total), today, streak: streak(days, now()) };
+  };
+
+  // ---------- membership helpers ----------
+  const membership = (classId, accountId) => h.get('SELECT * FROM class_members WHERE class_id = ? AND account_id = ?', classId, accountId);
+  const loadClass = (id) => h.get('SELECT * FROM classes WHERE id = ?', id) ?? notFound('Class not found.');
+  const asMember = (classId, me) => {
+    const c = loadClass(classId);
+    const m = membership(classId, me.id);
+    if (!m && me.role !== 'owner') notFound('Class not found.');
+    return { c, m: m ?? { role: 'instructor', owner: true } };
+  };
+  const asTeacher = (classId, me) => {
+    const x = asMember(classId, me);
+    if (!['instructor', 'ta'].includes(x.m.role)) forbidden('Only the class instructors can do that.');
+    return x;
+  };
+  const asInstructor = (classId, me) => {
+    const x = asMember(classId, me);
+    if (x.m.role !== 'instructor') forbidden('Only the class instructor can do that.');
+    return x;
+  };
+  const classOut = (c, m) => ({
+    id: c.id, title: c.title, description: c.description, kind: c.kind, status: c.status, meetingUrl: c.meeting_url, createdAt: c.created_at,
+    role: m?.role ?? null, board: m?.board ?? null, nickname: m?.nickname ?? null,
+    members: h.get('SELECT COUNT(*) AS n FROM class_members WHERE class_id = ?', c.id).n,
+    instructors: h.all("SELECT a.display_name AS name, a.identity_verified AS v, a.role AS r FROM class_members m JOIN accounts a ON a.id = m.account_id WHERE m.class_id = ? AND m.role = 'instructor'", c.id)
+      .map((x) => ({ name: x.name, verified: !!x.v || x.r === 'owner' })),
+  });
+  const boardName = (row) => (row.board === 'nickname' && row.nickname ? row.nickname : row.board === 'hidden' ? null : row.display_name);
+  const sessionOut = (s) => ({ id: s.id, classId: s.class_id, title: s.title, start: new Date(s.start_at).toISOString(), end: new Date(s.end_at).toISOString(), location: s.location, meetingUrl: s.meeting_url, notes: s.notes });
+
+  // ================= public API =================
+  const api = makeRouter();
+  const R = api.add;
+
+  R('GET', '/v1/health', () => ({ ok: true, service: 'kea-hub', version: VERSION }), { auth: false });
+  R('GET', '/v1/keys', () => ({ keys: [key.jwk] }), { auth: false });
+
+  R('POST', '/v1/auth/register', async ({ body, ip, client }) => {
+    limit('register', ip);
+    const email = V.email(body.email);
+    const displayName = V.str(body.displayName, 'Name', { min: 1, max: 60 });
+    if (body.age13 !== true) bad('Kea accounts are for people 13 and older.');
+    const problem = passwordProblem(body.password, { email, name: displayName });
+    if (problem) bad(problem, { field: 'password' });
+    if (h.get('SELECT 1 FROM accounts WHERE email = ?', email)) throw new HttpError(409, 'An account with that email already exists. Sign in instead.');
+    const id = randomUUID();
+    const t = now();
+    h.run('INSERT INTO accounts (id,email,display_name,pw_hash,created_at,updated_at) VALUES (?,?,?,?,?,?)', id, email, displayName, await hashPassword(body.password), t, t);
+    audit(id, 'account.register', id, null, ip);
+    const token = newSession(id, client);
+    return { status: 201, body: { token, account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', id)) }, token };
+  }, { auth: false });
+
+  R('POST', '/v1/auth/login', async ({ body, ip, client }) => {
+    limit('login', ip);
+    const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+    const password = typeof body.password === 'string' ? body.password : '';
+    if (!email || !password) bad('Enter your email and password.');
+    const nh = nameHash(email);
+    const locked = fails.locked(nh);
+    if (locked > 0) throw new HttpError(429, `Too many wrong tries for this account. Wait ${Math.ceil(locked / 1000)} seconds.`, { retryAfter: Math.ceil(locked / 1000) });
+    const a = h.get('SELECT * FROM accounts WHERE email = ?', email);
+    const ok = await verifyPassword(password, a?.pw_hash ?? null);
+    if (!ok) {
+      const f = fails.fail(nh);
+      audit(a?.id ?? null, 'auth.fail', null, { count: f.count }, ip);
+      throw new HttpError(401, 'Wrong email or password.');
+    }
+    if (a.status !== 'active') throw new HttpError(403, 'This account is suspended. Contact Kea support.');
+    if (a.totp_enabled) {
+      if (body.code == null || body.code === '') throw new HttpError(401, 'Enter the 6-digit code from your authenticator app.', { totpRequired: true });
+      const step = checkCode(a.totp_secret, body.code, now(), a.totp_last_step);
+      if (step == null) { fails.fail(nh); audit(a.id, 'auth.fail_totp', null, null, ip); throw new HttpError(401, 'That code is wrong or already used.', { totpRequired: true }); }
+      h.run('UPDATE accounts SET totp_last_step = ? WHERE id = ?', step, a.id);
+    }
+    fails.clear(nh);
+    if (needsRehash(a.pw_hash)) h.run('UPDATE accounts SET pw_hash = ?, updated_at = ? WHERE id = ?', await hashPassword(password), now(), a.id);
+    audit(a.id, 'auth.login', null, null, ip);
+    const token = newSession(a.id, client);
+    return { body: { token, account: publicAccount(a) }, token };
+  }, { auth: false });
+
+  R('POST', '/v1/auth/logout', ({ token }) => {
+    if (token) h.run('DELETE FROM sessions WHERE token_hash = ?', sha(token));
+    return { body: { ok: true }, clearCookie: true };
+  }, { auth: false });
+
+  // A short-lived signed token for an org server or Kea to check offline (aud names who it's for).
+  R('POST', '/v1/auth/token', ({ me, body }) => {
+    const aud = V.str(body.aud ?? 'kea', 'Audience', { min: 1, max: 200 });
+    const t = Math.floor(now() / 1000);
+    const token = signToken(key, {
+      iss: 'kea-hub', sub: me.id, aud, iat: t, exp: t + TOKEN_MINUTES * 60,
+      email: me.email, name: me.display_name, ev: !!me.email_verified, iv: !!me.identity_verified, owner: me.role === 'owner',
+    });
+    return { token, expiresIn: TOKEN_MINUTES * 60 };
+  });
+
+  // ---------- me ----------
+  R('GET', '/v1/me', ({ me }) => ({ account: publicAccount(me), progress: progressOf(me.id) }));
+  R('POST', '/v1/me', ({ me, body }) => {
+    const name = V.str(body.displayName, 'Name', { min: 1, max: 60 });
+    h.run('UPDATE accounts SET display_name = ?, updated_at = ? WHERE id = ?', name, now(), me.id);
+    return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', me.id)) };
+  });
+  R('POST', '/v1/me/password', async ({ me, body, token, ip }) => {
+    if (!(await verifyPassword(body.current ?? '', me.pw_hash))) { fails.fail(nameHash(me.email)); throw new HttpError(401, 'Your current password is wrong.'); }
+    const problem = passwordProblem(body.next, { email: me.email, name: me.display_name });
+    if (problem) bad(problem, { field: 'next' });
+    h.run('UPDATE accounts SET pw_hash = ?, updated_at = ? WHERE id = ?', await hashPassword(body.next), now(), me.id);
+    h.run('DELETE FROM sessions WHERE account_id = ? AND token_hash != ?', me.id, sha(token));
+    audit(me.id, 'account.password', me.id, null, ip);
+    return { ok: true, otherSessionsSignedOut: true };
+  });
+  R('GET', '/v1/me/sessions', ({ me, token }) => ({
+    sessions: h.all('SELECT * FROM sessions WHERE account_id = ? AND expires_at > ? ORDER BY last_seen DESC', me.id, now())
+      .map((s) => ({ id: s.token_hash.slice(0, 12), client: s.client, createdAt: s.created_at, lastSeen: s.last_seen, current: s.token_hash === sha(token) })),
+  }));
+  R('POST', '/v1/me/sessions/sign-out-others', ({ me, token }) => {
+    const r = h.run('DELETE FROM sessions WHERE account_id = ? AND token_hash != ?', me.id, sha(token));
+    return { signedOut: Number(r.changes) };
+  });
+  R('POST', '/v1/me/totp/setup', ({ me }) => {
+    if (me.totp_enabled) bad('Two-step sign-in is already on.');
+    const secret = newSecret();
+    h.run('UPDATE accounts SET totp_secret = ?, updated_at = ? WHERE id = ?', secret, now(), me.id);
+    return { secret, uri: otpauthUri(secret, me.email) };
+  });
+  R('POST', '/v1/me/totp/enable', ({ me, body, ip }) => {
+    if (!me.totp_secret) bad('Start setup first.');
+    const step = checkCode(me.totp_secret, body.code, now(), me.totp_last_step);
+    if (step == null) bad('That code is wrong. Check the time on your phone and try the newest code.');
+    h.run('UPDATE accounts SET totp_enabled = 1, totp_last_step = ?, updated_at = ? WHERE id = ?', step, now(), me.id);
+    audit(me.id, 'account.totp_on', me.id, null, ip);
+    return { ok: true };
+  });
+  R('POST', '/v1/me/totp/disable', async ({ me, body, ip }) => {
+    if (!me.totp_enabled) return { ok: true };
+    if (me.role === 'owner') forbidden('The owner account must keep two-step sign-in on.');
+    if (!(await verifyPassword(body.password ?? '', me.pw_hash))) throw new HttpError(401, 'Wrong password.');
+    if (checkCode(me.totp_secret, body.code, now(), me.totp_last_step) == null) throw new HttpError(401, 'That code is wrong.');
+    h.run('UPDATE accounts SET totp_enabled = 0, totp_secret = NULL, totp_last_step = -1, updated_at = ? WHERE id = ?', now(), me.id);
+    audit(me.id, 'account.totp_off', me.id, null, ip);
+    return { ok: true };
+  });
+
+  // ---------- hosting ----------
+  R('POST', '/v1/hosting/apply', ({ me, body, ip }) => {
+    if (me.can_host || me.role === 'owner') return { status: 'approved' };
+    const reason = V.str(body.reason, 'Reason', { min: 20, max: 2000 });
+    if (h.get("SELECT 1 FROM host_applications WHERE account_id = ? AND status = 'pending'", me.id)) bad('Your application is already waiting for review.');
+    const id = randomUUID();
+    h.run('INSERT INTO host_applications (id,account_id,reason,created_at) VALUES (?,?,?,?)', id, me.id, reason, now());
+    audit(me.id, 'hosting.apply', id, null, ip);
+    return { status: 'pending', id };
+  });
+  R('GET', '/v1/hosting', ({ me }) => {
+    if (me.can_host || me.role === 'owner') return { status: 'approved' };
+    const a = h.get('SELECT * FROM host_applications WHERE account_id = ? ORDER BY created_at DESC LIMIT 1', me.id);
+    return a ? { status: a.status, note: a.note, appliedAt: a.created_at } : { status: 'none' };
+  });
+
+  // ---------- classes ----------
+  R('POST', '/v1/classes', ({ me, body, ip }) => {
+    const owner = me.role === 'owner';
+    if (!owner && !me.can_host) forbidden('Hosting classes on the Kea Hub needs approval. Apply under Hosting.');
+    const kind = V.enum(body.kind ?? 'class', 'Kind', ['class', 'general']);
+    if (kind === 'general' && !owner && !me.identity_verified) forbidden('General curricula need an identity-verified account.');
+    const id = randomUUID();
+    h.tx(() => {
+      h.run('INSERT INTO classes (id,owner_id,title,description,kind,meeting_url,created_at) VALUES (?,?,?,?,?,?,?)', id, me.id,
+        V.str(body.title, 'Title', { min: 1, max: 120 }), V.str(body.description, 'Description', { optional: true, max: 4000 }) ?? '', kind, V.url(body.meetingUrl, 'Meeting link'), now());
+      h.run("INSERT INTO class_members (class_id,account_id,role,joined_at) VALUES (?,?,'instructor',?)", id, me.id, now());
+    });
+    audit(me.id, 'class.create', id, { kind }, ip);
+    return { status: 201, body: { class: classOut(loadClass(id), membership(id, me.id)) } };
+  });
+  R('GET', '/v1/classes', ({ me }) => ({
+    classes: h.all("SELECT c.*, m.role AS m_role, m.board AS m_board, m.nickname AS m_nick FROM classes c JOIN class_members m ON m.class_id = c.id WHERE m.account_id = ? AND c.status = 'active' ORDER BY c.title", me.id)
+      .map((c) => classOut(c, { role: c.m_role, board: c.m_board, nickname: c.m_nick })),
+  }));
+  R('GET', '/v1/classes/:id', ({ me, params }) => {
+    const { c, m } = asMember(params.id, me);
+    return { class: classOut(c, m), progress: progressOf(me.id, c.id) };
+  });
+  R('POST', '/v1/classes/:id', ({ me, params, body }) => {
+    const { c } = asInstructor(params.id, me);
+    h.run('UPDATE classes SET title = ?, description = ?, meeting_url = ?, status = ? WHERE id = ?',
+      body.title != null ? V.str(body.title, 'Title', { min: 1, max: 120 }) : c.title,
+      body.description != null ? V.str(body.description, 'Description', { optional: true, max: 4000 }) ?? '' : c.description,
+      'meetingUrl' in body ? V.url(body.meetingUrl, 'Meeting link') : c.meeting_url,
+      body.status != null ? V.enum(body.status, 'Status', ['active', 'archived']) : c.status, c.id);
+    return { class: classOut(loadClass(c.id), membership(c.id, me.id)) };
+  });
+
+  R('POST', '/v1/classes/:id/invites', ({ me, params, body }) => {
+    const { c } = asTeacher(params.id, me);
+    const role = V.enum(body.role ?? 'student', 'Role', ['student', 'ta']);
+    const maxUses = V.int(body.maxUses, 'Max uses', { optional: true, min: 1, max: 10000 });
+    const days = V.int(body.expiresDays, 'Days', { optional: true, min: 1, max: 365 });
+    const code = newCode();
+    h.run('INSERT INTO invites (code,class_id,role,created_by,max_uses,expires_at,created_at) VALUES (?,?,?,?,?,?,?)', code, c.id, role, me.id, maxUses, days ? now() + days * 86400_000 : null, now());
+    return { status: 201, body: { code, role, maxUses, expiresAt: days ? now() + days * 86400_000 : null } };
+  });
+  R('GET', '/v1/classes/:id/invites', ({ me, params }) => {
+    asTeacher(params.id, me);
+    return { invites: h.all('SELECT * FROM invites WHERE class_id = ? AND revoked = 0 ORDER BY created_at DESC', params.id)
+      .map((i) => ({ code: i.code, role: i.role, uses: i.uses, maxUses: i.max_uses, expiresAt: i.expires_at, expired: (i.expires_at != null && i.expires_at <= now()) || (i.max_uses != null && i.uses >= i.max_uses) })) };
+  });
+  R('POST', '/v1/invites/:code/revoke', ({ me, params }) => {
+    const inv = h.get('SELECT * FROM invites WHERE code = ?', normCode(params.code)) ?? notFound('Invite not found.');
+    asTeacher(inv.class_id, me);
+    h.run('UPDATE invites SET revoked = 1 WHERE code = ?', inv.code);
+    return { ok: true };
+  });
+  R('POST', '/v1/join', ({ me, body, ip }) => {
+    limit('join', ip); limit('join', me.id);
+    const code = normCode(body.code);
+    const inv = code.length === 10 ? h.get('SELECT * FROM invites WHERE code = ?', code) : null;
+    const usable = inv && !inv.revoked && (inv.expires_at == null || inv.expires_at > now()) && (inv.max_uses == null || inv.uses < inv.max_uses);
+    if (!usable) notFound("That code doesn't work. Check it, or ask for a new one.");
+    const c = loadClass(inv.class_id);
+    if (c.status !== 'active') notFound("That code doesn't work. Check it, or ask for a new one.");
+    const existing = membership(c.id, me.id);
+    if (!existing) {
+      h.tx(() => {
+        h.run('INSERT INTO class_members (class_id,account_id,role,board,nickname,joined_at) VALUES (?,?,?,?,?,?)', c.id, me.id, inv.role,
+          V.enum(body.board ?? 'name', 'Leaderboard name', ['name', 'nickname', 'hidden']), V.str(body.nickname, 'Nickname', { optional: true, max: 30 }), now());
+        h.run('UPDATE invites SET uses = uses + 1 WHERE code = ?', code);
+      });
+      audit(me.id, 'class.join', c.id, { role: inv.role }, ip);
+    }
+    return { class: classOut(c, membership(c.id, me.id)), alreadyMember: !!existing };
+  });
+  R('POST', '/v1/classes/:id/me', ({ me, params, body }) => {
+    const { m } = asMember(params.id, me);
+    if (m.owner) bad('You are not a member of this class.');
+    const board = V.enum(body.board ?? m.board, 'Leaderboard name', ['name', 'nickname', 'hidden']);
+    const nickname = 'nickname' in body ? V.str(body.nickname, 'Nickname', { optional: true, max: 30 }) : m.nickname;
+    if (board === 'nickname' && !nickname) bad('Pick a nickname first.');
+    h.run('UPDATE class_members SET board = ?, nickname = ? WHERE class_id = ? AND account_id = ?', board, nickname, params.id, me.id);
+    return { board, nickname };
+  });
+  R('POST', '/v1/classes/:id/leave', ({ me, params }) => {
+    const { c, m } = asMember(params.id, me);
+    if (c.owner_id === me.id) bad("You made this class, so you can't leave it. Archive it instead.");
+    if (!m.owner) h.run('DELETE FROM class_members WHERE class_id = ? AND account_id = ?', c.id, me.id);
+    return { ok: true };
+  });
+  R('GET', '/v1/classes/:id/members', ({ me, params }) => {
+    const { m } = asMember(params.id, me);
+    const teacher = ['instructor', 'ta'].includes(m.role);
+    const rows = h.all('SELECT m.*, a.display_name FROM class_members m JOIN accounts a ON a.id = m.account_id WHERE m.class_id = ? ORDER BY m.role, a.display_name', params.id);
+    return {
+      members: rows
+        .filter((r) => teacher || r.role !== 'student' || r.board !== 'hidden' || r.account_id === me.id)
+        .map((r) => ({ id: teacher ? r.account_id : undefined, name: teacher || r.role !== 'student' ? r.display_name : boardName(r), role: r.role, joinedAt: r.joined_at, you: r.account_id === me.id })),
+    };
+  });
+  R('POST', '/v1/classes/:id/members/:accountId/remove', ({ me, params, ip }) => {
+    const { c } = asInstructor(params.id, me);
+    if (params.accountId === c.owner_id) bad("The class's creator can't be removed.");
+    h.run('DELETE FROM class_members WHERE class_id = ? AND account_id = ?', c.id, params.accountId);
+    audit(me.id, 'class.remove_member', c.id, { account: params.accountId }, ip);
+    return { ok: true };
+  });
+
+  // ---------- class calendar ----------
+  const sessionFields = (body, prev = {}) => {
+    const start = body.start != null ? V.time(body.start, 'Start') : prev.start_at;
+    const end = body.end != null ? V.time(body.end, 'End') : prev.end_at;
+    if (start == null || end == null) bad('Give a start and an end.');
+    if (end <= start) bad('The end must be after the start.');
+    if (end - start > 14 * 86400_000) bad('A session can be at most 14 days long.');
+    return {
+      title: body.title != null ? V.str(body.title, 'Title', { min: 1, max: 120 }) : prev.title,
+      start, end,
+      location: 'location' in body ? V.str(body.location, 'Location', { optional: true, max: 200 }) : prev.location ?? null,
+      meetingUrl: 'meetingUrl' in body ? V.url(body.meetingUrl, 'Meeting link') : prev.meeting_url ?? null,
+      notes: 'notes' in body ? V.str(body.notes, 'Notes', { optional: true, max: 4000 }) : prev.notes ?? null,
+    };
+  };
+  R('POST', '/v1/classes/:id/sessions', ({ me, params, body }) => {
+    const { c } = asTeacher(params.id, me);
+    const f = sessionFields(body);
+    const id = randomUUID();
+    h.run('INSERT INTO class_sessions (id,class_id,title,start_at,end_at,location,meeting_url,notes) VALUES (?,?,?,?,?,?,?,?)', id, c.id, f.title, f.start, f.end, f.location, f.meetingUrl, f.notes);
+    return { status: 201, body: { session: sessionOut(h.get('SELECT * FROM class_sessions WHERE id = ?', id)) } };
+  });
+  R('GET', '/v1/classes/:id/sessions', ({ me, params }) => {
+    asMember(params.id, me);
+    return { sessions: h.all('SELECT * FROM class_sessions WHERE class_id = ? ORDER BY start_at', params.id).map(sessionOut) };
+  });
+  R('POST', '/v1/class-sessions/:sid', ({ me, params, body }) => {
+    const s = h.get('SELECT * FROM class_sessions WHERE id = ?', params.sid) ?? notFound('Session not found.');
+    asTeacher(s.class_id, me);
+    const f = sessionFields(body, s);
+    h.run('UPDATE class_sessions SET title=?, start_at=?, end_at=?, location=?, meeting_url=?, notes=? WHERE id = ?', f.title, f.start, f.end, f.location, f.meetingUrl, f.notes, s.id);
+    return { session: sessionOut(h.get('SELECT * FROM class_sessions WHERE id = ?', s.id)) };
+  });
+  R('POST', '/v1/class-sessions/:sid/delete', ({ me, params }) => {
+    const s = h.get('SELECT * FROM class_sessions WHERE id = ?', params.sid) ?? notFound('Session not found.');
+    asTeacher(s.class_id, me);
+    h.run('DELETE FROM class_sessions WHERE id = ?', s.id);
+    return { ok: true };
+  });
+  R('GET', '/v1/calendar', ({ me, query }) => {
+    const from = query.from ? V.time(query.from, 'from') : now() - 7 * 86400_000;
+    const to = query.to ? V.time(query.to, 'to') : now() + 60 * 86400_000;
+    if (to - from > 400 * 86400_000) bad('Ask for at most 400 days at a time.');
+    return {
+      sessions: h.all("SELECT s.*, c.title AS class_title FROM class_sessions s JOIN class_members m ON m.class_id = s.class_id JOIN classes c ON c.id = s.class_id WHERE m.account_id = ? AND c.status = 'active' AND s.end_at >= ? AND s.start_at <= ? ORDER BY s.start_at", me.id, from, to)
+        .map((s) => ({ ...sessionOut(s), classTitle: s.class_title })),
+    };
+  });
+
+  // ---------- study sets ----------
+  const parseQuestions = (list) => {
+    if (!Array.isArray(list) || list.length < 1 || list.length > 500) bad('A set needs 1 to 500 questions.');
+    return list.map((q, i) => {
+      const n = i + 1;
+      const text = V.str(q?.q, `Question ${n}`, { min: 1, max: 2000 });
+      if (!Array.isArray(q.choices) || q.choices.length < 2 || q.choices.length > 8) bad(`Question ${n} needs 2 to 8 choices.`);
+      const choices = q.choices.map((c, j) => V.str(c, `Question ${n} choice ${j + 1}`, { min: 1, max: 500 }));
+      const answer = V.int(q.answer, `Question ${n} answer`, { min: 0, max: choices.length - 1 });
+      return { q: text, choices, answer, why: V.str(q.why, `Question ${n} explanation`, { optional: true, max: 2000 }) };
+    });
+  };
+  R('POST', '/v1/classes/:id/sets', ({ me, params, body }) => {
+    const { c } = asTeacher(params.id, me);
+    const qs = parseQuestions(body.questions);
+    const id = randomUUID();
+    h.tx(() => {
+      h.run('INSERT INTO sets (id,class_id,title,leaderboard,created_by,created_at) VALUES (?,?,?,?,?,?)', id, c.id, V.str(body.title, 'Title', { min: 1, max: 120 }), body.leaderboard === false ? 0 : 1, me.id, now());
+      qs.forEach((q, i) => h.run('INSERT INTO questions (id,set_id,idx,q,choices,answer,why) VALUES (?,?,?,?,?,?,?)', randomUUID(), id, i, q.q, JSON.stringify(q.choices), q.answer, q.why));
+    });
+    return { status: 201, body: { id, count: qs.length } };
+  });
+  R('GET', '/v1/classes/:id/sets', ({ me, params }) => {
+    asMember(params.id, me);
+    return {
+      sets: h.all('SELECT * FROM sets WHERE class_id = ? ORDER BY created_at', params.id).map((s) => {
+        const total = h.get('SELECT COUNT(*) AS n FROM questions WHERE set_id = ?', s.id).n;
+        const notDue = h.get('SELECT COUNT(*) AS n FROM review_state r JOIN questions q ON q.id = r.question_id WHERE q.set_id = ? AND r.account_id = ? AND r.due_at > ?', s.id, me.id, now()).n;
+        const seen = h.get('SELECT COUNT(*) AS n FROM review_state r JOIN questions q ON q.id = r.question_id WHERE q.set_id = ? AND r.account_id = ? AND r.seen = 1', s.id, me.id).n;
+        return { id: s.id, title: s.title, leaderboard: !!s.leaderboard, questions: total, due: total - notDue, learned: seen };
+      }),
+    };
+  });
+  const loadSet = (id) => h.get('SELECT * FROM sets WHERE id = ?', id) ?? notFound('Set not found.');
+  // Questions come without answers: grading happens here, so scores can't be faked by a modified app.
+  R('GET', '/v1/sets/:id', ({ me, params }) => {
+    const s = loadSet(params.id);
+    const { m } = asMember(s.class_id, me);
+    const teacher = ['instructor', 'ta'].includes(m.role);
+    const states = new Map(h.all('SELECT r.* FROM review_state r JOIN questions q ON q.id = r.question_id WHERE q.set_id = ? AND r.account_id = ?', s.id, me.id).map((r) => [r.question_id, r]));
+    return {
+      set: { id: s.id, classId: s.class_id, title: s.title, leaderboard: !!s.leaderboard },
+      questions: h.all('SELECT * FROM questions WHERE set_id = ? ORDER BY idx', s.id).map((q) => {
+        const st = states.get(q.id);
+        return { id: q.id, q: q.q, choices: JSON.parse(q.choices), due: !st || st.due_at <= now(), dueAt: st?.due_at ?? null, box: st?.box ?? 0, ...(teacher ? { answer: q.answer, why: q.why } : {}) };
+      }),
+    };
+  });
+  R('POST', '/v1/sets/:id/delete', ({ me, params }) => {
+    const s = loadSet(params.id);
+    asTeacher(s.class_id, me);
+    h.run('DELETE FROM sets WHERE id = ?', s.id);
+    return { ok: true };
+  });
+  R('POST', '/v1/sets/:id/answer', ({ me, params, body }) => {
+    limit('answer', me.id);
+    const s = loadSet(params.id);
+    asMember(s.class_id, me);
+    const q = h.get('SELECT * FROM questions WHERE id = ? AND set_id = ?', V.str(body.questionId, 'Question', { min: 1, max: 100 }), s.id) ?? notFound('Question not found.');
+    const choice = V.int(body.choice, 'Choice', { min: 0, max: JSON.parse(q.choices).length - 1 });
+    const correct = choice === q.answer;
+    const t = now();
+    return h.tx(() => {
+      const prev = h.get('SELECT * FROM review_state WHERE account_id = ? AND question_id = ?', me.id, q.id);
+      const r = scoreAnswer(prev ? { box: prev.box, dueAt: prev.due_at, missedThisWindow: !!prev.missed, seen: !!prev.seen } : null, correct, t);
+      h.run('INSERT INTO review_state (account_id,question_id,box,due_at,missed,seen) VALUES (?,?,?,?,?,?) ON CONFLICT(account_id,question_id) DO UPDATE SET box=excluded.box, due_at=excluded.due_at, missed=excluded.missed, seen=excluded.seen',
+        me.id, q.id, r.state.box, r.state.dueAt, r.state.missedThisWindow ? 1 : 0, r.state.seen ? 1 : 0);
+      let points = 0;
+      if (s.leaderboard && r.points > 0) {
+        const today = h.get('SELECT COALESCE(SUM(points),0) AS s FROM xp_events WHERE account_id = ? AND day = ?', me.id, dayKey(t)).s;
+        points = capped(r.points, today);
+        if (points > 0) h.run('INSERT INTO xp_events (account_id,class_id,question_id,points,at,day) VALUES (?,?,?,?,?,?)', me.id, s.class_id, q.id, points, t, dayKey(t));
+      }
+      return {
+        correct, answer: q.answer, why: q.why, points, scoring: r.due,
+        capped: s.leaderboard && r.points > 0 && points < r.points,
+        nextDueAt: r.state.dueAt, box: r.state.box, progress: progressOf(me.id),
+      };
+    });
+  });
+
+  // ---------- leaderboards ----------
+  R('GET', '/v1/classes/:id/leaderboard', ({ me, params, query }) => {
+    asMember(params.id, me);
+    const period = V.enum(query.period ?? 'week', 'Period', ['week', 'all']);
+    const since = period === 'week' ? weekStart(now()) : 0;
+    const rows = h.all(`SELECT m.account_id, m.board, m.nickname, a.display_name, COALESCE(SUM(x.points),0) AS points
+      FROM class_members m JOIN accounts a ON a.id = m.account_id
+      LEFT JOIN xp_events x ON x.account_id = m.account_id AND x.class_id = m.class_id AND x.at >= ?
+      WHERE m.class_id = ? GROUP BY m.account_id ORDER BY points DESC, a.display_name`, since, params.id);
+    let rank = 0, last = null, shown = 0;
+    const out = []; let mine = null;
+    rows.forEach((r, i) => {
+      if (r.points !== last) { rank = i + 1; last = r.points; }
+      const entry = { rank, name: boardName(r) ?? 'Hidden', points: r.points, you: r.account_id === me.id };
+      if (entry.you) mine = entry;
+      if ((r.board !== 'hidden' || entry.you) && r.points > 0 && shown < 100) { out.push(entry); shown++; }
+    });
+    return { period, since, board: out, you: mine };
+  });
+
+  // ================= owner console (localhost, never tunneled) =================
+  const own = makeRouter();
+  const O = own.add;
+  const getAccount = (id) => h.get('SELECT * FROM accounts WHERE id = ? OR email = ?', id, String(id).toLowerCase()) ?? notFound('No such account.');
+  O('GET', '/owner/stats', () => ({
+    accounts: h.get('SELECT COUNT(*) AS n FROM accounts').n,
+    classes: h.get("SELECT COUNT(*) AS n FROM classes WHERE status = 'active'").n,
+    pendingHosting: h.get("SELECT COUNT(*) AS n FROM host_applications WHERE status = 'pending'").n,
+    failedSignInsToday: h.get("SELECT COUNT(*) AS n FROM audit WHERE action LIKE 'auth.fail%' AND at > ?", now() - 86400_000).n,
+  }));
+  O('GET', '/owner/accounts', ({ query }) => {
+    const q = `%${String(query.q ?? '').toLowerCase()}%`;
+    return { accounts: h.all('SELECT * FROM accounts WHERE lower(email) LIKE ? OR lower(display_name) LIKE ? ORDER BY created_at DESC LIMIT 200', q, q).map(publicAccount) };
+  });
+  O('POST', '/owner/accounts/:id', ({ params, body }) => {
+    const a = getAccount(params.id);
+    const set = (col, v) => h.run(`UPDATE accounts SET ${col} = ?, updated_at = ? WHERE id = ?`, v, now(), a.id);
+    if (body.emailVerified != null) { set('email_verified', V.bool(body.emailVerified, 'emailVerified') ? 1 : 0); set('verified_by', body.emailVerified ? 'owner' : null); }
+    if (body.identityVerified != null) set('identity_verified', V.bool(body.identityVerified, 'identityVerified') ? 1 : 0);
+    if (body.canHost != null) set('can_host', V.bool(body.canHost, 'canHost') ? 1 : 0);
+    if (body.status != null) {
+      set('status', V.enum(body.status, 'status', ['active', 'suspended']));
+      if (body.status === 'suspended') h.run('DELETE FROM sessions WHERE account_id = ?', a.id);
+    }
+    audit('owner', 'owner.account_update', a.id, body, 'local');
+    return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', a.id)) };
+  });
+  O('POST', '/owner/accounts/:id/unlock', ({ params }) => {
+    const a = getAccount(params.id);
+    fails.clear(nameHash(a.email));
+    audit('owner', 'owner.unlock', a.id, null, 'local');
+    return { ok: true };
+  });
+  O('GET', '/owner/hosting', ({ query }) => ({
+    applications: h.all('SELECT h.*, a.email, a.display_name FROM host_applications h JOIN accounts a ON a.id = h.account_id WHERE h.status = ? ORDER BY h.created_at', query.status ?? 'pending')
+      .map((x) => ({ id: x.id, accountId: x.account_id, email: x.email, name: x.display_name, reason: x.reason, status: x.status, createdAt: x.created_at, note: x.note })),
+  }));
+  O('POST', '/owner/hosting/:id/decide', ({ params, body }) => {
+    const app = h.get('SELECT * FROM host_applications WHERE id = ?', params.id) ?? notFound();
+    const approve = V.bool(body.approve, 'approve');
+    h.tx(() => {
+      h.run('UPDATE host_applications SET status = ?, decided_at = ?, note = ? WHERE id = ?', approve ? 'approved' : 'denied', now(), V.str(body.note, 'note', { optional: true, max: 2000 }), app.id);
+      if (approve) h.run('UPDATE accounts SET can_host = 1, updated_at = ? WHERE id = ?', now(), app.account_id);
+    });
+    audit('owner', approve ? 'owner.hosting_approve' : 'owner.hosting_deny', app.account_id, null, 'local');
+    return { ok: true };
+  });
+  O('GET', '/owner/audit', ({ query }) => ({
+    entries: h.all('SELECT * FROM audit ORDER BY id DESC LIMIT ?', Math.min(1000, Number(query.limit) || 200)),
+  }));
+
+  // ================= request handling =================
+  const clientIp = (req) => {
+    if (ipHeader) { const v = req.headers[ipHeader.toLowerCase()]; if (v) return String(v).split(',')[0].trim(); }
+    return req.socket.remoteAddress || 'unknown';
+  };
+
+  async function handleApi(req, res) {
+    const t0 = Date.now();
+    const url = new URL(req.url, 'http://localhost');
+    const secure = !!req.socket.encrypted || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+    let status = 200, payload, cookies = [];
+    try {
+      const { r, params } = api.find(req.method, url.pathname);
+      let body = {};
+      if (req.method === 'POST') {
+        const raw = await readBody(req);
+        if (raw.trim()) { try { body = JSON.parse(raw); } catch { bad('Invalid JSON.'); } }
+        body = V.obj(body);
+      }
+      const auth = req.headers.authorization;
+      const bearer = auth ? /^Bearer ([0-9a-f]{64})$/.exec(auth)?.[1] ?? null : null;
+      if (auth && !bearer) throw new HttpError(401, 'Sign in again.');
+      const cookieToken = bearer ? null : readCookie(req.headers.cookie, COOKIE);
+      if (req.method !== 'GET' && !bearer) {
+        if (!sameOrigin(req, secure)) forbidden('Cross-site request refused.');
+        if (cookieToken && req.headers['x-kea'] !== '1') forbidden('Missing X-Kea header.');
+      }
+      const ctx = { params, body, query: Object.fromEntries(url.searchParams), ip: clientIp(req), client: String(req.headers['x-kea-client'] || req.headers['user-agent'] || '').slice(0, 120), token: bearer || cookieToken };
+      if (r.auth) {
+        if (!ctx.token) throw new HttpError(401, 'Sign in first.');
+        const s = h.get('SELECT * FROM sessions WHERE token_hash = ?', sha(ctx.token));
+        if (!s || s.expires_at <= now()) {
+          if (cookieToken) cookies = [sessionCookie('', 0, secure)];
+          throw new HttpError(401, 'Your sign-in expired. Sign in again.');
+        }
+        const me = h.get('SELECT * FROM accounts WHERE id = ?', s.account_id);
+        if (!me || me.status !== 'active') throw new HttpError(401, 'Sign in again.');
+        if (now() - s.last_seen > 3600_000) h.run('UPDATE sessions SET last_seen = ? WHERE token_hash = ?', now(), s.token_hash);
+        ctx.me = me;
+      }
+      let out = await r.handler(ctx);
+      if (out && 'body' in out && (typeof out.status === 'number' || 'token' in out || 'clearCookie' in out)) {
+        if (out.token) cookies = [sessionCookie(out.token, SESSION_DAYS * 86400, secure)];
+        if (out.clearCookie) cookies = [sessionCookie('', 0, secure)];
+        if (typeof out.status === 'number') status = out.status;
+        out = out.body;
+      }
+      payload = out;
+    } catch (e) {
+      if (e instanceof HttpError) { status = e.status; payload = { error: e.message, ...(e.extra || {}) }; }
+      else { status = 500; payload = { error: 'Something went wrong on the Hub.' }; console.error(e); }
+    }
+    if (status === 429 && payload?.retryAfter) res.setHeader('retry-after', String(payload.retryAfter));
+    send(res, status, payload, cookies);
+    if (log) console.log(`${new Date().toISOString()} ${req.method} ${url.pathname} ${status} ${Date.now() - t0}ms`);
+  }
+
+  async function handleOwner(req, res) {
+    let status = 200, payload;
+    try {
+      // Belt and braces: the listener is bound to 127.0.0.1, and the key must match too.
+      const addr = req.socket.remoteAddress;
+      if (addr !== '127.0.0.1' && addr !== '::1' && addr !== '::ffff:127.0.0.1') forbidden();
+      if (req.headers.origin || req.headers['sec-fetch-site']) forbidden('The owner console takes no browser requests.');
+      const given = Buffer.from(String(req.headers['x-kea-owner-key'] || ''));
+      if (given.length !== ownerKey.length || !timingSafeEqual(given, ownerKey)) throw new HttpError(401, 'Owner key required.');
+      const url = new URL(req.url, 'http://localhost');
+      const { r, params } = own.find(req.method, url.pathname);
+      let body = {};
+      if (req.method === 'POST') { const raw = await readBody(req); if (raw.trim()) { try { body = JSON.parse(raw); } catch { bad('Invalid JSON.'); } } body = V.obj(body); }
+      payload = await r.handler({ params, body, query: Object.fromEntries(url.searchParams) });
+    } catch (e) {
+      if (e instanceof HttpError) { status = e.status; payload = { error: e.message, ...(e.extra || {}) }; }
+      else { status = 500; payload = { error: 'internal error' }; console.error(e); }
+    }
+    send(res, status, payload);
+  }
+
+  const wrap = (fn) => (req, res) => fn(req, res).catch((e) => { console.error(e); try { send(res, 500, { error: 'internal error' }); } catch {} });
+  const apiServer = http.createServer(wrap(handleApi));
+  const ownerServer = http.createServer(wrap(handleOwner));
+  apiServer.headersTimeout = 15_000; apiServer.requestTimeout = 30_000;
+  const listenOn = (srv, port) => new Promise((resolve) => srv.listen(port, HOST, () => resolve(srv.address().port)));
+
+  return {
+    h, key, ownerKey: ownerKey.toString(),
+    async listen({ port = Number(process.env.KEA_HUB_PORT) || 4860, ownerPort = Number(process.env.KEA_HUB_OWNER_PORT) || 4861 } = {}) {
+      return { port: await listenOn(apiServer, port), ownerPort: await listenOn(ownerServer, ownerPort) };
+    },
+    close() {
+      return Promise.all([apiServer, ownerServer].map((s) => new Promise((r) => (s.listening ? s.close(() => r()) : r())))).then(() => h.close());
+    },
+  };
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  const hub = createHub();
+  const { port, ownerPort } = await hub.listen();
+  console.log(`Kea Hub ${VERSION} on http://${HOST}:${port} (tunnel this one). Owner console on http://${HOST}:${ownerPort} (never tunnel this).`);
+}

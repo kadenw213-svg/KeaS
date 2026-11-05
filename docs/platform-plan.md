@@ -281,7 +281,134 @@ The user asked for these on top:
 
 ---
 
-## 10. Build passes (honest sizes)
+## 9b. User decisions (2026-11-05, second round)
+- **Tunnel:**
+  - **Free by default:** Tailscale Funnel. It's free on Tailscale's Personal plan and gives a `*.ts.net` address with TLS. KeaS adds its own protections (rate limits, lockouts, the localhost-only owner console).
+  - **Optional upgrade:** Cloudflare Tunnel (the tunnel itself is free; only a domain costs about $10 a year), for its DDoS and WAF protection.
+  - **Paid hosting:** only ever considered for Kea-user-only features. **Orgs always stay free.**
+- **Live video:** tunnels carry web traffic, not WebRTC media. The cheapest path that keeps quality:
+  - **Pass 1:** sessions carry a **meeting link** (Jitsi Meet is free with no account; Google Meet and Zoom links also work).
+  - **Later:** self-hosted LiveKit for orgs that run their own server.
+- **Email verification without a mail server:** "Verify with Google" or Microsoft sign-in proves the email for free. Kea already has Google sign-in. An SMTP sender is an Advanced option.
+- **Payroll data:** stays on the payroll admin's PC (as recommended).
+- **Claude:** required only for adding or updating tax and labor packs. Everywhere else it's an **optional streamlining integration**, for example drafting a schedule from availability or explaining a stub line. **Every Claude feature has a full manual path that is just as easy.**
+- **LLC:** not required. The user chose good terms instead: what Kea and KeaS do, what they don't do, where they can fall short, that the employer is the employer of record, and "as is". Recorded honestly: terms bind users who accept them, while an LLC shields personal assets. The user can revisit this.
+- **Estimates:** the user doubts 330+ hours, and the coding is far faster with Claude doing it. What doesn't speed up is **checking each state's numbers against official worked examples**. That checking gates the "verified" label, not the code.
+- **All of §7's "things big payroll has" are in scope.**
+- **Priority order:** **the study system first** (accounts, hosting classes, inviting people, studying, leaderboards), as cheap as possible while keeping quality. Then workforce and availability, then payroll breadth.
+- **Theming:** dark and light modes plus customizability (accent, density, font size; Advanced has every token), matching Kea.
+
+## 9c. Availability forms, the to-do box and scheduling
+
+**The format**
+- The model is the user's own December form:
+  - the org defines **shift blocks per weekday** (for example Mon 4:45–9am, 9am–1pm, 1–4pm, 3:45–8:45pm; Sat 6:45–11:30am …);
+  - the employee marks **which dates** they can do each block;
+  - plus notes, desired hours, days off and extra questions.
+- The November form (free text such as "4:45-1:00pm", "9-Close") shows why structured blocks are better: free text can't be scheduled automatically.
+
+**Admin: making a form** (aimed at about one minute per month)
+- **"New availability form"** → pick the period (defaults to next month).
+- **Blocks:** the org's **block templates** prefill the blocks. There are several template sets, by category or position, for example Lifeguard blocks and Swim-lesson sessions.
+- **"Copy last month"** in one click.
+- **Date exceptions:** closed (holidays), special hours, or extra blocks (events, meets).
+- **Extra questions** use the KeaS Forms engine: desired hours per week (min and max), days off, preferences, in-service topics, and swim sessions they can teach. There are defaults, and each question can be turned off.
+- **Who gets it:** everyone, or by department, position or category. A minors-only note shows to under-18s.
+- **Deadline and reminders**, for example 3 days and 1 day before, plus the morning of.
+- **Publish** → it appears in each person's to-do box in KeaS and in Kea (Work mode).
+
+**Employee: filling it in** (phone-first)
+- **A calendar of the period.** Each date shows its blocks as chips. Tap a chip to cycle through three states:
+  - **Available**;
+  - **If needed** (covers "text me first for 1–9pm");
+  - **Not available**.
+- **Bulk actions:**
+  - tap a weekday header to set that block for every date in the period;
+  - "All day" or "Off" for a whole date;
+  - drag across dates.
+- **Prefill** from "my usual week" (standing availability kept on the profile) or from last month's answers.
+- **Notes:** a note on any date, and an overall note.
+- **Hours:** desired hours per week, with a live total showing the hours they've marked available.
+- **Editing:**
+  - edits are allowed until the deadline;
+  - after it, an edit becomes a **change request** the manager approves (the "Change of Availability" process).
+  - Once the schedule is published, changes only affect future periods.
+
+**Manager: the results**
+- **Matrix view:** dates × blocks, showing who is available or if-needed, a **coverage count against need** per block (shown as a heatmap), and the notes inline.
+- **People view:** each person's answers, hours wanted against hours available, and who **hasn't submitted** (with a nudge button).
+- **Export:** CSV, and a Google-Sheets-shaped export with the same columns as the user's form.
+
+**Scheduling from availability (manual first)**
+- **Need templates:** how many of each position per block, by weekday or date.
+- **Manual:**
+  - drag people from the "available for this block" list onto the block;
+  - it shows hours so far against desired hours;
+  - cert and minor checks run live (the existing `checkAssignment`).
+- **Auto-fill** is deterministic, with no Claude. It fills open slots from the available people:
+  - cert, minor, overlap and overtime rules are hard limits;
+  - it prefers "Available" over "If needed";
+  - it balances hours toward each person's desired hours;
+  - it respects stated preferences tagged with structured chips (opener, closer, age groups).
+- **Optional Claude draft:** Claude reads the matrix **plus the free-text notes** ("prefers opening", "subject to change"), writes a draft, and explains each choice. A manager reviews it like any draft. Nothing publishes on its own.
+- Publish → shifts go to calendars and to-do boxes.
+
+**The to-do box** (KeaS home, and Kea's Work mode)
+Ordered by urgency, each item with a countdown and one tap to act:
+- availability forms due ("Due in 2 days");
+- **certs: days left before expiry or recert**, with color stages at 60, 30 and 7 days and "Expired, shifts blocked";
+- assigned classes and their next sessions, plus in-service sign-ups;
+- timecard sign-off, missed punches and the pre-payday check;
+- swap requests;
+- documents to sign and policy acknowledgments;
+- for managers: forms past their deadline with missing submissions, approvals waiting, budget warnings and pay-run warnings.
+
+Items can be snoozed, and the Advanced settings choose which kinds show.
+
+---
+
+## 10. Build passes (re-ordered 2026-11-05: study system first)
+
+**Pass 1 (now): Kea Hub + the study system**
+- **Hub service:**
+  - accounts with Argon2id;
+  - per-IP and per-account rate limits and lockout;
+  - the same error for "no such user" and "wrong password";
+  - optional TOTP;
+  - sessions;
+  - Ed25519-signed tokens;
+  - the localhost-only owner console API;
+  - the audit log;
+  - an encrypted backup command.
+- **Classes:**
+  - create a class (Kea library package format);
+  - invite codes and links;
+  - enroll, with roles (instructor, TA, student);
+  - sessions on a calendar, with a meeting link;
+  - the hosting application, owner approval and the general-curriculum gate.
+- **Study:**
+  - question banks;
+  - server-graded leaderboard sets;
+  - spaced review windows;
+  - XP, levels, streaks;
+  - weekly and all-time class boards;
+  - opt-in display names.
+- **Kea:** sign in with a Hub account, the mode picker, join a class or org by code, class sessions in the calendar.
+- **KeaS desktop:** the installer and the first-run wizard, including the Tailscale Funnel setup.
+
+**Pass 2: workforce**
+- the department tree and budgets;
+- availability forms (§9c);
+- the to-do box;
+- auto-fill scheduling;
+- org classes that issue certs;
+- theming everywhere.
+
+**Pass 3+:** the payroll breadth and everything in §7.
+
+The earlier sizing (330–610 hours) is superseded: the code is Claude-paced, and verifying the tables is the real gate.
+
+## 10-old. Earlier pass list (kept for reference)
 
 **Pass 1: the foundation.** The goal: the owner installs KeaS, sets up the Hub, signs in with a real account in KeaS **and** Kea, makes an org, and assigns a class.
 - **Hub service:**

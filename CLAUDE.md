@@ -11,3 +11,4 @@ Scheduling, time clock, certifications and payroll prep for any workplace. Separ
   - Nothing specific to one org, state or industry is hard-coded. It goes in packs and org settings.
   - Attendance is flags only; protected leave never counts, and a manager decides.
   - KeaS calculates and prepares; it never holds or moves money or files for the employer.
+- **Kea Hub** (`hub/`, plan in `docs/platform-plan.md`): the central accounts/classes/study server that runs on the owner's PC. `npm run hub` (API on 127.0.0.1:4860, which gets tunneled; owner console on 127.0.0.1:4861, which is never tunneled). Data lives in `hub/data/` (git-ignored) or `KEA_HUB_DATA`. Owner tools: `node hub/owner.mjs make-owner <email> | console owner/stats`. Encrypted backups: `node hub/backup.mjs create <folder>` with `KEA_BACKUP_PASSPHRASE`. Tests: `npm run test:hub`; `npm test` runs everything.

@@ -1,3 +1,4 @@
 node_modules/
 server/data/
 web/dist/
+hub/data/
