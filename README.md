@@ -1,66 +1,75 @@
-# KeaS
+<p align="center">
+  <img src="docs/logo/keas-a-key.svg" width="96" alt="KeaS logo">
+</p>
 
-KeaS is the server side of [Kea](https://github.com/kadenw213-svg/Kea). It runs the **Kea Hub**: one Kea account for everything, classes and study groups, leaderboards, Kea storage and sync, and Kea's shared Claude. It also includes a Windows app that turns any computer into a Kea server in a few clicks.
+<h1 align="center">KeaS</h1>
 
-Free, open source, and yours to host.
+<p align="center">
+  The server behind Kea: accounts, classes, study groups and sync, run on your own computer.
+</p>
 
-## Download
+<p align="center">
+  <a href="https://github.com/kadenw213-svg/KeaS/releases/latest"><b>⬇ Download KeaS</b></a>
+</p>
 
-Get the latest **KeaS Setup** from [Releases](https://github.com/kadenw213-svg/KeaS/releases). On first launch, KeaS walks you through setting up this computer as a Kea Hub:
+---
 
-1. **Choose where the data goes.** Any drive or folder; a big drive is best, since every account gets its own Kea storage.
-2. **Make it reachable from anywhere** with Tailscale Funnel, for free. KeaS installs Tailscale and sets up Funnel for you, so people can reach the Hub without you changing router settings or showing your home address.
-3. **Create the owner account**, with two-step sign-in.
+KeaS turns a Windows computer into a Kea Hub, the server that [Kea](https://github.com/kadenw213-svg/kea) connects
+to. It gives everyone one Kea account, lets instructors run classes and study groups, keeps each person's devices in
+step through their own Kea storage, and lets people without a Claude account have their classes set up on the Hub
+owner's Claude. Everything runs on hardware you own, and a few clicks of setup make it reachable from anywhere.
 
-After that, KeaS runs in the tray and starts with Windows. Light and dark themes are included.
+## Setup
 
-## The Kea Hub
+The first time KeaS opens, it walks you through three steps. Choose the drive the Hub keeps its data on; a large
+drive is best, since every account gets its own storage. KeaS then installs Tailscale and turns on Funnel, which
+gives the Hub a public https address for free without changing router settings or revealing your home address.
+Finally, create the owner account with two-step sign-in. From then on KeaS runs in the tray, starts with Windows,
+and keeps the Hub running.
 
-- **One Kea account.** Sign in once in Kea and KeaS.
-  - Passwords are stored only as a slow one-way hash (Argon2id or scrypt).
-  - Repeated wrong guesses lock the account for longer and longer.
-  - Two-step sign-in works with any authenticator app, and "Verify with Google" proves an email address.
-- **Terms that stay current.** Every account agrees to every section. When the terms change, people see exactly what changed and agree again before continuing.
-- **Classes.** Instructors create classes, invite people with a code, and put sessions on a shared calendar with meeting links. Hosting classes on a Hub needs the owner's approval.
-- **Studying that rewards studying:**
-  - practice sets graded by the Hub, so scores can't be faked;
-  - questions come back on a spaced schedule;
-  - XP, levels, streaks, and weekly and all-time class leaderboards;
-  - everyone chooses whether they appear by name, by nickname, or not at all.
-- **Kea storage and sync.** Kea syncs your devices through your Hub instead of a cloud drive. Only changed files move, and each version is tracked so devices never overwrite each other. Big downloads are paced so they can't fill the owner's internet connection.
-- **Kea's shared Claude.** People without their own Claude account can queue a scan of their classes on the Hub owner's Claude. Their school password never leaves their own computer: the scan reads their class site through their own Kea. The Hub keeps it fair with daily and weekly limits, one shared scan per course section, and question batches instead of regenerating.
-- **Built to be safe:**
-  - the owner console only answers on the Hub's own computer;
-  - every admin action is logged;
-  - backups are encrypted;
-  - anything that sends requests like a script is paused for the owner to review.
+## Accounts
 
-## Build from source
+One Kea account works in Kea and KeaS. Passwords are stored only as a slow one-way hash, never in a form anyone can
+read, and repeated wrong guesses lock an account for longer each time. Two-step sign-in works with any
+authenticator app, and **Verify with Google** proves an email address. Every account agrees to the Hub's terms
+section by section; when the terms change, people are shown exactly what changed and agree again before continuing.
 
-Needs Node 24.
+## Classes and studying
 
-```
-npm install
-npm run hub              # the Kea Hub on 127.0.0.1:4860 (owner console on 4861)
-npm run desktop          # the KeaS app
-npm run desktop:build    # the Windows installer
-npm test                 # all tests
-```
+Instructors create classes, invite people with a code, and put sessions on a shared calendar with meeting links.
+Practice questions are graded by the Hub, so scores can't be edited, and each question comes back on a spaced
+schedule. XP, levels, streaks, and weekly and all-time leaderboards reward studying. Each person chooses whether
+they appear by name, by nickname, or not at all.
 
-**Owner tools** run on the Hub's own computer:
-- `node hub/owner.mjs make-owner <email>`
-- `node hub/owner.mjs publish-terms`
-- `node hub/backup.mjs create <folder>`
+## Storage and sync
 
-## Roadmap
+Kea syncs each person's computers through their Kea storage on the Hub instead of a cloud drive. Only changed files
+move, every file keeps a version so two devices never overwrite each other, and large downloads are paced so they
+never fill the owner's internet connection.
 
-KeaS is growing into a free workforce suite for organizations:
-- scheduling, availability forms, time clock and certifications;
-- departments and budgets;
-- payroll preparation with tax tables verified each year.
+## Kea's shared Claude
 
-That work lives in `server/` and `web/`.
+People without their own Claude account can queue a scan of their classes on the Hub owner's Claude. Their school
+password never leaves their own computer: the scan reads their class site through their own Kea, and only page text
+reaches the Hub. Daily and weekly limits, one shared scan per course section, and batches of new questions in place
+of regenerating keep the queue fair and the owner's plan usable.
 
-## License
+## Install
 
-[MIT](LICENSE)
+**Windows 10 or 11 (64-bit):** download `KeaS-Setup-….exe` from the
+[latest release](https://github.com/kadenw213-svg/KeaS/releases/latest) and run it. The installer isn't code-signed
+yet, so Windows may show a warning; choose **More info → Run anyway**.
+
+## Built with
+
+Electron and Node.js, with SQLite (`node:sqlite`) for the Hub's data and no other runtime dependencies. Accounts use
+Argon2id or scrypt password hashing, Ed25519-signed tokens and TOTP two-step sign-in, and public access goes through
+Tailscale Funnel. To build KeaS from source, see [docs/DEVELOPING.md](docs/DEVELOPING.md).
+
+## Feedback
+
+Report bugs and ideas by [opening an issue](https://github.com/kadenw213-svg/KeaS/issues).
+
+---
+
+MIT licensed.
