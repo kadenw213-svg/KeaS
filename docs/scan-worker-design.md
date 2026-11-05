@@ -1,5 +1,15 @@
 # Scanning for other people on the owner's Claude: the worker design (2026-11-05)
 
+**Status (later 2026-11-05): built.**
+- **Hub relay and job-scoped folder access:** KeaS commit 54e76ec.
+- **Kea worker mode, launcher, student answerer and the "Use Kea's shared Claude" panel:** Kea commit e0714ef. Integration-tested with a stand-in student Kea.
+- **Not yet run end to end:** a real class site plus the owner's Claude. That needs the owner's desktop and a real student.
+- **Still open:**
+  - "25 more questions" jobs (the worker refuses them for now);
+  - giving classmates who joined a scan their copy of the course material;
+  - phone sync through the Hub;
+  - parent sign-off for under-18 accounts.
+
 Built so far:
 - **The Hub side** (`hub/index.mjs`, "shared Claude"): the queue and limits, plus `scan-inbox/` uploads, the worker's claim/finish calls, shared course folders and private member results.
 - **Kea syncing through the Hub** (Kea `electron/scholar/hubsync.cjs`). It mirrors the same `Kea/<profile>/` folder layout Kea used in OneDrive.
