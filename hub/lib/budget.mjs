@@ -1,5 +1,5 @@
 // The Claude budget: what the owner's Claude plan does for other people, and the limits that keep it usable.
-// (The rules in words are in docs/claude-usage-guidelines.md. Every number here is an owner setting.)
+// (Every number here is an owner setting: POST /owner/settings.)
 //
 // Kinds of Claude work someone can ask for:
 //   initial_scan   the first full scan of one of their classes. Once per class per person. If anyone in the same

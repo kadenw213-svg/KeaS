@@ -1,7 +1,7 @@
 # KeaS
 
 > ## PROTOTYPE — NOT FOR REAL USE
-> - Everything here runs on a **demo workplace with made-up people**. There are no real accounts and sign-in has no password.
+> - The **org server** runs on a **demo workplace with made-up people**, and its sign-in has no password. (The Kea Hub's accounts are real: see below.)
 > - **Payroll numbers are unverified estimates.** The tax and labor tables have not been checked for this year, every pay run is marked `unverified`, and **a pay run cannot be finalized**. The direct-deposit (NACHA) file is a sample that is never sent anywhere.
 > - The server listens on **127.0.0.1 only** (this computer).
 
@@ -24,7 +24,17 @@ KeaS is not a payroll processor. It prepares approved hours and pay estimates; p
   - **Timecards:** hours per pay period, missed-punch fix requests, manager approvals.
   - **People & certifications** (managers/payroll) and **Pay run** preview (payroll), with every warning and explanation.
 - **Org server** (`server/`): plain Node, SQLite, no runtime dependencies. API documented in [server/README.md](server/README.md).
-- **Research** behind the design: [docs/research/00-overview.md](docs/research/00-overview.md).
+- **Kea Hub** (`hub/`): the server behind Kea accounts.
+  - **Accounts:** passwords stored only as a slow one-way hash, lockouts after repeated wrong tries, optional two-step sign-in, and versioned terms everyone agrees to.
+  - **Classes:** invite codes and a class calendar.
+  - **Studying:** server-graded study sets and leaderboards.
+  - **Kea storage and sync.**
+  - **Kea's shared Claude:** a limited, queued service for people without their own Claude.
+  - Tests: `npm run test:hub`.
+- **KeaS desktop** (`desktop/`): the Windows app (`npm run desktop:build`). On first run it sets up this computer as a server:
+  - pick a data drive;
+  - optionally make it reachable from anywhere with Tailscale Funnel (installed and set up for you);
+  - it runs in the tray and starts with Windows.
 
 ## Run it
 

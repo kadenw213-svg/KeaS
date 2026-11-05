@@ -80,7 +80,7 @@ test('password rules: length, common list, own email/name', () => {
   assert.match(passwordProblem('short'), /10 characters/);
   assert.match(passwordProblem('password123'), /common/);
   assert.match(passwordProblem('aaaaaaaaaaaa'), /repeated|common/);
-  assert.match(passwordProblem('kadenw213-is-me', { email: 'kadenw213@gmail.com' }), /email/);
+  assert.match(passwordProblem('jordan.lee-is-me', { email: 'jordan.lee@example.com' }), /email/);
   assert.match(passwordProblem('Kaden Walsh 2026', { name: 'Kaden Walsh' }), /name/);
   assert.equal(passwordProblem('lantern velvet orbit'), null);
 });

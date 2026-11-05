@@ -51,7 +51,7 @@ function welcome() {
     h('h1', null, 'Set up KeaS on this computer'),
     h('p', { class: 'muted' }, 'KeaS can run a server right here. Pick what this computer is for.'),
     h('div', { class: 'cards' },
-      choice('hub', 'The Kea Hub', 'For Kea’s creator: everyone’s Kea accounts, classes, study groups, leaderboards and Kea storage live on this computer.', 'Owner'),
+      choice('hub', 'Run a Kea Hub', 'Only if you run the server that Kea accounts, classes and storage live on (Kea’s creator runs the main one). This makes a new, separate Hub on this computer; it doesn’t join anyone else’s.', 'Server owners'),
       choice('org', 'An organization’s server', 'Your workplace or club runs on this computer: schedules, availability, time clock, certifications, classes and payroll prep. Free, for any size.', 'Preview'),
       choice('join', 'I’m joining an organization', 'Someone else runs the server. You just need their link or code.'),
     ),
