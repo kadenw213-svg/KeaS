@@ -56,7 +56,12 @@
     {
       "id": "ai",
       "title": "11. Claude and other AI features",
-      "body": "- AI features are optional, except researching or updating tax and labor tables in KeaS, which needs Claude. Everything else can be done by hand.\n- AI features use your own Claude account, under Anthropic's terms. Kea sends Claude only what the feature needs.\n- AI output can be wrong. It is a draft (a schedule, a lesson, a table change, an explanation) until a person reviews it. Nothing an AI makes is published, sent or used for pay on its own."
+      "body": "- AI features are optional, except researching or updating tax and labor tables in KeaS, which needs Claude. Everything else can be done by hand.\n- AI features use your own Claude account, under Anthropic's terms, unless you use Kea's shared Claude (section 11b). Kea sends Claude only what the feature needs.\n- AI output can be wrong. It is a draft (a schedule, a lesson, a table change, an explanation) until a person reviews it. Nothing an AI makes is published, sent or used for pay on its own."
+    },
+    {
+      "id": "shared-claude",
+      "title": "11b. Kea's shared Claude",
+      "body": "If you don't have your own Claude, the developer's Claude can do a limited amount of work for you, for free, in a queue. To keep it working for everyone:\n- You need a verified email.\n- Each of your classes gets one first scan, and updates when something new is posted. If someone in your course section was already scanned, you share theirs right away.\n- When you run out of practice questions, you can ask for 25 more for a chapter, a few times per chapter. Classes are never regenerated from scratch on the shared Claude.\n- There are daily and weekly limits, and requests wait in line and run one at a time. Wait times can be long, and the queue can be paused.\n- Material made from a shared scan is shared with others in the same course section. Your grades, your own assignments and your private work are never shared.\n- Sending requests automatically, using several accounts to get around the limits, or overloading the queue gets the account suspended for review.\n- The shared Claude is a free extra, not a guaranteed service. It can change or stop at any time. For more, connect your own Claude."
     },
     {
       "id": "acceptable-use",
@@ -72,6 +77,11 @@
       "id": "third-party",
       "title": "14. Other services",
       "body": "Kea can connect to services run by others: Google, Microsoft, Anthropic (Claude), meeting services, school sites, banks, and the tunnel service that carries Hub traffic (Tailscale or Cloudflare). Those services have their own terms and privacy policies, and the developer isn't responsible for them."
+    },
+    {
+      "id": "donations",
+      "title": "14b. Donations",
+      "body": "- Kea is free. You can chip in through the \"Support Kea\" link if you want to, and Kea never asks you again or locks anything behind it.\n- Donations are gifts that help pay for running Kea. They don't buy extra shared-Claude use, priority, features or any promise of service, and they aren't refundable unless the law requires it."
     },
     {
       "id": "warranty",

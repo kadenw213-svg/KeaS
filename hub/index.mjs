@@ -11,6 +11,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync,
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkTerms, diffTerms, sameSections, termsPage } from './lib/terms.mjs';
+import { DEFAULTS as BUDGET, courseKey, decide, pickNext } from './lib/budget.mjs';
 import { googleKeys, verifyGoogleIdToken } from './lib/google.mjs';
 import { openDb, DATA_DIR } from './db.mjs';
 import { hashPassword, verifyPassword, needsRehash, passwordProblem } from './lib/passwords.mjs';
@@ -750,9 +751,190 @@ export function createHub({
     return { period, since, board: out, you: mine };
   });
 
+  // ================= the shared Claude (owner's plan): queue + limits =================
+  const getSetting = (k, fallback) => { const r = h.get('SELECT value FROM settings WHERE key = ?', k); return r ? JSON.parse(r.value) : fallback; };
+  const setSetting = (k, v) => h.run('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', k, JSON.stringify(v));
+  const limitsNow = () => ({ ...BUDGET, ...getSetting('limits', {}) });
+  const ownerIds = () => new Set(h.all("SELECT id FROM accounts WHERE role = 'owner'").map((r) => r.id));
+  const DAY_MS = 86400_000;
+  const dayStart = () => Date.parse(`${dayKey(now())}T00:00:00Z`);
+  // Jobs someone takes part in: ones they started plus ones they joined.
+  const MINE = '(j.account_id = ? OR j.id IN (SELECT job_id FROM scan_job_members WHERE account_id = ?))';
+  const avgMinutes = () => {
+    const r = h.all("SELECT started_at, finished_at FROM scan_jobs WHERE status = 'done' AND started_at IS NOT NULL ORDER BY finished_at DESC LIMIT 20");
+    return r.length ? r.reduce((s, x) => s + (x.finished_at - x.started_at), 0) / r.length / 60_000 : limitsNow().defaultJobMinutes;
+  };
+  const queueOrder = () => {
+    const owners = ownerIds();
+    return h.all("SELECT * FROM scan_jobs WHERE status IN ('queued','running') ORDER BY created_at")
+      .sort((a, b) => (b.status === 'running') - (a.status === 'running') || owners.has(b.account_id) - owners.has(a.account_id) || a.created_at - b.created_at);
+  };
+  const jobOut = (j, order = queueOrder()) => {
+    const pos = order.findIndex((x) => x.id === j.id);
+    return {
+      id: j.id, kind: j.kind, course: j.course_key, chapter: j.chapter, status: j.status, createdAt: j.created_at, finishedAt: j.finished_at, note: j.note,
+      ...(pos >= 0 && j.status === 'queued' ? { position: pos, etaMinutes: Math.round(pos * avgMinutes()) } : {}),
+    };
+  };
+  const allowance = (me) => {
+    const L = limitsNow();
+    const today = h.get(`SELECT COUNT(*) AS n FROM scan_jobs WHERE account_id = ? AND created_at >= ? AND status != 'cancelled'`, me.id, dayStart()).n;
+    const week = h.get(`SELECT COUNT(*) AS n FROM scan_jobs WHERE account_id = ? AND created_at >= ? AND status != 'cancelled'`, me.id, now() - 7 * DAY_MS).n;
+    return me.role === 'owner' ? { unlimited: true } : { today, perDay: L.perAccountDaily, week, perWeek: L.perAccountWeekly, batchSize: L.questionBatchSize };
+  };
+  /** Counts every request; flags someone refused a lot, and suspends an account sending requests like a script. */
+  const watchRequests = (me, kind, outcome, ip) => {
+    const day = dayKey(now());
+    h.run('INSERT INTO scan_requests (account_id,kind,outcome,at,day) VALUES (?,?,?,?,?)', me.id, kind, outcome, now(), day);
+    if (me.role === 'owner') return;
+    const L = limitsNow();
+    const all = h.get('SELECT COUNT(*) AS n FROM scan_requests WHERE account_id = ? AND day = ?', me.id, day).n;
+    const refused = h.get("SELECT COUNT(*) AS n FROM scan_requests WHERE account_id = ? AND day = ? AND outcome LIKE 'refuse%'", me.id, day).n;
+    const openToday = (reason) => h.get("SELECT 1 FROM flags WHERE account_id = ? AND reason = ? AND status = 'open' AND at >= ?", me.id, reason, dayStart());
+    if (all >= L.requestsBeforeSuspend) {
+      h.tx(() => {
+        h.run("UPDATE accounts SET status = 'suspended', updated_at = ? WHERE id = ?", now(), me.id);
+        h.run('DELETE FROM sessions WHERE account_id = ?', me.id);
+        if (!openToday('script_requests')) h.run('INSERT INTO flags (account_id,reason,detail,auto_suspended,at) VALUES (?,?,?,1,?)', me.id, 'script_requests', JSON.stringify({ requestsToday: all }), now());
+      });
+      audit('system', 'flag.auto_suspend', me.id, { requestsToday: all }, ip);
+      throw new HttpError(403, 'This account was paused for review: it sent far more requests than a person would. Kea’s creator will look at it.');
+    }
+    if (refused >= L.refusalsBeforeFlag && !openToday('many_refusals')) {
+      h.run('INSERT INTO flags (account_id,reason,detail,at) VALUES (?,?,?,?)', me.id, 'many_refusals', JSON.stringify({ refusedToday: refused }), now());
+      audit('system', 'flag.open', me.id, { refusedToday: refused }, ip);
+    }
+  };
+
+  R('POST', '/v1/scan', ({ me, body, ip }) => {
+    limit('join', me.id);
+    const kind = V.str(body.kind, 'Kind', { min: 1, max: 40 });
+    const key = courseKey(V.obj(body.course));
+    if (!key && kind !== 'regenerate') bad('Say which course: school, course code and term (and section if there is one).');
+    const chapter = kind === 'more_questions' ? V.str(body.chapter, 'Chapter', { optional: true, max: 120 }) : null;
+    const t = now();
+    const mats = key ? h.get('SELECT * FROM course_materials WHERE course_key = ?', key) : null;
+    const same = key ? h.get(`SELECT * FROM scan_jobs WHERE kind = ? AND course_key = ? AND status IN ('queued','running') ${kind === 'more_questions' ? 'AND chapter = ?' : ''} ORDER BY created_at LIMIT 1`, ...[kind, key, ...(kind === 'more_questions' ? [chapter] : [])]) : null;
+    const facts = {
+      verified: !!me.email_verified, owner: me.role === 'owner', chapter,
+      alreadyScannedByMe: !!(key && h.get('SELECT 1 FROM course_members WHERE course_key = ? AND account_id = ?', key, me.id)),
+      courseHasMaterials: !!mats, hoursSinceCourseUpdate: mats ? (t - mats.updated_at) / 3600_000 : null,
+      joinJobId: same && same.account_id !== me.id ? same.id : same ? same.id : null,
+      myQueued: h.get("SELECT COUNT(*) AS n FROM scan_jobs WHERE account_id = ? AND status IN ('queued','running')", me.id).n,
+      myJobsToday: h.get("SELECT COUNT(*) AS n FROM scan_jobs WHERE account_id = ? AND created_at >= ? AND status != 'cancelled'", me.id, dayStart()).n,
+      myJobsThisWeek: h.get("SELECT COUNT(*) AS n FROM scan_jobs WHERE account_id = ? AND created_at >= ? AND status != 'cancelled'", me.id, t - 7 * DAY_MS).n,
+      myBatchesThisChapter: kind === 'more_questions' ? h.get(`SELECT COUNT(*) AS n FROM scan_jobs j WHERE ${MINE} AND kind = 'more_questions' AND course_key = ? AND chapter = ? AND status NOT IN ('cancelled','failed')`, me.id, me.id, key, chapter).n : 0,
+      myBatchesToday: kind === 'more_questions' ? h.get(`SELECT COUNT(*) AS n FROM scan_jobs j WHERE ${MINE} AND kind = 'more_questions' AND created_at >= ? AND status NOT IN ('cancelled','failed')`, me.id, me.id, dayStart()).n : 0,
+    };
+    const d = decide(kind, getSetting('limits', {}), facts);
+    watchRequests(me, kind, d.action === 'refuse' ? `refuse:${d.code}` : d.action, ip);
+    if (d.action === 'refuse') throw new HttpError(429, d.reason, { code: d.code, allowance: allowance(me) });
+    if (kind === 'initial_scan') h.run('INSERT OR IGNORE INTO course_members (course_key,account_id,joined_at) VALUES (?,?,?)', key, me.id, t);
+    if (d.action === 'share') return { status: 'shared', message: d.reason, allowance: allowance(me) };
+    if (d.action === 'join') {
+      h.run('INSERT OR IGNORE INTO scan_job_members (job_id,account_id,joined_at) VALUES (?,?,?)', d.jobId, me.id, t);
+      return { status: 'joined', message: d.reason, job: jobOut(h.get('SELECT * FROM scan_jobs WHERE id = ?', d.jobId)), allowance: allowance(me) };
+    }
+    const id = randomUUID();
+    h.run('INSERT INTO scan_jobs (id,account_id,kind,course_key,chapter,detail,created_at) VALUES (?,?,?,?,?,?,?)', id, me.id, kind, key, chapter,
+      body.detail == null ? null : JSON.stringify(body.detail).slice(0, 4000), t);
+    return { status: 'queued', job: jobOut(h.get('SELECT * FROM scan_jobs WHERE id = ?', id)), allowance: allowance(me) };
+  });
+  R('GET', '/v1/scan', ({ me }) => {
+    const order = queueOrder();
+    return {
+      jobs: h.all(`SELECT * FROM scan_jobs j WHERE ${MINE} ORDER BY created_at DESC LIMIT 50`, me.id, me.id).map((j) => jobOut(j, order)),
+      allowance: allowance(me),
+      paused: (getSetting('pausedUntil', 0) || 0) > now(),
+    };
+  });
+  R('POST', '/v1/scan/:id/cancel', ({ me, params }) => {
+    const j = h.get("SELECT * FROM scan_jobs WHERE id = ? AND status = 'queued'", params.id) ?? notFound('Nothing waiting with that id.');
+    if (j.account_id !== me.id) {
+      h.run('DELETE FROM scan_job_members WHERE job_id = ? AND account_id = ?', j.id, me.id);
+      return { ok: true };
+    }
+    // Someone else joined it: it's theirs now instead of being cancelled.
+    const heir = h.get('SELECT account_id FROM scan_job_members WHERE job_id = ? ORDER BY joined_at LIMIT 1', j.id);
+    h.tx(() => {
+      if (heir) {
+        h.run('UPDATE scan_jobs SET account_id = ? WHERE id = ?', heir.account_id, j.id);
+        h.run('DELETE FROM scan_job_members WHERE job_id = ? AND account_id = ?', j.id, heir.account_id);
+      } else h.run("UPDATE scan_jobs SET status = 'cancelled', finished_at = ? WHERE id = ?", now(), j.id);
+    });
+    return { ok: true };
+  });
+  // Donations: one quiet link the apps can show on the account page. Never a pop-up, never a nag.
+  R('GET', '/v1/support', () => getSetting('donate', { url: null, message: null }), { auth: false });
+
   // ================= owner console (localhost, never tunneled) =================
   const own = makeRouter();
   const O = own.add;
+  // The worker on the owner's PC: take the next job, report when it's done. Paused (or over today's total for others):
+  // only the owner's own jobs come out.
+  O('POST', '/owner/scan/next', () => {
+    if (h.get("SELECT 1 FROM scan_jobs WHERE status = 'running'")) return { job: null, reason: 'A job is already running.' };
+    const done = new Map(h.all("SELECT account_id, COUNT(*) AS n FROM scan_jobs WHERE started_at >= ? AND status IN ('running','done') GROUP BY account_id", dayStart()).map((r) => [r.account_id, r.n]));
+    const owners = ownerIds();
+    const globalUsedToday = h.get(`SELECT COUNT(*) AS n FROM scan_jobs WHERE started_at >= ? AND status IN ('running','done','failed') AND account_id NOT IN (SELECT id FROM accounts WHERE role = 'owner')`, dayStart()).n;
+    const j = pickNext(h.all("SELECT * FROM scan_jobs WHERE status = 'queued'"), { doneTodayByAccount: done, ownerIds: owners, globalUsedToday, limits: getSetting('limits', {}), paused: (getSetting('pausedUntil', 0) || 0) > now() });
+    if (!j) return { job: null };
+    h.run("UPDATE scan_jobs SET status = 'running', started_at = ? WHERE id = ?", now(), j.id);
+    const members = h.all('SELECT a.id, a.email FROM accounts a WHERE a.id = ? OR a.id IN (SELECT account_id FROM scan_job_members WHERE job_id = ?)', j.account_id, j.id);
+    return { job: { ...jobOut(h.get('SELECT * FROM scan_jobs WHERE id = ?', j.id)), detail: j.detail ? JSON.parse(j.detail) : null, members } };
+  });
+  O('POST', '/owner/scan/:id/finish', ({ params, body }) => {
+    const j = h.get("SELECT * FROM scan_jobs WHERE id = ? AND status = 'running'", params.id) ?? notFound('No running job with that id.');
+    const ok = V.bool(body.ok, 'ok');
+    h.tx(() => {
+      h.run('UPDATE scan_jobs SET status = ?, finished_at = ?, note = ? WHERE id = ?', ok ? 'done' : 'failed', now(), V.str(body.note, 'note', { optional: true, max: 2000 }), j.id);
+      if (ok && j.kind !== 'more_questions') h.run('INSERT INTO course_materials (course_key,first_job_id,created_at,updated_at) VALUES (?,?,?,?) ON CONFLICT(course_key) DO UPDATE SET updated_at = excluded.updated_at', j.course_key, j.id, now(), now());
+    });
+    return { ok: true };
+  });
+  // The plan hit its limit, or the owner needs it: others' jobs wait until then (hours null = resume now).
+  O('POST', '/owner/scan/pause', ({ body }) => {
+    const hours = body.hours == null ? null : Number(body.hours);
+    setSetting('pausedUntil', hours ? now() + hours * 3600_000 : 0);
+    return { pausedUntil: getSetting('pausedUntil', 0) };
+  });
+  O('GET', '/owner/scan/queue', () => {
+    const order = queueOrder();
+    const emails = new Map(h.all('SELECT id, email FROM accounts').map((a) => [a.id, a.email]));
+    return { paused: (getSetting('pausedUntil', 0) || 0) > now(), avgMinutes: Math.round(avgMinutes()), jobs: order.map((j) => ({ ...jobOut(j, order), email: emails.get(j.account_id), joined: h.get('SELECT COUNT(*) AS n FROM scan_job_members WHERE job_id = ?', j.id).n })) };
+  });
+  O('GET', '/owner/settings', () => ({ limits: limitsNow(), donate: getSetting('donate', { url: null, message: null }) }));
+  O('POST', '/owner/settings', ({ body }) => {
+    if (body.limits) {
+      const next = { ...getSetting('limits', {}) };
+      for (const [k, v] of Object.entries(V.obj(body.limits))) {
+        if (!(k in BUDGET)) bad(`Unknown limit: ${k}`);
+        if (typeof BUDGET[k] === 'boolean') next[k] = V.bool(v, k);
+        else next[k] = V.int(v, k, { min: 0, max: 100_000 });
+      }
+      setSetting('limits', next);
+    }
+    if (body.donate) {
+      const d = V.obj(body.donate);
+      setSetting('donate', { url: V.url(d.url, 'Donation link'), message: V.str(d.message, 'Message', { optional: true, max: 200 }) });
+    }
+    return { limits: limitsNow(), donate: getSetting('donate', { url: null, message: null }) };
+  });
+  O('GET', '/owner/flags', ({ query }) => ({
+    flags: h.all('SELECT f.*, a.email, a.status AS account_status FROM flags f JOIN accounts a ON a.id = f.account_id WHERE f.status = ? ORDER BY f.at DESC LIMIT 200', query.status ?? 'open')
+      .map((f) => ({ id: f.id, accountId: f.account_id, email: f.email, reason: f.reason, detail: f.detail ? JSON.parse(f.detail) : null, autoSuspended: !!f.auto_suspended, accountStatus: f.account_status, at: f.at, note: f.note })),
+  }));
+  O('POST', '/owner/flags/:id/resolve', ({ params, body }) => {
+    const f = h.get('SELECT * FROM flags WHERE id = ?', Number(params.id)) ?? notFound();
+    const action = V.enum(body.action ?? 'dismiss', 'action', ['dismiss', 'unsuspend', 'suspend']);
+    h.tx(() => {
+      if (action === 'unsuspend') h.run("UPDATE accounts SET status = 'active', updated_at = ? WHERE id = ?", now(), f.account_id);
+      if (action === 'suspend') { h.run("UPDATE accounts SET status = 'suspended', updated_at = ? WHERE id = ?", now(), f.account_id); h.run('DELETE FROM sessions WHERE account_id = ?', f.account_id); }
+      h.run("UPDATE flags SET status = 'resolved', resolved_at = ?, note = ? WHERE id = ?", now(), V.str(body.note, 'note', { optional: true, max: 2000 }), f.id);
+    });
+    audit('owner', `owner.flag_${action}`, f.account_id, null, 'local');
+    return { ok: true };
+  });
   const getAccount = (id) => h.get('SELECT * FROM accounts WHERE id = ? OR email = ?', id, String(id).toLowerCase()) ?? notFound('No such account.');
   O('GET', '/owner/stats', () => ({
     accounts: h.get('SELECT COUNT(*) AS n FROM accounts').n,

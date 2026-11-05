@@ -351,6 +351,82 @@ test('Kea storage: write, read, versions and conflicts, quota, path safety, isol
   assert.equal(exp.body.termsAgreements.length, 1);
 });
 
+test('shared Claude: verified only, classmates share one scan, batches of 25, limits, owner queue and pause', async () => {
+  const course = { school: 'UCCS', code: 'CHEM 1110', term: 'Spring 2027', section: '001' };
+  const mk = async (email) => { const t = await register(email); await owner('POST', `/owner/accounts/${email}`, { emailVerified: true }); return t; };
+  const unverified = await register('nov@example.com');
+  assert.equal((await call('POST', '/v1/scan', unverified, { kind: 'initial_scan', course })).body.code, 'verify');
+  const a = await mk('scan-a@example.com'), b = await mk('scan-b@example.com'), c = await mk('scan-c@example.com');
+
+  // A queues the first scan of the course; B (same section, typed differently) joins it instead of a second run.
+  const qa = await call('POST', '/v1/scan', a, { kind: 'initial_scan', course });
+  assert.deepEqual([qa.status, qa.body.status, qa.body.job.position], [200, 'queued', 0]);
+  const jb = await call('POST', '/v1/scan', b, { kind: 'initial_scan', course: { ...course, code: 'chem-1110' } });
+  assert.equal(jb.body.status, 'joined');
+  assert.equal((await call('POST', '/v1/scan', a, { kind: 'initial_scan', course })).body.code, 'already_scanned');
+  assert.equal((await call('POST', '/v1/scan', a, { kind: 'regenerate', course })).body.code, 'no_regenerate');
+
+  // The worker on the owner's PC runs it; then C gets it shared, with no Claude at all.
+  const next = await owner('POST', '/owner/scan/next');
+  assert.equal(next.body.job.id, qa.body.job.id);
+  assert.deepEqual(next.body.job.members.map((m) => m.email).sort(), ['scan-a@example.com', 'scan-b@example.com']);
+  assert.equal((await owner('POST', '/owner/scan/next')).body.job, null, 'one at a time');
+  await owner('POST', `/owner/scan/${qa.body.job.id}/finish`, { ok: true });
+  const sc = await call('POST', '/v1/scan', c, { kind: 'initial_scan', course });
+  assert.equal(sc.body.status, 'shared');
+  assert.equal(sc.body.allowance.today, 0, 'sharing costs nothing');
+
+  // Updates: once per cooldown for the whole section.
+  assert.equal((await call('POST', '/v1/scan', b, { kind: 'update_scan', course })).body.code, 'cooldown');
+
+  // More questions: batches of 25, joined when someone already asked for that chapter, capped per day.
+  const m1 = await call('POST', '/v1/scan', a, { kind: 'more_questions', course, chapter: 'Ch 2' });
+  assert.equal(m1.body.status, 'queued');
+  assert.equal(m1.body.allowance.batchSize, 25);
+  assert.equal((await call('POST', '/v1/scan', c, { kind: 'more_questions', course, chapter: 'Ch 2' })).body.status, 'joined');
+  assert.equal((await call('POST', '/v1/scan', a, { kind: 'more_questions', course, chapter: 'Ch 3' })).body.status, 'queued');
+  // (A has now started 3 jobs today: the day's limit.)
+  assert.equal((await call('POST', '/v1/scan', a, { kind: 'more_questions', course, chapter: 'Ch 4' })).body.code, 'batch_day');
+  assert.equal((await call('POST', '/v1/scan', a, { kind: 'initial_scan', course: { ...course, code: 'MATH 1120' } })).body.code, 'day_cap');
+  const mine = await call('GET', '/v1/scan', c);
+  assert.ok(mine.body.jobs.some((j) => j.chapter === 'Ch 2' && j.status === 'queued' && j.position >= 0));
+
+  // Paused (the plan hit its limit): others wait; the owner's own jobs still run first.
+  await owner('POST', '/owner/scan/pause', { hours: 5 });
+  assert.equal((await owner('POST', '/owner/scan/next')).body.job, null);
+  await owner('POST', '/owner/scan/pause', { hours: null });
+  assert.equal((await owner('POST', '/owner/scan/next')).body.job.chapter, 'Ch 2');
+
+  // Cancelling a job someone joined hands it to them instead.
+  const qb = await call('POST', '/v1/scan', b, { kind: 'more_questions', course, chapter: 'Ch 7' });
+  await call('POST', '/v1/scan', c, { kind: 'more_questions', course, chapter: 'Ch 7' });
+  await call('POST', `/v1/scan/${qb.body.job.id}/cancel`, b);
+  assert.ok((await call('GET', '/v1/scan', c)).body.jobs.some((j) => j.id === qb.body.job.id && j.status === 'queued'));
+
+  // Settings and the quiet donation link.
+  assert.equal((await owner('POST', '/owner/settings', { limits: { perAccountDaily: 5 }, donate: { url: 'https://ko-fi.com/example', message: 'Kea is free. If it helps you, you can chip in.' } })).body.limits.perAccountDaily, 5);
+  assert.equal((await owner('POST', '/owner/settings', { limits: { nope: 1 } })).status, 400);
+  assert.equal((await call('GET', '/v1/support')).body.url, 'https://ko-fi.com/example');
+});
+
+test('shared Claude: an account sending requests like a script is suspended and flagged for review', async () => {
+  const t = await register('spam@example.com');
+  await owner('POST', '/owner/accounts/spam@example.com', { emailVerified: true });
+  await owner('POST', '/owner/settings', { limits: { requestsBeforeSuspend: 12, refusalsBeforeFlag: 4 } });
+  const course = { school: 'X', code: 'Y 1', term: 'Z' };
+  let last;
+  for (let i = 0; i < 12; i++) { clock += 61_000; last = await call('POST', '/v1/scan', t, { kind: 'regenerate', course }); }
+  assert.equal(last.status, 403);
+  assert.equal((await call('GET', '/v1/me', t)).status, 401, 'signed out');
+  const flags = (await owner('GET', '/owner/flags')).body.flags.filter((f) => f.email === 'spam@example.com');
+  assert.deepEqual(flags.map((f) => f.reason).sort(), ['many_refusals', 'script_requests']);
+  const s = flags.find((f) => f.reason === 'script_requests');
+  assert.equal(s.autoSuspended, true);
+  assert.equal((await owner('POST', `/owner/flags/${s.id}/resolve`, { action: 'unsuspend', note: 'Was a test' })).status, 200);
+  assert.equal((await call('POST', '/v1/auth/login', null, { email: 'spam@example.com', password: 'lantern velvet orbit' }, freshIp())).status, 200);
+  await owner('POST', '/owner/settings', { limits: { requestsBeforeSuspend: 200, refusalsBeforeFlag: 15 } });
+});
+
 // Last: publishing new terms locks everyone out until they agree again.
 test('terms change: everyone must re-agree; only changes shown; reading, export and sign-out still work', async () => {
   const t = await register('reader@example.com', 'Rae Reader');

@@ -107,6 +107,40 @@ CREATE TABLE IF NOT EXISTS files (
   PRIMARY KEY (account_id, path)
 );
 CREATE TABLE IF NOT EXISTS google_tokens_used (token_hash TEXT PRIMARY KEY, at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+-- The shared-Claude queue (hub/lib/budget.mjs). One row per Claude job; people who asked for the same thing join it.
+CREATE TABLE IF NOT EXISTS scan_jobs (
+  id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('initial_scan','update_scan','more_questions')),
+  course_key TEXT NOT NULL, chapter TEXT, detail TEXT,
+  status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','running','done','failed','cancelled')),
+  created_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER, note TEXT
+);
+CREATE INDEX IF NOT EXISTS scan_jobs_status ON scan_jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS scan_jobs_account ON scan_jobs(account_id, created_at);
+CREATE TABLE IF NOT EXISTS scan_job_members (
+  job_id TEXT NOT NULL REFERENCES scan_jobs(id) ON DELETE CASCADE, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  joined_at INTEGER NOT NULL, PRIMARY KEY (job_id, account_id)
+);
+-- A course section that has scanned materials everyone in it shares.
+CREATE TABLE IF NOT EXISTS course_materials (
+  course_key TEXT PRIMARY KEY, first_job_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS course_members (
+  course_key TEXT NOT NULL, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, joined_at INTEGER NOT NULL,
+  PRIMARY KEY (course_key, account_id)
+);
+CREATE TABLE IF NOT EXISTS scan_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL, outcome TEXT NOT NULL, at INTEGER NOT NULL, day TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS scan_requests_day ON scan_requests(account_id, day);
+-- Accounts flagged for the owner's review (overuse, scripts). Suspension can be automatic; lifting it is the owner's.
+CREATE TABLE IF NOT EXISTS flags (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  reason TEXT NOT NULL, detail TEXT, auto_suspended INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','resolved')), at INTEGER NOT NULL, resolved_at INTEGER, note TEXT
+);
 `;
 
 // Columns added after the first release, applied to existing databases.

@@ -10,6 +10,48 @@ import { loadOrCreateKey, signToken, verifyToken } from '../../hub/lib/tokens.mj
 import { Windows, lockFor, FREE, MAX_LOCK_MS } from '../../hub/lib/limiter.mjs';
 import { scoreAnswer, POINTS, INTERVAL_DAYS, levelOf, xpForLevel, streak, weekStart, capped, DAILY_CAP } from '../../hub/lib/study.mjs';
 import { seal, open } from '../../hub/backup.mjs';
+import { courseKey, decide, pickNext, DEFAULTS } from '../../hub/lib/budget.mjs';
+
+test('claude budget: course keys match however they are typed', () => {
+  assert.equal(courseKey({ school: 'UCCS', code: 'BIO 1010', term: 'Spring 2027', section: '002' }), courseKey({ school: ' uccs ', code: 'bio-1010', term: 'spring  2027', section: '002' }));
+  assert.equal(courseKey({ school: 'UCCS', code: '', term: 'x' }), null);
+});
+
+test('claude budget: decisions', () => {
+  const base = { verified: true, owner: false, myQueued: 0, myJobsToday: 0, myJobsThisWeek: 0, myBatchesThisChapter: 0, myBatchesToday: 0 };
+  const d = (kind, f) => decide(kind, {}, { ...base, ...f });
+  assert.equal(d('regenerate').code, 'no_regenerate');
+  assert.equal(decide('regenerate', {}, { ...base, owner: true }).code, 'no_regenerate', 'not even the owner regenerates on the shared queue');
+  assert.equal(d('initial_scan', { verified: false }).code, 'verify');
+  assert.equal(d('initial_scan', {}).action, 'queue');
+  assert.equal(d('initial_scan', { courseHasMaterials: true }).action, 'share');
+  assert.equal(d('initial_scan', { alreadyScannedByMe: true }).code, 'already_scanned');
+  assert.equal(d('initial_scan', { joinJobId: 'j1' }).action, 'join');
+  assert.equal(d('update_scan', { hoursSinceCourseUpdate: 3 }).code, 'cooldown');
+  assert.equal(d('update_scan', { hoursSinceCourseUpdate: 30 }).action, 'queue');
+  assert.equal(d('more_questions', {}).code, 'chapter');
+  assert.equal(d('more_questions', { chapter: 'Ch 3', myBatchesThisChapter: DEFAULTS.questionBatchesPerChapter }).code, 'chapter_cap');
+  assert.equal(d('more_questions', { chapter: 'Ch 3', myBatchesToday: DEFAULTS.questionBatchesPerDay }).code, 'batch_day');
+  assert.equal(d('initial_scan', { myQueued: DEFAULTS.maxQueuedPerAccount }).code, 'queue_full');
+  assert.equal(d('initial_scan', { myJobsToday: DEFAULTS.perAccountDaily }).code, 'day_cap');
+  assert.equal(d('initial_scan', { myJobsThisWeek: DEFAULTS.perAccountWeekly }).code, 'week_cap');
+  assert.equal(decide('initial_scan', { perAccountDaily: 10 }, { ...base, myJobsToday: 5 }).action, 'queue', 'owner settings override defaults');
+  assert.equal(decide('initial_scan', {}, { ...base, owner: true, myJobsToday: 99, verified: false }).action, 'queue', 'the owner has no limits');
+});
+
+test('claude budget: turn order is fair and the owner goes first', () => {
+  const q = [
+    { id: 'a1', account_id: 'a', created_at: 1 }, { id: 'a2', account_id: 'a', created_at: 2 },
+    { id: 'b1', account_id: 'b', created_at: 3 }, { id: 'o1', account_id: 'owner', created_at: 4 },
+  ];
+  const ctx = (o) => ({ doneTodayByAccount: new Map(), ownerIds: new Set(['owner']), globalUsedToday: 0, limits: {}, paused: false, ...o });
+  assert.equal(pickNext(q, ctx()).id, 'o1');
+  const others = q.filter((j) => j.account_id !== 'owner');
+  assert.equal(pickNext(others, ctx({ doneTodayByAccount: new Map([['a', 1]]) })).id, 'b1', 'whoever has had fewer jobs today goes first');
+  assert.equal(pickNext(others, ctx({ paused: true })), null);
+  assert.equal(pickNext(q, ctx({ paused: true })).id, 'o1', 'paused: only the owner');
+  assert.equal(pickNext(others, ctx({ globalUsedToday: DEFAULTS.globalDaily })), null);
+});
 
 const DAY = 86400_000;
 
