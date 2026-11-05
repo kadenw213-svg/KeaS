@@ -1,30 +1,48 @@
-// Password hashing for the Kea Hub. Passwords are never stored or logged: only an Argon2id hash (Node's built-in
-// crypto.argon2), with a random salt per account. Not even the owner can read a password back; recovery is a reset.
-import { argon2, randomBytes, timingSafeEqual } from 'node:crypto';
+// Password hashing for the Kea Hub. Passwords are never stored or logged: only a slow, memory-hard one-way hash with
+// a random salt per account. Not even the owner can read a password back; recovery is a reset.
+//
+// Argon2id where the runtime has it (Node 24.7+). Inside the KeaS desktop app, Electron's crypto library (BoringSSL)
+// has no Argon2, so there it's scrypt at OWASP's recommended strength (N=2^17, r=8, p=1: 128 MiB per hash). Both
+// formats verify wherever their algorithm exists, and a hash weaker than today's settings is upgraded on the next
+// successful sign-in (needsRehash).
+import { argon2, argon2Sync, scrypt, randomBytes, timingSafeEqual } from 'node:crypto';
 import { COMMON } from './common-passwords.mjs';
 
-// OWASP's Argon2id baseline (19 MiB, 2 passes, 1 lane). Stored in the hash string, so it can be raised later and old
-// hashes are upgraded on the next successful sign-in (needsRehash).
 export const PARAMS = { memory: 19456, passes: 2, parallelism: 1, tagLength: 32 };
+export const SCRYPT = { N: 2 ** 17, r: 8, p: 1, keylen: 32 };
+
+export const HAS_ARGON2 = (() => {
+  try { argon2Sync('argon2id', { message: 'x', nonce: Buffer.alloc(16), parallelism: 1, tagLength: 16, memory: 64, passes: 1 }); return true; } catch { return false; }
+})();
 
 const b64 = (b) => Buffer.from(b).toString('base64url');
-const derive = (password, salt, p) =>
+const deriveArgon = (password, salt, p) =>
   new Promise((resolve, reject) =>
     argon2('argon2id', { message: Buffer.from(password, 'utf8'), nonce: salt, parallelism: p.parallelism, tagLength: p.tagLength, memory: p.memory, passes: p.passes }, (err, out) => (err ? reject(err) : resolve(out))),
   );
+const deriveScrypt = (password, salt, p) =>
+  new Promise((resolve, reject) =>
+    scrypt(Buffer.from(password, 'utf8'), salt, p.keylen, { N: p.N, r: p.r, p: p.p, maxmem: 160 * p.N * p.r + 1024 * 1024 }, (err, out) => (err ? reject(err) : resolve(out))),
+  );
 
-/** `argon2id$m=19456,t=2,p=1$<salt>$<hash>` */
-export async function hashPassword(password, p = PARAMS) {
+/** `argon2id$m=19456,t=2,p=1$<salt>$<hash>` or `scrypt$n=17,r=8,p=1$<salt>$<hash>` (n is log2 N). */
+export async function hashPassword(password, { algorithm = HAS_ARGON2 ? 'argon2id' : 'scrypt' } = {}) {
   const salt = randomBytes(16);
-  const out = await derive(password, salt, p);
-  return `argon2id$m=${p.memory},t=${p.passes},p=${p.parallelism}$${b64(salt)}$${b64(out)}`;
+  if (algorithm === 'argon2id') {
+    const p = PARAMS;
+    return `argon2id$m=${p.memory},t=${p.passes},p=${p.parallelism}$${b64(salt)}$${b64(await deriveArgon(password, salt, p))}`;
+  }
+  const s = SCRYPT;
+  return `scrypt$n=${Math.log2(s.N)},r=${s.r},p=${s.p}$${b64(salt)}$${b64(await deriveScrypt(password, salt, s))}`;
 }
 
 function parse(stored) {
-  const m = /^argon2id\$m=(\d+),t=(\d+),p=(\d+)\$([\w-]+)\$([\w-]+)$/.exec(String(stored || ''));
-  if (!m) return null;
-  const hash = Buffer.from(m[5], 'base64url');
-  return { memory: +m[1], passes: +m[2], parallelism: +m[3], tagLength: hash.length, salt: Buffer.from(m[4], 'base64url'), hash };
+  const str = String(stored || '');
+  let m = /^argon2id\$m=(\d+),t=(\d+),p=(\d+)\$([\w-]+)\$([\w-]+)$/.exec(str);
+  if (m) { const hash = Buffer.from(m[5], 'base64url'); return { alg: 'argon2id', memory: +m[1], passes: +m[2], parallelism: +m[3], tagLength: hash.length, salt: Buffer.from(m[4], 'base64url'), hash }; }
+  m = /^scrypt\$n=(\d+),r=(\d+),p=(\d+)\$([\w-]+)\$([\w-]+)$/.exec(str);
+  if (m && +m[1] >= 10 && +m[1] <= 22) { const hash = Buffer.from(m[5], 'base64url'); return { alg: 'scrypt', N: 2 ** +m[1], r: +m[2], p: +m[3], keylen: hash.length, salt: Buffer.from(m[4], 'base64url'), hash }; }
+  return null;
 }
 
 // A real hash of a random password: checking an unknown email costs the same time as checking a real one.
@@ -33,14 +51,19 @@ const dummyHash = async () => (dummy ??= await hashPassword(randomBytes(18).toSt
 
 /** Constant-time check. A missing or malformed hash still does the full work and returns false. */
 export async function verifyPassword(password, stored) {
-  const p = parse(stored) ?? parse(await dummyHash());
-  const out = await derive(String(password ?? ''), p.salt, p);
-  return stored != null && parse(stored) !== null && timingSafeEqual(out, p.hash);
+  const real = parse(stored);
+  const p = real && (real.alg === 'scrypt' || HAS_ARGON2) ? real : parse(await dummyHash());
+  const pw = String(password ?? '');
+  const out = p.alg === 'argon2id' ? await deriveArgon(pw, p.salt, p) : await deriveScrypt(pw, p.salt, p);
+  return p === real && timingSafeEqual(out, p.hash);
 }
 
 export const needsRehash = (stored) => {
   const p = parse(stored);
-  return !p || p.memory < PARAMS.memory || p.passes < PARAMS.passes || p.tagLength !== PARAMS.tagLength;
+  if (!p) return true;
+  if (p.alg === 'argon2id') return p.memory < PARAMS.memory || p.passes < PARAMS.passes || p.tagLength !== PARAMS.tagLength;
+  // scrypt: upgrade to Argon2id where it exists, or to today's scrypt strength.
+  return HAS_ARGON2 || p.N < SCRYPT.N || p.r < SCRYPT.r || p.keylen !== SCRYPT.keylen;
 };
 
 /** Why a new password is refused, or null. Long passphrases are encouraged; composition rules are not used (NIST 800-63B). */

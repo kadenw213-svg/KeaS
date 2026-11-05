@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'" />
+    <title>KeaS setup</title>
+    <link rel="stylesheet" href="setup.css" />
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand"><span class="mark">K</span> KeaS</div>
+      <ol class="progress" id="progress"></ol>
+      <label class="theme">
+        <span class="sr">Theme</span>
+        <select id="theme">
+          <option value="system">System theme</option>
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+        </select>
+      </label>
+    </header>
+    <main id="app"></main>
+    <script src="setup.js"></script>
+  </body>
+</html>

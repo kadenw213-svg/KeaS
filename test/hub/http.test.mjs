@@ -101,6 +101,13 @@ test('login: right password works, wrong is generic, unknown email looks identic
   assert.equal((await owner('POST', '/owner/accounts/learner@example.com/unlock')).status, 200);
 });
 
+test('a faked forwarded address does not escape the per-IP limit', async () => {
+  // The proxy appends the real address last; a client-supplied first entry is ignored.
+  let last;
+  for (let i = 0; i < 31; i++) last = await call('POST', '/v1/auth/login', null, { email: `fake${i}@example.com`, password: 'x' }, { 'x-test-ip': `1.2.3.${i}, 198.51.100.7` });
+  assert.equal(last.status, 429);
+});
+
 test('per-IP limit on sign-in attempts', async () => {
   const ip = { 'x-test-ip': '203.0.113.9' };
   let last;

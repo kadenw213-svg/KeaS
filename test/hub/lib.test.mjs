@@ -25,6 +25,15 @@ test('passwords: argon2id hash verifies, wrong and missing fail, hash format', a
   assert.equal(needsRehash('argon2id$m=4096,t=1,p=1$AAAA$BBBB'), true);
 });
 
+test('passwords: scrypt (used inside the desktop app, where Electron has no Argon2) verifies too', async () => {
+  const s = await hashPassword('correct horse battery', { algorithm: 'scrypt' });
+  assert.match(s, /^scrypt\$n=17,r=8,p=1\$/);
+  assert.equal(await verifyPassword('correct horse battery', s), true);
+  assert.equal(await verifyPassword('correct horse batterz', s), false);
+  assert.equal(await verifyPassword('x', 'scrypt$n=40,r=8,p=1$AAAA$BBBB'), false, 'absurd cost is refused, not run');
+  assert.equal(needsRehash('scrypt$n=14,r=8,p=1$AAAA$BBBB'), true);
+});
+
 test('password rules: length, common list, own email/name', () => {
   assert.match(passwordProblem('short'), /10 characters/);
   assert.match(passwordProblem('password123'), /common/);

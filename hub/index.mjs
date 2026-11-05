@@ -823,7 +823,13 @@ export function createHub({
 
   // ================= request handling =================
   const clientIp = (req) => {
-    if (ipHeader) { const v = req.headers[ipHeader.toLowerCase()]; if (v) return String(v).split(',')[0].trim(); }
+    // Behind one trusted proxy (Tailscale Funnel), X-Forwarded-For's LAST entry is the address the proxy saw; earlier
+    // entries come from the client and can be faked to dodge the per-IP limits. Single-value headers
+    // (cf-connecting-ip) are used as they are.
+    if (ipHeader) {
+      const v = req.headers[ipHeader.toLowerCase()];
+      if (v) { const parts = String(v).split(',').map((s) => s.trim()).filter(Boolean); if (parts.length) return parts[parts.length - 1]; }
+    }
     return req.socket.remoteAddress || 'unknown';
   };
 
