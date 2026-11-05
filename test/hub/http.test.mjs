@@ -456,6 +456,60 @@ test('shared Claude: an account sending requests like a script is suspended and 
   await owner('POST', '/owner/settings', { limits: { requestsBeforeSuspend: 200, refusalsBeforeFlag: 15 } });
 });
 
+test('relay: the worker browses through the person’s own Kea; their Kea folder is open to the worker only while the job runs', async () => {
+  const email = 'relay@example.com';
+  const t = await register(email);
+  await owner('POST', `/owner/accounts/${email}`, { emailVerified: true });
+  const other = await register('relay-other@example.com');
+  const course = { school: 'Relay U', code: 'HIS 101', term: 'Fall 2027' };
+  const q = await call('POST', '/v1/scan', t, { kind: 'initial_scan', course });
+  const jobId = q.body.job.id;
+  await fetch(`${base}/v1/files/scan-inbox/${jobId}/school.json`, { method: 'PUT', headers: { authorization: `Bearer ${t}` }, body: '{"home":"https://d2l.relay.edu"}' });
+  await call('POST', `/v1/scan/${jobId}/ready`, t);
+  // (An earlier test leaves a job running; only one runs at a time.)
+  for (const j of (await owner('GET', '/owner/scan/queue')).body.jobs.filter((x) => x.status === 'running')) await owner('POST', `/owner/scan/${j.id}/finish`, { ok: true });
+  // Not running yet: nobody can poll it, and the worker can't touch their folder.
+  assert.equal((await call('GET', `/v1/scan/${jobId}/calls`, t)).status, 404);
+  assert.equal((await owner('GET', `/owner/scan/${jobId}/kea-files`)).status, 404);
+  // (Earlier tests left other jobs queued ahead of this one: run through them.)
+  for (let n = await owner('POST', '/owner/scan/next'); n.body.job.id !== jobId; n = await owner('POST', '/owner/scan/next')) await owner('POST', `/owner/scan/${n.body.job.id}/finish`, { ok: true });
+
+  // Their Kea is waiting for calls; the worker asks to fetch a page; their Kea answers.
+  const poll = call('GET', `/v1/scan/${jobId}/calls`, t);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal((await owner('GET', `/owner/scan/${jobId}/relay`)).body.connected, true);
+  const asked = owner('POST', `/owner/scan/${jobId}/call`, { op: 'request', args: { url: 'https://d2l.relay.edu/d2l/api/lp/1.0/enrollments/myenrollments/' } });
+  const got = await poll;
+  assert.equal(got.body.calls.length, 1);
+  const c1 = got.body.calls[0];
+  assert.deepEqual([c1.op, c1.args.url], ['request', 'https://d2l.relay.edu/d2l/api/lp/1.0/enrollments/myenrollments/']);
+  assert.equal((await call('POST', `/v1/scan/${jobId}/calls/${c1.id}/result`, other, { result: 'x' })).status, 404, 'only the job’s own person answers');
+  assert.equal((await call('POST', `/v1/scan/${jobId}/calls/${c1.id}/result`, t, { result: { status: 200, body: '{"Items":[]}' } })).status, 200);
+  const answer = await asked;
+  assert.deepEqual(answer.body, { ok: true, result: { status: 200, body: '{"Items":[]}' }, error: null });
+  // A call made before their Kea polls is queued for it.
+  const asked2 = owner('POST', `/owner/scan/${jobId}/call`, { op: 'status' });
+  await new Promise((r) => setTimeout(r, 50));
+  const got2 = await call('GET', `/v1/scan/${jobId}/calls`, t);
+  await call('POST', `/v1/scan/${jobId}/calls/${got2.body.calls[0].id}/result`, t, { ok: false, error: 'Not signed in' });
+  assert.deepEqual((await asked2).body, { ok: false, result: null, error: 'Not signed in' });
+  assert.equal((await owner('POST', `/owner/scan/${jobId}/call`, { op: 'postForm' })).status, 400, 'only read operations exist');
+
+  // The worker acts as their primary device: read and write their kea/ folder, nothing else.
+  const putK = (p, data) => fetch(`${ownerBase}/owner/scan/${jobId}/kea-file?path=${encodeURIComponent(p)}`, { method: 'PUT', headers: { 'x-kea-owner-key': hub.ownerKey }, body: data });
+  assert.equal((await putK('kea/School/Devices/primary.json', '{"id":"worker"}')).status, 200);
+  assert.equal((await putK('scan-inbox/x', 'x')).status, 403);
+  const kf = await owner('GET', `/owner/scan/${jobId}/kea-files`);
+  assert.deepEqual(kf.body.files.map((f) => f.path), ['kea/School/Devices/primary.json']);
+  const theirs = await call('GET', '/v1/files?prefix=kea/', t);
+  assert.equal(theirs.body.files[0].path, 'kea/School/Devices/primary.json', 'it lands in their own storage, so their Kea follows it');
+
+  // Finished: the relay closes and the folder is theirs alone again.
+  await owner('POST', `/owner/scan/${jobId}/finish`, { ok: true });
+  assert.equal((await putK('kea/School/x.json', '{}')).status, 404);
+  assert.equal((await call('GET', `/v1/scan/${jobId}/calls`, t)).status, 404);
+});
+
 test('big downloads are paced to the owner’s send limit; small sync files are not; lists carry the server time', async () => {
   const t = await register('pace@example.com');
   await owner('POST', '/owner/accounts/pace@example.com/quota', { gb: 1 });

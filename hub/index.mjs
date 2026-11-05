@@ -79,10 +79,10 @@ function sameOrigin(req, secure) {
   const origin = req.headers.origin;
   return origin == null || origin === `${secure ? 'https' : 'http'}://${req.headers.host}`;
 }
-function readBody(req) {
+function readBody(req, max = MAX_BODY) {
   return new Promise((resolve, reject) => {
     let size = 0; const chunks = [];
-    req.on('data', (c) => { size += c.length; if (size > MAX_BODY) { reject(new HttpError(413, 'Request too large.')); req.destroy(); } else chunks.push(c); });
+    req.on('data', (c) => { size += c.length; if (size > max) { reject(new HttpError(413, 'Request too large.')); req.destroy(); } else chunks.push(c); });
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     req.on('error', reject);
   });
@@ -136,6 +136,9 @@ export function createHub({
   googleClientIds = String(process.env.KEA_GOOGLE_CLIENT_IDS || '').split(',').map((s) => s.trim()).filter(Boolean),
   googleKeyFn = null,
   termsFile = join(dirname(fileURLToPath(import.meta.url)), 'terms', 'terms.json'),
+  // The relay: how long a person's Kea waits for calls per request, and how long the worker waits for an answer.
+  relayWaitMs = 20_000,
+  relayAnswerMs = 120_000,
 } = {}) {
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(storageDir, { recursive: true });
@@ -935,6 +938,50 @@ export function createHub({
     });
     return { ok: true };
   });
+  // ---------- The relay: the owner's worker browses through the person's own Kea ----------
+  // While a job runs, the worker (Claude on the owner's PC) asks the person's Kea to fetch, open or click on their
+  // class site. Their Kea is signed in with their own password; only page text comes back. Calls live in memory:
+  // they only matter while both sides are connected.
+  const relays = new Map(); // job id -> { queue: [], waiters: [], pending: Map(callId -> { resolve, timer }), seenAt }
+  const relayOf = (jobId) => {
+    let r = relays.get(jobId);
+    if (!r) relays.set(jobId, (r = { queue: [], waiters: [], pending: new Map(), seenAt: 0 }));
+    return r;
+  };
+  const dropRelay = (jobId, why) => {
+    const r = relays.get(jobId);
+    if (!r) return;
+    for (const p of r.pending.values()) { clearTimeout(p.timer); p.resolve({ ok: false, error: why }); }
+    for (const w of r.waiters) w([]);
+    relays.delete(jobId);
+  };
+  const RELAY_OPS = ['request', 'open', 'click', 'status'];
+  const myRunningJob = (me, id) => h.get("SELECT * FROM scan_jobs WHERE id = ? AND account_id = ? AND status = 'running'", id, me.id) ?? notFound('No job of yours is running with that id.');
+  // The person's Kea waits here (up to 20 s at a time) for the worker's next calls.
+  R('GET', '/v1/scan/:id/calls', async ({ me, params }) => {
+    const j = myRunningJob(me, params.id);
+    const r = relayOf(j.id);
+    r.seenAt = now();
+    if (r.queue.length) return { calls: r.queue.splice(0) };
+    const calls = await new Promise((resolve) => {
+      const w = (list) => { clearTimeout(t); resolve(list); };
+      const t = setTimeout(() => { r.waiters = r.waiters.filter((x) => x !== w); resolve([]); }, relayWaitMs);
+      r.waiters.push(w);
+    });
+    r.seenAt = now();
+    return { calls };
+  });
+  R('POST', '/v1/scan/:id/calls/:callId/result', ({ me, params, body }) => {
+    const j = myRunningJob(me, params.id);
+    const r = relayOf(j.id);
+    const p = r.pending.get(params.callId);
+    if (!p) return { ok: true, late: true };
+    clearTimeout(p.timer);
+    r.pending.delete(params.callId);
+    p.resolve({ ok: body.ok !== false, result: body.result ?? null, error: body.error ? String(body.error).slice(0, 2000) : null });
+    return { ok: true };
+  });
+
   // Donations: one quiet link the apps can show on the account page. Never a pop-up, never a nag.
   R('GET', '/v1/support', () => getSetting('donate', { url: null, message: null }), { auth: false });
 
@@ -963,10 +1010,58 @@ export function createHub({
       // The uploaded class content isn't kept once the job is over.
       spaceDeletePrefix(spaces.user(j.account_id), `scan-inbox/${j.id}/`);
     });
+    dropRelay(j.id, 'The job has finished.');
+    return { ok: true };
+  });
+  const runningJob = (id) => h.get("SELECT * FROM scan_jobs WHERE id = ? AND status = 'running'", id) ?? notFound('No running job with that id.');
+  // The worker's side of the relay: one call, answered by the person's Kea (or an error if it's closed).
+  O('POST', '/owner/scan/:id/call', async ({ params, body }) => {
+    const j = runningJob(params.id);
+    const op = V.enum(body.op, 'op', RELAY_OPS);
+    const r = relayOf(j.id);
+    const id = randomUUID();
+    const answer = new Promise((resolve) => {
+      const timer = setTimeout(() => { r.pending.delete(id); resolve({ ok: false, error: 'The student’s Kea didn’t answer in time. Is it open and online?' }); }, relayAnswerMs);
+      r.pending.set(id, { resolve, timer });
+    });
+    const call = { id, op, args: V.obj(body.args) };
+    const w = r.waiters.shift();
+    if (w) w([call]); else r.queue.push(call);
+    return answer;
+  });
+  O('GET', '/owner/scan/:id/relay', ({ params }) => {
+    const j = runningJob(params.id);
+    const r = relays.get(j.id);
+    return { connected: !!r && now() - (r.seenAt || 0) < 30_000, waiting: r?.waiters.length ?? 0, queued: r?.queue.length ?? 0 };
+  });
+  // The person's Kea folder (kea/...) while their job runs: the worker is their primary device for it.
+  O('GET', '/owner/scan/:id/kea-files', ({ params, query }) => {
+    const j = runningJob(params.id);
+    return { files: spaceList(spaces.user(j.account_id), 'kea/', Number(query.since) || 0), now: now() };
+  });
+  O('GET', '/owner/scan/:id/kea-file', ({ params, query }) => {
+    const j = runningJob(params.id);
+    const p = String(query.path ?? '');
+    if (!p.startsWith('kea/')) forbidden('Only their Kea folder.');
+    const sp = spaces.user(j.account_id);
+    return rawOut(spaceRead(sp, spaceRow(sp, p) ?? notFound()));
+  });
+  O('PUT', '/owner/scan/:id/kea-file', ({ params, query, raw }) => {
+    const j = runningJob(params.id);
+    const p = checkPath(String(query.path ?? ''));
+    if (!p.startsWith('kea/')) forbidden('Only their Kea folder.');
+    return spaceWrite(spaces.user(j.account_id), p, raw);
+  });
+  O('DELETE', '/owner/scan/:id/kea-file', ({ params, query }) => {
+    const j = runningJob(params.id);
+    const p = String(query.path ?? '');
+    if (!p.startsWith('kea/') || p === 'kea/') forbidden('Only files in their Kea folder.');
+    const sp = spaces.user(j.account_id);
+    const row = spaceRow(sp, p);
+    if (row) { h.run('DELETE FROM files WHERE account_id = ? AND path = ?', j.account_id, p); rmSync(join(sp.dir, row.blob), { force: true }); }
     return { ok: true };
   });
   // What the person's Kea uploaded for this job.
-  const runningJob = (id) => h.get("SELECT * FROM scan_jobs WHERE id = ? AND status = 'running'", id) ?? notFound('No running job with that id.');
   O('GET', '/owner/scan/:id/inbox', ({ params }) => {
     const j = runningJob(params.id);
     return { files: spaceList(spaces.user(j.account_id), `scan-inbox/${j.id}/`) };
@@ -1126,7 +1221,7 @@ export function createHub({
       const { r, params } = fileRoute ? { r: { auth: true, terms: true }, params: {} } : api.find(req.method, url.pathname);
       let body = {};
       if (req.method === 'POST') {
-        const raw = await readBody(req);
+        const raw = await readBody(req, /^\/v1\/scan\/[^/]+\/calls\/[^/]+\/result$/.test(url.pathname) ? 48 * 1024 * 1024 : MAX_BODY);
         if (raw.trim()) { try { body = JSON.parse(raw); } catch { bad('Invalid JSON.'); } }
         body = V.obj(body);
       }
@@ -1299,7 +1394,7 @@ export function createHub({
   const wrap = (fn) => (req, res) => fn(req, res).catch((e) => { console.error(e); try { send(res, 500, { error: 'internal error' }); } catch {} });
   const apiServer = http.createServer(wrap(handleApi));
   const ownerServer = http.createServer(wrap(handleOwner));
-  apiServer.headersTimeout = 15_000; apiServer.requestTimeout = 30_000;
+  apiServer.headersTimeout = 15_000; apiServer.requestTimeout = 120_000;
   const listenOn = (srv, port) => new Promise((resolve) => srv.listen(port, HOST, () => resolve(srv.address().port)));
 
   return {
