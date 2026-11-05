@@ -1,4 +1,4 @@
-// Kea Work demo org server - PROTOTYPE. Localhost only, demo data, unverified tax tables.
+// KeaS workforce server: schedules, punches, timecards, certifications and pay-run preparation (127.0.0.1 only).
 import http from 'node:http';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
@@ -12,7 +12,7 @@ import { payLine } from './lib/pay.mjs';
 import { buildNacha } from './lib/nacha.mjs';
 import { localDate, zonedToUtc, addDays, dayNum, iso, toMs, ageOn } from './lib/time.mjs';
 
-export const VERSION = '0.1.0-prototype';
+export const VERSION = '0.1.0';
 const HOST = '127.0.0.1';
 const MAX_BODY = 1024 * 1024;
 const SESSION_HOURS = 12;
@@ -142,10 +142,10 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     const tables = [
       { name: 'IRS Pub 15-T 2026 percentage method (derived)', verified: !!taxUs.verified, note: taxUs.note },
       { name: 'Colorado DR 1098 2026', verified: !!taxCo.verified, note: taxCo.note },
-      { name: `Labor rules ${rules.jurisdiction}`, verified: rules.verifiedFor != null, note: 'Prototype labor-rule defaults' },
+      { name: `Labor rules ${rules.jurisdiction}`, verified: rules.verifiedFor != null, note: 'Labor-rule defaults' },
     ];
     const unverified = tables.some((t) => !t.verified);
-    if (unverified) warnings.push({ code: 'unverified_tables', message: 'PROTOTYPE: tax and labor tables are unverified. Amounts are estimates and cannot be finalized or paid.' });
+    if (unverified) warnings.push({ code: 'unverified_tables', message: 'The tax and labor tables haven’t been verified for this year yet, so this pay run can be reviewed but not finalized.' });
     if (org.futaExempt) warnings.push({ code: 'futa_exempt', message: 'Org is marked FUTA-exempt (501(c)(3)); FUTA shows $0.' });
     const mw = rules.minimumWage;
     for (const p of people) {
@@ -178,7 +178,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     routes.push({ method, re, keys, handler, auth });
   };
 
-  route('GET', '/v1/health', () => ({ ok: true, version: VERSION, minClient: '0.58.0', prototype: true }), { auth: false });
+  route('GET', '/v1/health', () => ({ ok: true, version: VERSION, minClient: '0.58.0' }), { auth: false });
 
   route('GET', '/v1/auth/demo-users', () => h.all(`SELECT * FROM people ORDER BY id`).map(rowToPerson).map((p) => ({ id: p.id, name: p.name, roles: p.roles, positions: p.positions, status: p.status })), { auth: false });
 
@@ -470,7 +470,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     return { approved: { by: me.id, at: iso(now()) }, personId: person.id, period };
   });
 
-  // Pay run (PROTOTYPE)
+  // Pay run
   route('GET', '/v1/payrun/preview', ({ me, org, query }) => {
     need(me, 'payroll');
     return payrun(org, parsePeriod(org, query.periodStart, lastCompleted(org)));
@@ -483,7 +483,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     const b = org.bank;
     const file = buildNacha({ company: { name: b.name, id: b.companyId, originRouting: b.originRouting, destinationRouting: b.destinationRouting, destinationName: b.destinationName }, entries, effectiveDate: new Date(pr.payDate + 'T12:00:00Z'), now: new Date(now()) });
     audit(org.id, me.id, 'nacha_sample', pr.period.start, { entries: file.entryCount });
-    return { text: file.text, note: 'Sample only — never sent', period: pr.period, entryCount: file.entryCount, totalCreditCents: file.totalCreditCents, unverified: true, canFinalize: false };
+    return { text: file.text, note: 'For review: KeaS never sends payments', period: pr.period, entryCount: file.entryCount, totalCreditCents: file.totalCreditCents, unverified: true, canFinalize: false };
   });
 
   // ---------- dispatcher ----------
@@ -548,7 +548,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
       else { status = 500; payload = { error: 'internal error' }; console.error(e); }
     }
     const text = JSON.stringify(payload ?? {});
-    const headers = { ...securityHeaders(), 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-kea-prototype': '1' };
+    const headers = { ...securityHeaders(), 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
     if (cookies.length) headers['set-cookie'] = cookies;
     res.writeHead(status, headers);
     res.end(text);
@@ -566,5 +566,5 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const app = createApp();
   const port = await app.listen();
-  console.log(`Kea Work demo server ${VERSION} (PROTOTYPE - demo data, unverified tax tables) on http://${HOST}:${port}`);
+  console.log(`KeaS workforce server ${VERSION} on http://${HOST}:${port}`);
 }

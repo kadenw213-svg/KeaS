@@ -1,4 +1,4 @@
-// Pay-run math (pure). PROTOTYPE ESTIMATES ONLY - tax tables are unverified; nothing here may be used to pay anyone.
+// Pay-run math (pure). A run is only finalized with tax tables verified for the year (see canFinalize in index.mjs).
 // Amounts are integer cents unless a name says otherwise.
 
 const r2 = (x) => Math.round(x * 100) / 100;           // dollars -> dollars at cents precision
@@ -142,7 +142,7 @@ export function payLine({ person, totals, rateCents, otMultiplier = 1.5, periods
     `Employee taxes withheld: ${taxes.map((t) => `${t.label} ${$(t.cents)}`).join(', ')} = ${$(withheld)}`,
     `Net = ${$(g)} - ${$(withheld)} = ${$(net)}`,
     `Employer cost on top of gross: ${$(employerTotal)}`,
-    ...(unverified ? ['PROTOTYPE: tax tables are unverified estimates; this line cannot be finalized.'] : []),
+    ...(unverified ? ['Tax tables not yet verified for this year: this line can’t be finalized.'] : []),
   ];
   return {
     personId: person.id, name: person.name,

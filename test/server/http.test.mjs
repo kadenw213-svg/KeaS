@@ -23,7 +23,7 @@ const future = (days, h) => new Date(Date.now() + days * 86400000 + h * 3600000)
 
 test('health and demo users are public; everything else needs a token', async () => {
   const h = await call('GET', '/v1/health');
-  assert.deepEqual([h.status, h.body.version, h.body.minClient], [200, '0.1.0-prototype', '0.58.0']);
+  assert.deepEqual([h.status, h.body.version, h.body.minClient], [200, '0.1.0', '0.58.0']);
   const u = await call('GET', '/v1/auth/demo-users');
   assert.equal(u.body.length, 12);
   assert.equal((await call('GET', '/v1/me')).status, 401);

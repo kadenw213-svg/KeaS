@@ -2,7 +2,7 @@
 'use strict';
 const k = window.keas;
 const app = document.getElementById('app');
-const S = { step: 'welcome', role: null, dataDir: '', storageDir: '', quotaGb: 25, reach: 'tailscale', drives: [], defaults: {}, config: {}, ts: {}, log: [], busy: false, error: '', owner: null, totp: null, terms: null, agreed: new Set(), totpDone: false };
+const S = { step: 'welcome', role: 'hub', dataDir: '', storageDir: '', quotaGb: 25, reach: 'tailscale', drives: [], defaults: {}, config: {}, ts: {}, log: [], busy: false, error: '', owner: null, totp: null, terms: null, agreed: new Set(), totpDone: false };
 
 function h(tag, props, ...kids) {
   const el = document.createElement(tag);
@@ -48,15 +48,12 @@ function welcome() {
   const choice = (role, title, text, tag) =>
     h('button', { class: `choice ${S.role === role ? 'on' : ''}`, onclick: () => { S.role = role; render(); } }, h('b', null, title, tag && h('span', { class: 'tag' }, tag)), h('span', { class: 'muted' }, text));
   return [
-    h('h1', null, 'Set up KeaS on this computer'),
-    h('p', { class: 'muted' }, 'KeaS can run a server right here. Pick what this computer is for.'),
+    h('h1', null, 'Set up a Kea Hub on this computer'),
+    h('p', { class: 'muted' }, 'A Kea Hub is the server Kea accounts, classes, study groups and Kea storage live on. This makes a new Hub of your own on this computer.'),
     h('div', { class: 'cards' },
-      choice('hub', 'Run a Kea Hub', 'Only if you run the server that Kea accounts, classes and storage live on (Kea’s creator runs the main one). This makes a new, separate Hub on this computer; it doesn’t join anyone else’s.', 'Server owners'),
-      choice('org', 'An organization’s server', 'Your workplace or club runs on this computer: schedules, availability, time clock, certifications, classes and payroll prep. Free, for any size.', 'Preview'),
-      choice('join', 'I’m joining an organization', 'Someone else runs the server. You just need their link or code.'),
+      choice('hub', 'Run a Kea Hub', 'Accounts with two-step sign-in, classes and invite codes, study leaderboards, Kea storage and sync, and Kea’s shared Claude.'),
     ),
-    S.role === 'join' && h('div', { class: 'panel' }, h('h2', null, 'Joining is quicker'), h('p', { class: 'muted' }, 'Ask your organization for its KeaS link or join code. Open the link on your phone or computer and sign in with your Kea account. Joining from inside Kea (Work mode) comes in the next update.')),
-    h('div', { class: 'actions' }, h('button', { class: 'btn primary', disabled: !S.role || S.role === 'join', onclick: () => { S.dataDir = S.dataDir || (S.role === 'hub' ? S.defaults.hubData : S.defaults.orgData); go('storage'); } }, 'Next')),
+    h('div', { class: 'actions' }, h('button', { class: 'btn primary', disabled: S.role !== 'hub', onclick: () => { S.dataDir = S.dataDir || S.defaults.hubData; go('storage'); } }, 'Next')),
   ];
 }
 

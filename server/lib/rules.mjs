@@ -1,4 +1,4 @@
-// Labor rules engine (pure). PROTOTYPE: the rule tables it reads are unverified defaults.
+// Labor rules engine (pure). Reads the labor-rule tables in shared/labor (each records whether it's verified).
 import { toMs, localDate, localMinuteOfDay, weekStartOf, weekday, addDays, ageOn, isSummer, hhmmToMin } from './time.mjs';
 
 const MIN = 60000;

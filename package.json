@@ -1,8 +1,8 @@
 {
   "name": "keas",
-  "version": "0.1.0-prototype",
+  "version": "0.1.0",
   "private": true,
-  "description": "KeaS: free, self-hosted staffing, time clock and payroll for organizations. Prototype.",
+  "description": "KeaS: the Kea Hub (accounts, classes, study, storage and sync for Kea) and a free workforce suite for organizations.",
   "type": "module",
   "license": "MIT",
   "scripts": {

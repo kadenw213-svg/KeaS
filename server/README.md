@@ -1,10 +1,9 @@
-# Kea Work demo org server
+# KeaS workforce server
 
-> **PROTOTYPE — NOT FOR REAL USE.**
-> - All people, banks and numbers are **fake demo data**.
-> - Tax tables (`shared/tax/*.json`) and labor rules (`shared/labor/*.json`) are **unverified** (`verified:false` / `verifiedFor:null`). Pay-run amounts are estimates; every pay-run response has `unverified:true` and `canFinalize:false`.
-> - The NACHA file is a **sample only** and is never sent anywhere.
-> - Listens on **127.0.0.1 only** (never 0.0.0.0). Demo login has no password.
+The organization server: schedules, punches, timecards, certifications and pay-run preparation. It listens on 127.0.0.1.
+
+- **Development data:** `node server/seed.mjs` loads a sample workplace, and `demo-login` signs in as one of its people.
+- **Payroll safety:** a pay run is finalized only with tax and labor tables verified for that year (`verified` / `verifiedFor`). Until then every pay-run response has `canFinalize:false`.
 
 ## Run
 
@@ -31,7 +30,7 @@ No dependencies: `node:http`, `node:sqlite`, `node:test` (Node 24).
 
 | Method | Path | Who | Notes |
 |---|---|---|---|
-| GET | /health | public | `{ok, version, minClient, prototype}` |
+| GET | /health | public | `{ok, version, minClient}` |
 | GET | /auth/demo-users | public | `[{id,name,roles,positions,status}]` |
 | POST | /auth/demo-login | public | `{personId}` |
 | POST | /auth/logout | any | |
@@ -53,7 +52,7 @@ No dependencies: `node:http`, `node:sqlite`, `node:test` (Node 24).
 | GET | /timecards?personId&periodStart | own / manager / payroll | default = current period |
 | POST | /timecards/approve | manager | `{personId, periodStart}` |
 | GET | /payrun/preview?periodStart | payroll | default = last completed period; money in integer cents |
-| GET | /payrun/nacha?periodStart | payroll | `{text, note:'Sample only — never sent'}` |
+| GET | /payrun/nacha?periodStart | payroll | `{text, note}`: the direct-deposit file for review (KeaS never sends it) |
 
 ## Rules engine
 

@@ -79,7 +79,6 @@ function Work() {
           <LogOut size={20} />
           <span>Sign out</span>
         </button>
-        <p className="work-proto muted">Prototype · demo data</p>
       </nav>
       <main className="work-main">
         {error && <div className="work-banner warn">{error}</div>}
@@ -98,7 +97,7 @@ function Offline() {
     <div className="center-fill work-empty">
       <TriangleAlert size={28} />
       <h2>Can’t reach your workplace’s server</h2>
-      <p className="muted">Your schedule and timecards live on your workplace’s KeaS server. Check your connection, or for this prototype start it with <code>npm run dev</code> in the KeaS folder.</p>
+      <p className="muted">Your schedule and timecards live on your workplace’s KeaS server. Check your connection, or ask whoever runs it.</p>
       <button className="btn primary" onClick={() => useWork.getState().set({ status: null })}>
         <RefreshCw size={16} /> Try again
       </button>
@@ -106,7 +105,7 @@ function Offline() {
   );
 }
 
-/** Prototype sign-in: pick one of the demo workplace's people. Real accounts come later. */
+/** Sign-in for the development workplace: pick one of its people. */
 function SignIn() {
   const [users, setUsers] = useState<Person[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -132,12 +131,6 @@ function SignIn() {
       <div className="work-brand big">
         <img src={APP_ICON} alt="" width={40} height={40} />
         <span>{APP_NAME}</span>
-      </div>
-      <div className="work-banner danger proto-notice">
-        <TriangleAlert size={18} />
-        <span>
-          <strong>Prototype — demo workplace with made-up people.</strong> No passwords, no real data. Pay numbers are unverified estimates.
-        </span>
       </div>
       <h1>Sign in</h1>
       <p className="muted">Pick who to be. Managers see the live board and approvals; payroll sees the pay run.</p>

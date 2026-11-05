@@ -1,4 +1,4 @@
-// Demo data for "Demo Aquatics" (all names and numbers are fake).
+// Sample workplace for development and tests ("Demo Aquatics"; the people and bank numbers are made up).
 // Runs automatically when the db is empty; `node server/seed.mjs --reset` wipes and reseeds.
 import { randomUUID } from 'node:crypto';
 import { rmSync } from 'node:fs';

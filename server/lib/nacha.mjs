@@ -20,7 +20,7 @@ export function buildNacha({ company, entries, effectiveDate, now = new Date(), 
   const odfi = company.originRouting.slice(0, 8);
   const lines = [];
   lines.push('1' + '01' + ' ' + N(company.destinationRouting, 9) + ' ' + N(company.originRouting, 9) + yymmdd(now) + now.toISOString().slice(11, 16).replace(':', '') + 'A' + '094' + '10' + '1' + A(company.destinationName, 23) + A(company.name, 23) + A('SAMPLE', 8));
-  lines.push('5' + '220' + A(company.name, 16) + A('SAMPLE ONLY', 20) + A(company.id, 10) + 'PPD' + A('PAYROLL', 10) + A(yymmdd(effectiveDate), 6) + yymmdd(effectiveDate) + '   ' + '1' + odfi + N(batchNumber, 7));
+  lines.push('5' + '220' + A(company.name, 16) + A('PAYROLL REVIEW', 20) + A(company.id, 10) + 'PPD' + A('PAYROLL', 10) + A(yymmdd(effectiveDate), 6) + yymmdd(effectiveDate) + '   ' + '1' + odfi + N(batchNumber, 7));
   let hash = 0, credit = 0, seq = 0;
   for (const e of entries) {
     if (!isValidRouting(e.routing)) throw new Error(`bad routing number for ${e.name}`);

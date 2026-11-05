@@ -2,7 +2,7 @@
   "year": 2026,
   "jurisdiction": "CO",
   "verified": false,
-  "note": "PROTOTYPE - NOT VERIFIED. Colorado wage withholding per DR 1098 annualized method: (period wages x periods) - annual withholding allowance, x flat rate, / periods. The 4.4% rate and the allowance amounts below are entered from memory and must be checked against the current DR 1098 before real use. If the employee filed a DR 0004, its annual allowance (people.co_allowance) replaces the W-4-status default.",
+  "note": "Not yet verified for 2026. Colorado wage withholding per DR 1098 annualized method: (period wages x periods) - annual withholding allowance, x flat rate, / periods. The 4.4% rate and the allowance amounts below are entered from memory and must be checked against the current DR 1098 before real use. If the employee filed a DR 0004, its annual allowance (people.co_allowance) replaces the W-4-status default.",
   "source": [
     {
       "title": "Colorado DR 1098 - Colorado Withholding Worksheet for Employers",

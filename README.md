@@ -1,74 +1,65 @@
 # KeaS
 
-> ## PROTOTYPE — NOT FOR REAL USE
-> - The **org server** runs on a **demo workplace with made-up people**, and its sign-in has no password. (The Kea Hub's accounts are real: see below.)
-> - **Payroll numbers are unverified estimates.** The tax and labor tables have not been checked for this year, every pay run is marked `unverified`, and **a pay run cannot be finalized**. The direct-deposit (NACHA) file is a sample that is never sent anywhere.
-> - The server listens on **127.0.0.1 only** (this computer).
+KeaS is the server side of [Kea](https://github.com/kadenw213-svg/Kea). It runs the **Kea Hub**: one Kea account for everything, classes and study groups, leaderboards, Kea storage and sync, and Kea's shared Claude. It also includes a Windows app that turns any computer into a Kea server in a few clicks.
 
-KeaS is a free, self-hosted system for scheduling staff, clocking in and out, timecards and payroll prep, built first for a Colorado community pool with teen lifeguards.
+Free, open source, and yours to host.
 
-**Why it exists:** big payroll suites charge roughly $21–41 per employee per month, which is brutal for seasonal and part-time teams, and they lock you into long contracts. KeaS is:
+## Download
 
-- **Free to host yourself**, with open data you can export at any time. No per-head pricing, no lock-in.
-- **Built for seasonal and youth workforces** (pools, rec centers, camps, parks): shifts are checked against certifications (an expired lifeguard cert blocks the shift) and against minor work-hour rules before anyone is scheduled.
-- **Transparent:** staff can see exactly how their hours and pay were worked out. Every pay amount comes with its explanation.
-- **Resilient:** your workplace runs its own server, so a vendor outage doesn't stop the clock.
+Get the latest **KeaS Setup** from [Releases](https://github.com/kadenw213-svg/KeaS/releases). On first launch, KeaS walks you through setting up this computer as a Kea Hub:
 
-KeaS is not a payroll processor. It prepares approved hours and pay estimates; paying people and filing taxes stays with your payroll provider or bank.
+1. **Choose where the data goes.** Any drive or folder; a big drive is best, since every account gets its own Kea storage.
+2. **Make it reachable from anywhere** with Tailscale Funnel, for free. KeaS installs Tailscale and sets up Funnel for you, so people can reach the Hub without you changing router settings or showing your home address.
+3. **Create the owner account**, with two-step sign-in.
 
-## What's in the prototype
+After that, KeaS runs in the tray and starts with Windows. Light and dark themes are included.
 
-- **Phone-first web app** served by the KeaS server itself. Staff just open the link (and can install it to their home screen); managers and payroll use it in a browser or on a kiosk tablet.
-  - **Today:** a big Clock in / Clock out button, your next shift, and for managers a live board of who's on, late or missing.
-  - **Schedule:** the week (a day-by-day list on phones), shift swaps, and for managers adding shifts with live checks (certifications, ages, minor hours, overtime) and publishing.
-  - **Timecards:** hours per pay period, missed-punch fix requests, manager approvals.
-  - **People & certifications** (managers/payroll) and **Pay run** preview (payroll), with every warning and explanation.
-- **Org server** (`server/`): plain Node, SQLite, no runtime dependencies. API documented in [server/README.md](server/README.md).
-- **Kea Hub** (`hub/`): the server behind Kea accounts.
-  - **Accounts:** passwords stored only as a slow one-way hash, lockouts after repeated wrong tries, optional two-step sign-in, and versioned terms everyone agrees to.
-  - **Classes:** invite codes and a class calendar.
-  - **Studying:** server-graded study sets and leaderboards.
-  - **Kea storage and sync.**
-  - **Kea's shared Claude:** a limited, queued service for people without their own Claude.
-  - Tests: `npm run test:hub`.
-- **KeaS desktop** (`desktop/`): the Windows app (`npm run desktop:build`). On first run it sets up this computer as a server:
-  - pick a data drive;
-  - optionally make it reachable from anywhere with Tailscale Funnel (installed and set up for you);
-  - it runs in the tray and starts with Windows.
+## The Kea Hub
 
-## Run it
+- **One Kea account.** Sign in once in Kea and KeaS.
+  - Passwords are stored only as a slow one-way hash (Argon2id or scrypt).
+  - Repeated wrong guesses lock the account for longer and longer.
+  - Two-step sign-in works with any authenticator app, and "Verify with Google" proves an email address.
+- **Terms that stay current.** Every account agrees to every section. When the terms change, people see exactly what changed and agree again before continuing.
+- **Classes.** Instructors create classes, invite people with a code, and put sessions on a shared calendar with meeting links. Hosting classes on a Hub needs the owner's approval.
+- **Studying that rewards studying:**
+  - practice sets graded by the Hub, so scores can't be faked;
+  - questions come back on a spaced schedule;
+  - XP, levels, streaks, and weekly and all-time class leaderboards;
+  - everyone chooses whether they appear by name, by nickname, or not at all.
+- **Kea storage and sync.** Kea syncs your devices through your Hub instead of a cloud drive. Only changed files move, and each version is tracked so devices never overwrite each other. Big downloads are paced so they can't fill the owner's internet connection.
+- **Kea's shared Claude.** People without their own Claude account can queue a scan of their classes on the Hub owner's Claude. Their school password never leaves their own computer: the scan reads their class site through their own Kea. The Hub keeps it fair with daily and weekly limits, one shared scan per course section, and question batches instead of regenerating.
+- **Built to be safe:**
+  - the owner console only answers on the Hub's own computer;
+  - every admin action is logged;
+  - backups are encrypted;
+  - anything that sends requests like a script is paused for the owner to review.
+
+## Build from source
 
 Needs Node 24.
 
 ```
 npm install
-node server/seed.mjs --reset     # create the demo workplace (dates are set around today)
-npm run dev                      # server on 127.0.0.1:4850 + the web app with live reload
+npm run hub              # the Kea Hub on 127.0.0.1:4860 (owner console on 4861)
+npm run desktop          # the KeaS app
+npm run desktop:build    # the Windows installer
+npm test                 # all tests
 ```
 
-Open the URL Vite prints (normally **http://127.0.0.1:5173**) and pick a demo person to sign in as. Try a lifeguard (staff), a manager (live board, approvals, adding shifts) and the payroll person (pay run).
+**Owner tools** run on the Hub's own computer:
+- `node hub/owner.mjs make-owner <email>`
+- `node hub/owner.mjs publish-terms`
+- `node hub/backup.mjs create <folder>`
 
-To run it the way a workplace would, with the server serving the built app:
+## Roadmap
 
-```
-npm run web:build                # builds web/ into web/dist
-npm run server:dev               # then open http://127.0.0.1:4850
-```
+KeaS is growing into a free workforce suite for organizations:
+- scheduling, availability forms, time clock and certifications;
+- departments and budgets;
+- payroll preparation with tax tables verified each year.
 
-Other commands:
-
-```
-npm run test:server              # server tests (API, rules, pay, cookie auth/CSRF, static serving)
-npm run typecheck                # TypeScript check of the web app
-```
-
-## Security notes (prototype)
-
-- The web app uses a same-origin `HttpOnly; SameSite=Strict` session cookie; scripts and the desktop app can use `Authorization: Bearer`.
-- Cookie-authenticated writes must carry `X-KeaS: 1` and come from the same origin; cross-site requests are refused.
-- Pages are served with a strict Content-Security-Policy, `nosniff` and `no-referrer`; files are only ever served from inside `web/dist`.
-- The service worker caches the app shell only. API responses (schedules, punches, pay) are never cached.
-- The app icon is a placeholder: replace `web/public/icon.svg`.
+That work lives in `server/` and `web/`.
 
 ## License
 

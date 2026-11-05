@@ -39,10 +39,12 @@ export function PayRun() {
           {run.payDate ? ` · pay date ${fmtDay(run.payDate)}` : ''}
         </span>
       </div>
-      {/* Always shown: these numbers are prototype estimates no matter what the server says. */}
-      <div className="work-banner danger">
-        <ShieldAlert size={16} /> Prototype estimates. The tax and labor tables used here haven’t been verified, so this pay run can’t be finalized. Check every number before using it.
-      </div>
+      {/* Shown until this year's tables are verified (the server also refuses to finalize). */}
+      {run.canFinalize !== true && (
+        <div className="work-banner danger">
+          <ShieldAlert size={16} /> The tax and labor tables haven’t been verified for this year yet, so this pay run can be reviewed but not finalized.
+        </div>
+      )}
       {groupWarnings(listOf(run.warnings, 'warnings'), lines).map((x, i) => (
         <div key={i} className="work-banner warn">
           <TriangleAlert size={15} /> {x}
@@ -161,13 +163,13 @@ export function PayRun() {
 
 /**
  * One line per kind of warning ("Timecard not approved for 9 people: …") instead of a row per person.
- * The prototype notice is already the red banner, so its duplicate is dropped.
+ * The unverified-tables notice is already the red banner, so its duplicate is dropped.
  */
 function groupWarnings(warnings: any[], lines: any[]): string[] {
   const name = (id: string) => lines.find((l) => l.personId === id)?.name || 'someone';
   const groups = new Map<string, any[]>();
   for (const w of warnings) {
-    if (/^(unverified|prototype)/i.test(w.code || '')) continue;
+    if (/^unverified/i.test(w.code || '')) continue;
     const key = w.personId ? w.code || w.message : w.message || w.code;
     groups.set(key, [...(groups.get(key) || []), w]);
   }

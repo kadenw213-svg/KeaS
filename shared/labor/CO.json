@@ -1,6 +1,6 @@
 {
   "jurisdiction": "CO",
-  "name": "Colorado (COMPS Order #39, YEOA, HFWA) - PROTOTYPE DEFAULTS",
+  "name": "Colorado (COMPS Order #39, YEOA, HFWA)",
   "overtime": { "weeklyHours": 40, "dailyHours": 12, "consecutiveHours": 12, "multiplier": 1.5,
     "note": "COMPS Rule 4.1.1: over 40/workweek, over 12/workday, or over 12 consecutive hours regardless of the workday, whichever gives the greater pay, without duplication." },
   "meal": { "afterHours": 5, "minutes": 30, "paid": false, "note": "Uninterrupted, duty-free 30-minute meal period when a shift exceeds 5 hours; otherwise an on-duty paid meal." },
@@ -24,7 +24,7 @@
     "localOverrides": [ { "place": "Denver", "standard": 19.29 } ]
   },
   "sickLeave": { "accrueHoursPer": 30, "cap": 48, "note": "HFWA: 1 hour paid sick leave per 30 hours worked, up to 48 hours per year." },
-  "notes": ["Prototype defaults entered 2026-10-27 and NOT verified against current Colorado rules. Do not rely on them."],
+  "notes": ["Defaults entered 2026-10-27, not yet verified against current Colorado rules. Do not rely on them."],
   "source": [
     { "title": "Colorado COMPS Order #39 (7 CCR 1103-1)", "url": "https://cdle.colorado.gov/comps", "checked": "2026-10-27" },
     { "title": "Colorado minimum wage", "url": "https://cdle.colorado.gov/minimumwage", "checked": "2026-10-27" },
