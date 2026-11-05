@@ -23,6 +23,9 @@ export const DEFAULTS = {
   refusalsBeforeFlag: 15, // refused requests in a day before the account is flagged for review
   requestsBeforeSuspend: 200, // requests in a day before it's suspended automatically (a script, not a person)
   defaultJobMinutes: 12, // for wait estimates until there's history
+  // The owner's home internet: big downloads from the Hub, all together, never go faster than this (megabits per
+  // second), so they can't fill the upload. Small files (sync data) skip the limit and go first.
+  maxSendMbps: 10,
 };
 export const KINDS = ['initial_scan', 'update_scan', 'more_questions'];
 

@@ -243,6 +243,25 @@ export function createHub({
     h.run(`DELETE FROM ${sp.table} WHERE ${sp.col} = ? AND substr(path, 1, length(?)) = ?`, sp.id, prefix, prefix);
   }
   const rawOut = (data, headers = {}) => ({ __raw: data, headers });
+  // Pacing what the Hub sends, so big downloads never fill the owner's home upload: every large response shares one
+  // budget of maxSendMbps. Small files (under 256 KB: sync data, cards, requests) go straight out.
+  const SMALL = 256 * 1024, CHUNK = 64 * 1024;
+  let paceAt = Date.now();
+  async function sendPaced(res, data) {
+    if (data.length <= SMALL) return void res.end(data);
+    for (let o = 0; o < data.length; o += CHUNK) {
+      const part = data.subarray(o, o + CHUNK);
+      const bytesPerMs = (Math.max(1, limitsNow().maxSendMbps) * 1e6) / 8 / 1000;
+      // Reserve this chunk's time on the shared clock; wait until it comes round.
+      const t = Date.now();
+      paceAt = Math.max(paceAt, t) + part.length / bytesPerMs;
+      const wait = paceAt - t - part.length / bytesPerMs;
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      if (res.destroyed) return;
+      if (!res.write(part)) await new Promise((r) => res.once('drain', r));
+    }
+    res.end();
+  }
 
   const publicAccount = (a) => ({
     id: a.id, email: a.email, displayName: a.display_name, role: a.role, status: a.status,
@@ -424,7 +443,7 @@ export function createHub({
     const prefix = String(query.prefix ?? '');
     const since = Number(query.since) || 0;
     return {
-      used: usedBy(me.id), quota: quotaOf(me),
+      used: usedBy(me.id), quota: quotaOf(me), now: now(),
       files: h.all("SELECT path, size, version, sha256, updated_at FROM files WHERE account_id = ? AND substr(path, 1, length(?)) = ? AND updated_at > ? ORDER BY path", me.id, prefix, prefix, since)
         .map((f) => ({ path: f.path, size: f.size, version: f.version, sha256: f.sha256, updatedAt: f.updated_at })),
     };
@@ -1141,7 +1160,7 @@ export function createHub({
       let out = await r.handler(ctx);
       if (out && out.__raw) {
         res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': out.__raw.length, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...out.headers });
-        res.end(out.__raw);
+        await sendPaced(res, out.__raw);
         return;
       }
       if (out && 'body' in out && (typeof out.status === 'number' || 'token' in out || 'clearCookie' in out)) {
@@ -1209,7 +1228,7 @@ export function createHub({
       if (etagVersion(req.headers['if-none-match']) === row.version) { res.writeHead(304, { etag: `"${row.version}"` }); res.end(); return; }
       const data = readFileSync(blobPath(me.id, row.blob));
       res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': data.length, etag: `"${row.version}"`, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'x-kea-sha256': row.sha256 });
-      res.end(data);
+      await sendPaced(res, data);
       return;
     }
     const ifMatch = req.headers['if-match'];

@@ -456,6 +456,23 @@ test('shared Claude: an account sending requests like a script is suspended and 
   await owner('POST', '/owner/settings', { limits: { requestsBeforeSuspend: 200, refusalsBeforeFlag: 15 } });
 });
 
+test('big downloads are paced to the owner’s send limit; small sync files are not; lists carry the server time', async () => {
+  const t = await register('pace@example.com');
+  await owner('POST', '/owner/accounts/pace@example.com/quota', { gb: 1 });
+  await owner('POST', '/owner/settings', { limits: { maxSendMbps: 8 } }); // 1 MB/s
+  const put = (p, data) => fetch(`${base}/v1/files/${p}`, { method: 'PUT', headers: { authorization: `Bearer ${t}` }, body: data });
+  assert.equal((await put('big.bin', Buffer.alloc(700 * 1024, 7))).status, 201);
+  assert.equal((await put('small.json', '{"a":1}')).status, 201);
+  const get = async (p) => { const t0 = Date.now(); const r = await fetch(`${base}/v1/files/${p}`, { headers: { authorization: `Bearer ${t}` } }); const b = Buffer.from(await r.arrayBuffer()); return { ms: Date.now() - t0, len: b.length }; };
+  const big = await get('big.bin');
+  assert.equal(big.len, 700 * 1024);
+  assert.ok(big.ms >= 450, `700 KB at 1 MB/s took ${big.ms} ms`);
+  assert.ok((await get('small.json')).ms < 300);
+  const list = await call('GET', '/v1/files', t);
+  assert.equal(list.body.now, clock);
+  await owner('POST', '/owner/settings', { limits: { maxSendMbps: 10 } });
+});
+
 // Last: publishing new terms locks everyone out until they agree again.
 test('terms change: everyone must re-agree; only changes shown; reading, export and sign-out still work', async () => {
   const t = await register('reader@example.com', 'Rae Reader');
