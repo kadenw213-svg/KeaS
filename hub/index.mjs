@@ -7,9 +7,11 @@
 //     (`node hub/owner.mjs make-owner <email>`), never through the API.
 import http from 'node:http';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, statfsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { checkTerms, diffTerms, sameSections, termsPage } from './lib/terms.mjs';
+import { googleKeys, verifyGoogleIdToken } from './lib/google.mjs';
 import { openDb, DATA_DIR } from './db.mjs';
 import { hashPassword, verifyPassword, needsRehash, passwordProblem } from './lib/passwords.mjs';
 import { newSecret, checkCode, otpauthUri } from './lib/totp.mjs';
@@ -94,7 +96,8 @@ function makeRouter() {
   const add = (method, path, handler, opts = {}) => {
     const keys = [];
     const re = new RegExp('^' + path.replace(/:(\w+)/g, (_, k) => { keys.push(k); return '([^/]+)'; }) + '$');
-    routes.push({ method, re, keys, handler, auth: opts.auth !== false });
+    // terms: false lets an account that hasn't agreed to the current terms still use the route.
+    routes.push({ method, re, keys, handler, auth: opts.auth !== false, terms: opts.terms !== false });
   };
   const find = (method, pathname) => {
     const r = routes.find((x) => x.method === method && x.re.test(pathname));
@@ -123,9 +126,20 @@ export function createHub({
   ipHeader = process.env.KEA_HUB_IP_HEADER || null, // e.g. 'cf-connecting-ip' behind Cloudflare, 'x-forwarded-for' behind Funnel
   limits = {},
   log = true,
+  // Kea storage: where account files live (point this at the big drive), and each account's default limit.
+  storageDir = process.env.KEA_HUB_STORAGE || join(dataDir, 'storage'),
+  defaultQuotaBytes = (Number(process.env.KEA_HUB_QUOTA_GB) || 25) * 1024 ** 3,
+  minFreeBytes = 5 * 1024 ** 3,
+  maxFileBytes = 64 * 1024 ** 2,
+  // Verify with Google: the Kea OAuth client IDs whose tokens are accepted, and how to get Google's keys.
+  googleClientIds = String(process.env.KEA_GOOGLE_CLIENT_IDS || '').split(',').map((s) => s.trim()).filter(Boolean),
+  googleKeyFn = null,
+  termsFile = join(dirname(fileURLToPath(import.meta.url)), 'terms', 'terms.json'),
 } = {}) {
   mkdirSync(dataDir, { recursive: true });
+  mkdirSync(storageDir, { recursive: true });
   const h = openDb(dbFile);
+  const gKeys = googleKeyFn ?? googleKeys({ nowFn: now });
   const key = loadOrCreateKey(join(dataDir, 'hub-signing-key.pem'));
   const ownerKeyFile = join(dataDir, 'owner.key');
   if (!existsSync(ownerKeyFile)) writeFileSync(ownerKeyFile, randomBytes(32).toString('hex'), { mode: 0o600 });
@@ -140,6 +154,65 @@ export function createHub({
   };
   const audit = (actor, action, target, detail, ip) =>
     h.run('INSERT INTO audit (at,actor,action,target,detail,ip) VALUES (?,?,?,?,?,?)', now(), actor ?? null, action, target ?? null, detail == null ? null : JSON.stringify(detail), ip ?? null);
+
+  // ---------- terms ----------
+  const termsRow = (n) => h.get('SELECT * FROM terms_versions WHERE n = ?', n);
+  const currentTerms = () => {
+    const r = h.get('SELECT * FROM terms_versions ORDER BY n DESC LIMIT 1');
+    return r && { ...r, sections: JSON.parse(r.sections) };
+  };
+  const publishTerms = (doc) => {
+    const t = checkTerms(doc);
+    const cur = currentTerms();
+    if (cur && sameSections(cur.sections, t.sections) && cur.title === t.title) return { n: cur.n, published: false };
+    const r = h.run('INSERT INTO terms_versions (label,title,summary,sections,published_at) VALUES (?,?,?,?,?)', t.label, t.title, t.summary, JSON.stringify(t.sections), now());
+    audit('owner', 'terms.publish', String(r.lastInsertRowid), { label: t.label }, 'local');
+    return { n: Number(r.lastInsertRowid), published: true };
+  };
+  if (!currentTerms()) publishTerms(JSON.parse(readFileSync(termsFile, 'utf8')));
+  const acceptedVersion = (accountId) => h.get('SELECT MAX(version) AS v FROM terms_acceptances WHERE account_id = ?', accountId)?.v ?? null;
+  const termsStatus = (accountId) => {
+    const cur = currentTerms();
+    const accepted = acceptedVersion(accountId);
+    return { current: cur.n, accepted, needsAgreement: accepted !== cur.n };
+  };
+  /** Records agreement; every section of the current version must be listed. */
+  const recordAgreement = (accountId, body, ip, client) => {
+    const cur = currentTerms();
+    if (body.termsVersion !== cur.n) throw new HttpError(409, 'The terms changed. Read the latest version and agree to it.', { termsVersion: cur.n });
+    const agreed = new Set(Array.isArray(body.termsSections) ? body.termsSections : []);
+    const missing = cur.sections.filter((s) => !agreed.has(s.id)).map((s) => s.id);
+    if (missing.length) bad('Agree to every section of the terms.', { missing });
+    h.run('INSERT OR IGNORE INTO terms_acceptances (account_id,version,sections,at,ip,client) VALUES (?,?,?,?,?,?)', accountId, cur.n, JSON.stringify(cur.sections.map((s) => s.id)), now(), ip ?? null, client ?? null);
+  };
+
+  // ---------- Google ----------
+  const google = async (idToken) => {
+    if (typeof idToken !== 'string' || idToken.length > 8000) bad('Missing Google sign-in.');
+    let g;
+    try { g = await verifyGoogleIdToken(idToken, { clientIds: googleClientIds, keys: gKeys, nowMs: now() }); }
+    catch (e) { throw new HttpError(e.status ?? 401, e.message); }
+    // Each Google sign-in can be used once.
+    const th = sha(`google:${idToken}`);
+    if (h.get('SELECT 1 FROM google_tokens_used WHERE token_hash = ?', th)) throw new HttpError(401, 'That Google sign-in was already used. Try again.');
+    h.run('INSERT INTO google_tokens_used (token_hash,at) VALUES (?,?)', th, now());
+    h.run('DELETE FROM google_tokens_used WHERE at < ?', now() - 86400_000);
+    return g;
+  };
+  const markGoogleVerified = (accountId, g) =>
+    h.run("UPDATE accounts SET email_verified = 1, verified_by = 'Google', google_sub = ?, updated_at = ? WHERE id = ?", g.sub, now(), accountId);
+  const requireTotp = (a, code, nh, ip) => {
+    if (!a.totp_enabled) return;
+    if (code == null || code === '') throw new HttpError(401, 'Enter the 6-digit code from your authenticator app.', { totpRequired: true });
+    const step = checkCode(a.totp_secret, code, now(), a.totp_last_step);
+    if (step == null) { fails.fail(nh); audit(a.id, 'auth.fail_totp', null, null, ip); throw new HttpError(401, 'That code is wrong or already used.', { totpRequired: true }); }
+    h.run('UPDATE accounts SET totp_last_step = ? WHERE id = ?', step, a.id);
+  };
+
+  // ---------- storage ----------
+  const quotaOf = (a) => (a.quota_bytes == null ? defaultQuotaBytes : a.quota_bytes);
+  const usedBy = (accountId) => h.get('SELECT COALESCE(SUM(size),0) AS s FROM files WHERE account_id = ?', accountId).s;
+  const blobPath = (accountId, blob) => join(storageDir, accountId, blob);
 
   const publicAccount = (a) => ({
     id: a.id, email: a.email, displayName: a.display_name, role: a.role, status: a.status,
@@ -205,10 +278,19 @@ export function createHub({
     const problem = passwordProblem(body.password, { email, name: displayName });
     if (problem) bad(problem, { field: 'password' });
     if (h.get('SELECT 1 FROM accounts WHERE email = ?', email)) throw new HttpError(409, 'An account with that email already exists. Sign in instead.');
+    const cur = currentTerms();
+    if (body.termsVersion !== cur.n) throw new HttpError(409, 'The terms changed. Read the latest version and agree to it.', { termsVersion: cur.n });
+    const g = body.googleIdToken ? await google(body.googleIdToken) : null;
+    if (g && g.email !== email) bad(`That Google account is ${g.email}, not ${email}.`);
     const id = randomUUID();
     const t = now();
-    h.run('INSERT INTO accounts (id,email,display_name,pw_hash,created_at,updated_at) VALUES (?,?,?,?,?,?)', id, email, displayName, await hashPassword(body.password), t, t);
-    audit(id, 'account.register', id, null, ip);
+    const pwHash = await hashPassword(body.password);
+    h.tx(() => {
+      h.run('INSERT INTO accounts (id,email,display_name,pw_hash,created_at,updated_at) VALUES (?,?,?,?,?,?)', id, email, displayName, pwHash, t, t);
+      recordAgreement(id, body, ip, client);
+      if (g) markGoogleVerified(id, g);
+    });
+    audit(id, 'account.register', id, { google: !!g }, ip);
     const token = newSession(id, client);
     return { status: 201, body: { token, account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', id)) }, token };
   }, { auth: false });
@@ -229,18 +311,106 @@ export function createHub({
       throw new HttpError(401, 'Wrong email or password.');
     }
     if (a.status !== 'active') throw new HttpError(403, 'This account is suspended. Contact Kea support.');
-    if (a.totp_enabled) {
-      if (body.code == null || body.code === '') throw new HttpError(401, 'Enter the 6-digit code from your authenticator app.', { totpRequired: true });
-      const step = checkCode(a.totp_secret, body.code, now(), a.totp_last_step);
-      if (step == null) { fails.fail(nh); audit(a.id, 'auth.fail_totp', null, null, ip); throw new HttpError(401, 'That code is wrong or already used.', { totpRequired: true }); }
-      h.run('UPDATE accounts SET totp_last_step = ? WHERE id = ?', step, a.id);
-    }
+    requireTotp(a, body.code, nh, ip);
     fails.clear(nh);
     if (needsRehash(a.pw_hash)) h.run('UPDATE accounts SET pw_hash = ?, updated_at = ? WHERE id = ?', await hashPassword(password), now(), a.id);
     audit(a.id, 'auth.login', null, null, ip);
     const token = newSession(a.id, client);
-    return { body: { token, account: publicAccount(a) }, token };
+    return { body: { token, account: publicAccount(a), terms: termsStatus(a.id) }, token };
   }, { auth: false });
+
+  // Sign in with Google instead of a password (the account must already exist with that email). Two-step sign-in
+  // still applies. Also proves the email.
+  R('POST', '/v1/auth/google', async ({ body, ip, client }) => {
+    limit('login', ip);
+    const g = await google(body.idToken);
+    const a = h.get('SELECT * FROM accounts WHERE email = ?', g.email);
+    if (!a) throw new HttpError(404, `There's no Kea account for ${g.email} yet. Create one first.`, { email: g.email, name: g.name });
+    if (a.status !== 'active') throw new HttpError(403, 'This account is suspended. Contact Kea support.');
+    const nh = nameHash(a.email);
+    const locked = fails.locked(nh);
+    if (locked > 0) throw new HttpError(429, `Too many wrong tries for this account. Wait ${Math.ceil(locked / 1000)} seconds.`, { retryAfter: Math.ceil(locked / 1000) });
+    requireTotp(a, body.code, nh, ip);
+    markGoogleVerified(a.id, g);
+    audit(a.id, 'auth.login_google', null, null, ip);
+    const token = newSession(a.id, client);
+    return { body: { token, account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', a.id)), terms: termsStatus(a.id) }, token };
+  }, { auth: false });
+
+  // Forgot your password: prove the email with Google, then set a new one. Every other session is signed out.
+  R('POST', '/v1/auth/reset/google', async ({ body, ip, client }) => {
+    limit('login', ip);
+    const g = await google(body.idToken);
+    const a = h.get('SELECT * FROM accounts WHERE email = ?', g.email);
+    if (!a) throw new HttpError(404, `There's no Kea account for ${g.email}.`);
+    if (a.status !== 'active') throw new HttpError(403, 'This account is suspended. Contact Kea support.');
+    const problem = passwordProblem(body.password, { email: a.email, name: a.display_name });
+    if (problem) bad(problem, { field: 'password' });
+    const nh = nameHash(a.email);
+    requireTotp(a, body.code, nh, ip);
+    const pwHash = await hashPassword(body.password);
+    h.tx(() => {
+      h.run('UPDATE accounts SET pw_hash = ?, updated_at = ? WHERE id = ?', pwHash, now(), a.id);
+      h.run('DELETE FROM sessions WHERE account_id = ?', a.id);
+      markGoogleVerified(a.id, g);
+    });
+    fails.clear(nh);
+    audit(a.id, 'account.reset_google', a.id, null, ip);
+    const token = newSession(a.id, client);
+    return { body: { token, account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', a.id)), terms: termsStatus(a.id) }, token };
+  }, { auth: false });
+
+  R('POST', '/v1/me/verify/google', async ({ me, body, ip }) => {
+    const g = await google(body.idToken);
+    if (g.email !== me.email) bad(`That Google account is ${g.email}, but your Kea account is ${me.email}. Sign in to Google with ${me.email}.`);
+    markGoogleVerified(me.id, g);
+    audit(me.id, 'account.verify_google', me.id, null, ip);
+    return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', me.id)) };
+  });
+
+  // ---------- terms ----------
+  const termsOut = (t) => ({ version: t.n, label: t.label, title: t.title, summary: t.summary, publishedAt: t.published_at, sections: t.sections });
+  R('GET', '/v1/terms', ({ query }) => {
+    const t = query.version ? termsRow(Number(query.version)) : null;
+    if (query.version && !t) notFound('No such version.');
+    return { terms: termsOut(t ? { ...t, sections: JSON.parse(t.sections) } : currentTerms()), versions: h.all('SELECT n, label, published_at FROM terms_versions ORDER BY n').map((v) => ({ version: v.n, label: v.label, publishedAt: v.published_at })) };
+  }, { auth: false });
+  // What changed since a version (default: the one this person last agreed to).
+  R('GET', '/v1/terms/changes', ({ me, query }) => {
+    const cur = currentTerms();
+    const since = query.since ? Number(query.since) : acceptedVersion(me.id);
+    const old = since ? termsRow(since) : null;
+    if (since && !old) notFound('No such version.');
+    return { from: since ?? null, to: cur.n, summary: cur.summary, ...diffTerms(old ? JSON.parse(old.sections) : [], cur.sections) };
+  }, { terms: false });
+  R('POST', '/v1/terms/accept', ({ me, body, ip, client }) => {
+    recordAgreement(me.id, body, ip, client);
+    audit(me.id, 'terms.accept', String(body.termsVersion), null, ip);
+    return { terms: termsStatus(me.id) };
+  }, { terms: false });
+
+  // Kea storage: list (optionally under a folder prefix, or only what changed since a time, for syncing).
+  R('GET', '/v1/files', ({ me, query }) => {
+    const prefix = String(query.prefix ?? '');
+    const since = Number(query.since) || 0;
+    return {
+      used: usedBy(me.id), quota: quotaOf(me),
+      files: h.all("SELECT path, size, version, sha256, updated_at FROM files WHERE account_id = ? AND substr(path, 1, length(?)) = ? AND updated_at > ? ORDER BY path", me.id, prefix, prefix, since)
+        .map((f) => ({ path: f.path, size: f.size, version: f.version, sha256: f.sha256, updatedAt: f.updated_at })),
+    };
+  });
+
+  // Download everything the Hub keeps about you (allowed even before agreeing to new terms).
+  R('GET', '/v1/me/export', ({ me }) => ({
+    exportedAt: new Date(now()).toISOString(),
+    account: publicAccount(me),
+    termsAgreements: h.all('SELECT version, at FROM terms_acceptances WHERE account_id = ? ORDER BY version', me.id),
+    classes: h.all('SELECT c.id, c.title, m.role, m.board, m.nickname, m.joined_at FROM class_members m JOIN classes c ON c.id = m.class_id WHERE m.account_id = ?', me.id),
+    studyAnswers: h.all('SELECT question_id, box, due_at, seen FROM review_state WHERE account_id = ?', me.id),
+    points: h.all('SELECT class_id, question_id, points, at FROM xp_events WHERE account_id = ? ORDER BY at', me.id),
+    files: h.all('SELECT path, size, version, updated_at FROM files WHERE account_id = ? ORDER BY path', me.id),
+    signIns: h.all("SELECT action, at, ip FROM audit WHERE actor = ? AND action LIKE 'auth.%' ORDER BY id DESC LIMIT 500", me.id),
+  }), { terms: false });
 
   R('POST', '/v1/auth/logout', ({ token }) => {
     if (token) h.run('DELETE FROM sessions WHERE token_hash = ?', sha(token));
@@ -259,7 +429,10 @@ export function createHub({
   });
 
   // ---------- me ----------
-  R('GET', '/v1/me', ({ me }) => ({ account: publicAccount(me), progress: progressOf(me.id) }));
+  R('GET', '/v1/me', ({ me }) => ({
+    account: publicAccount(me), progress: progressOf(me.id), terms: termsStatus(me.id),
+    storage: { used: usedBy(me.id), quota: quotaOf(me) },
+  }), { terms: false });
   R('POST', '/v1/me', ({ me, body }) => {
     const name = V.str(body.displayName, 'Name', { min: 1, max: 60 });
     h.run('UPDATE accounts SET display_name = ?, updated_at = ? WHERE id = ?', name, now(), me.id);
@@ -277,11 +450,11 @@ export function createHub({
   R('GET', '/v1/me/sessions', ({ me, token }) => ({
     sessions: h.all('SELECT * FROM sessions WHERE account_id = ? AND expires_at > ? ORDER BY last_seen DESC', me.id, now())
       .map((s) => ({ id: s.token_hash.slice(0, 12), client: s.client, createdAt: s.created_at, lastSeen: s.last_seen, current: s.token_hash === sha(token) })),
-  }));
+  }), { terms: false });
   R('POST', '/v1/me/sessions/sign-out-others', ({ me, token }) => {
     const r = h.run('DELETE FROM sessions WHERE account_id = ? AND token_hash != ?', me.id, sha(token));
     return { signedOut: Number(r.changes) };
-  });
+  }, { terms: false });
   R('POST', '/v1/me/totp/setup', ({ me }) => {
     if (me.totp_enabled) bad('Two-step sign-in is already on.');
     const secret = newSecret();
@@ -627,6 +800,26 @@ export function createHub({
   O('GET', '/owner/audit', ({ query }) => ({
     entries: h.all('SELECT * FROM audit ORDER BY id DESC LIMIT ?', Math.min(1000, Number(query.limit) || 200)),
   }));
+  // Publish a new terms version (no-op if nothing changed). Everyone must agree again before using the Hub.
+  O('POST', '/owner/terms', ({ body }) => {
+    try { return publishTerms(body); } catch (e) { bad(e.message); }
+  });
+  O('GET', '/owner/terms', () => {
+    const cur = currentTerms();
+    return {
+      current: cur.n,
+      versions: h.all('SELECT n, label, published_at FROM terms_versions ORDER BY n'),
+      agreedToCurrent: h.get('SELECT COUNT(*) AS n FROM terms_acceptances WHERE version = ?', cur.n).n,
+      accounts: h.get('SELECT COUNT(*) AS n FROM accounts').n,
+    };
+  });
+  O('POST', '/owner/accounts/:id/quota', ({ params, body }) => {
+    const a = getAccount(params.id);
+    const gb = body.gb === null ? null : V.int(body.gb, 'gb', { min: 0, max: 100_000 });
+    h.run('UPDATE accounts SET quota_bytes = ?, updated_at = ? WHERE id = ?', gb == null ? null : gb * 1024 ** 3, now(), a.id);
+    audit('owner', 'owner.quota', a.id, { gb }, 'local');
+    return { used: usedBy(a.id), quota: quotaOf(h.get('SELECT * FROM accounts WHERE id = ?', a.id)) };
+  });
 
   // ================= request handling =================
   const clientIp = (req) => {
@@ -639,8 +832,12 @@ export function createHub({
     const url = new URL(req.url, 'http://localhost');
     const secure = !!req.socket.encrypted || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
     let status = 200, payload, cookies = [];
+    // The readable terms page (Kea opens it in a window; anyone can read it).
+    if (url.pathname === '/terms' && req.method === 'GET') return serveTermsPage(url, res);
     try {
-      const { r, params } = api.find(req.method, url.pathname);
+      const fileMatch = /^\/v1\/files\/(.+)$/.exec(url.pathname);
+      const fileRoute = fileMatch && ['GET', 'PUT', 'DELETE'].includes(req.method);
+      const { r, params } = fileRoute ? { r: { auth: true, terms: true }, params: {} } : api.find(req.method, url.pathname);
       let body = {};
       if (req.method === 'POST') {
         const raw = await readBody(req);
@@ -667,7 +864,13 @@ export function createHub({
         if (!me || me.status !== 'active') throw new HttpError(401, 'Sign in again.');
         if (now() - s.last_seen > 3600_000) h.run('UPDATE sessions SET last_seen = ? WHERE token_hash = ?', now(), s.token_hash);
         ctx.me = me;
+        // Nothing else works until the current terms are agreed to (reading them, exporting data and signing out still do).
+        if (r.terms) {
+          const ts = termsStatus(me.id);
+          if (ts.needsAgreement) throw new HttpError(428, 'The Kea terms have changed. Read what changed and agree to keep using Kea.', { termsRequired: true, ...ts });
+        }
       }
+      if (fileRoute) return await handleFile(req, res, ctx, decodeURIComponent(fileMatch[1]), t0);
       let out = await r.handler(ctx);
       if (out && 'body' in out && (typeof out.status === 'number' || 'token' in out || 'clearCookie' in out)) {
         if (out.token) cookies = [sessionCookie(out.token, SESSION_DAYS * 86400, secure)];
@@ -683,6 +886,96 @@ export function createHub({
     if (status === 429 && payload?.retryAfter) res.setHeader('retry-after', String(payload.retryAfter));
     send(res, status, payload, cookies);
     if (log) console.log(`${new Date().toISOString()} ${req.method} ${url.pathname} ${status} ${Date.now() - t0}ms`);
+  }
+
+  function serveTermsPage(url, res) {
+    const versions = h.all('SELECT n FROM terms_versions ORDER BY n');
+    const want = Number(url.searchParams.get('version')) || null;
+    const row = want ? termsRow(want) : null;
+    const t = row ? { ...row, sections: JSON.parse(row.sections) } : currentTerms();
+    const since = Number(url.searchParams.get('since')) || null;
+    const old = since ? termsRow(since) : null;
+    const html = termsPage(t, { since, diff: old ? diffTerms(JSON.parse(old.sections), t.sections) : null, versions });
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer',
+      'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+    });
+    res.end(html);
+  }
+
+  // ---------- Kea storage: GET (list or read), PUT (write), DELETE ----------
+  // Paths are like "kea/School/kea-data.json". Files are stored on disk under random names, so a path can never point
+  // outside the account's folder. Writes are atomic, and If-Match: "<version>" makes a write fail (412) if another
+  // device changed the file first, so devices never overwrite each other silently.
+  const SEGMENT = /^[\p{L}\p{N} ._()+@,'&!~-]{1,120}$/u;
+  function checkPath(p) {
+    if (p.length > 500) bad('That path is too long.');
+    const parts = p.split('/');
+    if (parts.length > 12 || parts.some((s) => !SEGMENT.test(s) || s === '.' || s === '..' || s.trim() !== s)) bad('That file path has characters Kea storage does not allow.');
+    return parts.join('/');
+  }
+  const readRaw = (req, max) => new Promise((resolve, reject) => {
+    let size = 0; const chunks = [];
+    req.on('data', (c) => { size += c.length; if (size > max) { reject(new HttpError(413, `Files can be at most ${Math.round(max / 1024 ** 2)} MB.`)); req.destroy(); } else chunks.push(c); });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+  const etagVersion = (v) => { const m = /^"?(\d+)"?$/.exec(String(v ?? '').trim()); return m ? Number(m[1]) : null; };
+
+  async function handleFile(req, res, ctx, rawPath, t0) {
+    const me = ctx.me;
+    const done = (status, payload, headers = {}) => {
+      for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
+      send(res, status, payload);
+      if (log) console.log(`${new Date().toISOString()} ${req.method} /v1/files/… ${status} ${Date.now() - t0}ms`);
+    };
+    // GET /v1/files/ (empty path) is handled by the list route; here the path is a file.
+    const path = checkPath(rawPath);
+    const row = h.get('SELECT * FROM files WHERE account_id = ? AND path = ?', me.id, path);
+    if (req.method === 'GET') {
+      if (!row) notFound('No such file.');
+      if (etagVersion(req.headers['if-none-match']) === row.version) { res.writeHead(304, { etag: `"${row.version}"` }); res.end(); return; }
+      const data = readFileSync(blobPath(me.id, row.blob));
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': data.length, etag: `"${row.version}"`, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'x-kea-sha256': row.sha256 });
+      res.end(data);
+      return;
+    }
+    const ifMatch = req.headers['if-match'];
+    const conflict = () => { throw new HttpError(412, 'This file was changed on another device. Get the newest copy first.', { version: row?.version ?? null }); };
+    if (ifMatch != null) {
+      if (ifMatch === '*' ? !row : etagVersion(ifMatch) !== row?.version) conflict();
+    }
+    if (req.headers['if-none-match'] === '*' && row) conflict();
+    if (req.method === 'DELETE') {
+      if (!row) notFound('No such file.');
+      h.run('DELETE FROM files WHERE account_id = ? AND path = ?', me.id, path);
+      rmSync(blobPath(me.id, row.blob), { force: true });
+      return done(200, { ok: true });
+    }
+    // PUT
+    const data = await readRaw(req, maxFileBytes);
+    const used = usedBy(me.id) - (row?.size ?? 0);
+    const quota = quotaOf(me);
+    if (quota >= 0 && used + data.length > quota) throw new HttpError(507, `Your Kea storage is full (${(quota / 1024 ** 3).toFixed(1)} GB). Delete some files or ask for more space.`, { used, quota });
+    try { const fs = statfsSync(storageDir); if (fs.bavail * fs.bsize - data.length < minFreeBytes) throw new HttpError(507, "The Kea Hub's drive is nearly full. Try again later."); } catch (e) { if (e instanceof HttpError) throw e; }
+    const blob = randomUUID();
+    const dir = join(storageDir, me.id);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${blob}.tmp`), data);
+    renameSync(join(dir, `${blob}.tmp`), join(dir, blob));
+    const version = (row?.version ?? 0) + 1;
+    const hash = createHash('sha256').update(data).digest('hex');
+    try {
+      h.tx(() => {
+        // Re-check inside the transaction so two simultaneous writes can't both win.
+        const cur = h.get('SELECT version FROM files WHERE account_id = ? AND path = ?', me.id, path);
+        if ((cur?.version ?? 0) !== (row?.version ?? 0)) conflict();
+        h.run('INSERT INTO files (account_id,path,blob,size,version,sha256,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(account_id,path) DO UPDATE SET blob=excluded.blob, size=excluded.size, version=excluded.version, sha256=excluded.sha256, updated_at=excluded.updated_at',
+          me.id, path, blob, data.length, version, hash, now());
+      });
+    } catch (e) { rmSync(join(dir, blob), { force: true }); throw e; }
+    if (row) rmSync(blobPath(me.id, row.blob), { force: true });
+    return done(row ? 200 : 201, { path, version, size: data.length, sha256: hash }, { etag: `"${version}"` });
   }
 
   async function handleOwner(req, res) {

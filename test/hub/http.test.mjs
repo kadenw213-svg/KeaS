@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { generateKeyPairSync, sign } from 'node:crypto';
 import { createHub } from '../../hub/index.mjs';
 import { codeAt, stepOf } from '../../hub/lib/totp.mjs';
 import { verifyToken } from '../../hub/lib/tokens.mjs';
@@ -12,9 +13,19 @@ const DAY = 86400_000;
 let hub, base, ownerBase, dir;
 let clock = Date.UTC(2026, 10, 5, 15);
 
+// A stand-in for Google: our own RSA key, published the way Google publishes its keys.
+const google = generateKeyPairSync('rsa', { modulusLength: 2048 });
+const googleJwk = { ...google.publicKey.export({ format: 'jwk' }), kid: 'test-kid', alg: 'RS256', use: 'sig' };
+function googleToken(claims = {}, key = google.privateKey) {
+  const t = Math.floor(clock / 1000);
+  const head = Buffer.from(JSON.stringify({ alg: 'RS256', kid: 'test-kid', typ: 'JWT' })).toString('base64url');
+  const body = Buffer.from(JSON.stringify({ iss: 'https://accounts.google.com', aud: 'kea-test-client', sub: 'g-123', email_verified: true, iat: t, exp: t + 3600, ...claims })).toString('base64url');
+  return `${head}.${body}.${sign('RSA-SHA256', Buffer.from(`${head}.${body}`), key).toString('base64url')}`;
+}
+
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), 'kea-hub-test-'));
-  hub = createHub({ dataDir: dir, now: () => clock, log: false, ipHeader: 'x-test-ip' });
+  hub = createHub({ dataDir: dir, now: () => clock, log: false, ipHeader: 'x-test-ip', googleClientIds: ['kea-test-client'], googleKeyFn: async () => [googleJwk], defaultQuotaBytes: 1000, minFreeBytes: 0 });
   const p = await hub.listen({ port: 0, ownerPort: 0 });
   base = `http://127.0.0.1:${p.port}`;
   ownerBase = `http://127.0.0.1:${p.ownerPort}`;
@@ -34,9 +45,13 @@ async function owner(method, path, body, key = hub.ownerKey) {
   return { status: r.status, body: await r.json() };
 }
 let ipN = 0;
-const freshIp = () => ({ 'x-test-ip': `10.0.0.${++ipN}` });
-async function register(email, name = 'Test Person', password = 'lantern velvet orbit') {
-  const r = await call('POST', '/v1/auth/register', null, { email, password, displayName: name, age13: true }, freshIp());
+const freshIp = () => ({ 'x-test-ip': `10.0.${Math.floor(++ipN / 250)}.${ipN % 250}` });
+async function agreement() {
+  const t = (await call('GET', '/v1/terms')).body.terms;
+  return { termsVersion: t.version, termsSections: t.sections.map((s) => s.id) };
+}
+async function register(email, name = 'Test Person', password = 'lantern velvet orbit', extra = {}) {
+  const r = await call('POST', '/v1/auth/register', null, { email, password, displayName: name, age13: true, ...(await agreement()), ...extra }, freshIp());
   assert.equal(r.status, 201, JSON.stringify(r.body));
   return r.body.token;
 }
@@ -50,12 +65,17 @@ test('health and keys are public; the rest needs a session', async () => {
 });
 
 test('register: validation, age gate, weak password, duplicate email', async () => {
-  const bad = (b) => call('POST', '/v1/auth/register', null, { email: 'a@b.co', password: 'lantern velvet orbit', displayName: 'A', age13: true, ...b }, freshIp());
+  const ag = await agreement();
+  const bad = (b) => call('POST', '/v1/auth/register', null, { email: 'a@b.co', password: 'lantern velvet orbit', displayName: 'A', age13: true, ...ag, ...b }, freshIp());
   assert.equal((await bad({ email: 'nope' })).status, 400);
   assert.match((await bad({ age13: false })).body.error, /13/);
   assert.match((await bad({ password: 'password123' })).body.error, /common/);
+  // Terms: every section must be agreed to, on the current version.
+  assert.equal((await bad({ termsVersion: undefined })).status, 409);
+  const partial = await bad({ termsSections: ag.termsSections.slice(1) });
+  assert.deepEqual([partial.status, partial.body.missing], [400, [ag.termsSections[0]]]);
   await register('dup@example.com');
-  assert.equal((await call('POST', '/v1/auth/register', null, { email: 'DUP@example.com', password: 'lantern velvet orbit', displayName: 'B', age13: true }, freshIp())).status, 409);
+  assert.equal((await call('POST', '/v1/auth/register', null, { email: 'DUP@example.com', password: 'lantern velvet orbit', displayName: 'B', age13: true, ...ag }, freshIp())).status, 409);
 });
 
 test('login: right password works, wrong is generic, unknown email looks identical, lockout doubles', async () => {
@@ -260,4 +280,111 @@ test('suspension signs the account out everywhere', async () => {
   const audit = await owner('GET', '/owner/audit');
   assert.ok(audit.body.entries.some((e) => e.action === 'owner.account_update'));
   assert.ok(!JSON.stringify(audit.body).includes('lantern'), 'passwords never reach the audit log');
+});
+
+test('verify with Google: right email verifies; wrong app, wrong email, forged, stale and reused tokens are refused', async () => {
+  const t = await register('gwen@example.com', 'Gwen');
+  const bad = async (tok) => (await call('POST', '/v1/me/verify/google', t, { idToken: tok })).status;
+  assert.equal(await bad(googleToken({ email: 'gwen@example.com', aud: 'other-app' })), 401);
+  assert.equal(await bad(googleToken({ email: 'someone@example.com' })), 400);
+  assert.equal(await bad(googleToken({ email: 'gwen@example.com', email_verified: false })), 401);
+  assert.equal(await bad(googleToken({ email: 'gwen@example.com', iat: Math.floor(clock / 1000) - 3600 })), 401);
+  assert.equal(await bad(googleToken({ email: 'gwen@example.com' }, generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey)), 401);
+  const good = googleToken({ email: 'Gwen@example.com' });
+  const ok = await call('POST', '/v1/me/verify/google', t, { idToken: good });
+  assert.deepEqual([ok.status, ok.body.account.emailVerified, ok.body.account.verifiedBy], [200, true, 'Google']);
+  assert.equal(await bad(good), 401, 'a Google sign-in works once');
+});
+
+test('register with Google, sign in with Google, reset a forgotten password with Google', async () => {
+  const reg = await register('grace@example.com', 'Grace', 'lantern velvet orbit', { googleIdToken: googleToken({ email: 'grace@example.com', sub: 'g-grace' }) });
+  assert.equal((await call('GET', '/v1/me', reg)).body.account.emailVerified, true);
+  const g = await call('POST', '/v1/auth/google', null, { idToken: googleToken({ email: 'grace@example.com', sub: 'g-grace', nonce: 1 }) }, freshIp());
+  assert.equal(g.status, 200);
+  const none = await call('POST', '/v1/auth/google', null, { idToken: googleToken({ email: 'nobody@example.com', nonce: 2 }) }, freshIp());
+  assert.deepEqual([none.status, none.body.email], [404, 'nobody@example.com']);
+  const reset = await call('POST', '/v1/auth/reset/google', null, { idToken: googleToken({ email: 'grace@example.com', nonce: 3 }), password: 'river copper lantern' }, freshIp());
+  assert.equal(reset.status, 200);
+  assert.equal((await call('GET', '/v1/me', reg)).status, 401, 'old sessions end');
+  assert.equal((await call('POST', '/v1/auth/login', null, { email: 'grace@example.com', password: 'river copper lantern' }, freshIp())).status, 200);
+});
+
+test('Kea storage: write, read, versions and conflicts, quota, path safety, isolation', async () => {
+  const a = await register('files@example.com');
+  const b = await register('other@example.com');
+  const put = (tok, path, data, headers = {}) => fetch(`${base}/v1/files/${path}`, { method: 'PUT', headers: { authorization: `Bearer ${tok}`, ...headers }, body: data });
+  const get = (tok, path, headers = {}) => fetch(`${base}/v1/files/${path}`, { headers: { authorization: `Bearer ${tok}`, ...headers } });
+  let r = await put(a, 'kea/School/notes.json', '{"n":1}');
+  assert.equal(r.status, 201);
+  assert.equal((await r.json()).version, 1);
+  r = await get(a, 'kea/School/notes.json');
+  assert.deepEqual([r.status, await r.text(), r.headers.get('etag')], [200, '{"n":1}', '"1"']);
+  assert.equal((await get(a, 'kea/School/notes.json', { 'if-none-match': '"1"' })).status, 304);
+  // A device writes with the version it knows; a stale device is refused.
+  assert.equal((await put(a, 'kea/School/notes.json', '{"n":2}', { 'if-match': '"1"' })).status, 200);
+  const stale = await put(a, 'kea/School/notes.json', '{"n":"stale"}', { 'if-match': '"1"' });
+  assert.deepEqual([stale.status, (await stale.json()).version], [412, 2]);
+  assert.equal((await put(a, 'kea/School/notes.json', 'x', { 'if-none-match': '*' })).status, 412);
+  // Names with spaces and accents are fine; tricks are not.
+  assert.equal((await put(a, encodeURIComponent('kea/Café notes/Week 1 (draft).md').replace(/%2F/g, '/'), 'hi')).status, 201);
+  // (A literal "/../" is resolved by URL parsing before it reaches the Hub; an encoded slash isn't, so test that.)
+  for (const p of ['kea/..%2Fx', 'kea/%2E%2E%2Fx', 'kea//x', 'kea/a%5Cb', 'kea/%00', 'kea/a%3Ab', 'kea/%20lead']) assert.equal((await put(a, p, 'x')).status, 400, p);
+  // Quota (1000 bytes in this test).
+  assert.equal((await put(a, 'big.bin', 'x'.repeat(2000))).status, 507);
+  // Other accounts can't see it.
+  assert.equal((await get(b, 'kea/School/notes.json')).status, 404);
+  const list = await call('GET', '/v1/files?prefix=kea/School/', a);
+  assert.deepEqual(list.body.files.map((f) => [f.path, f.version]), [['kea/School/notes.json', 2]]);
+  assert.equal((await call('GET', '/v1/files', b)).body.files.length, 0);
+  assert.equal((await fetch(`${base}/v1/files/kea/School/notes.json`, { method: 'DELETE', headers: { authorization: `Bearer ${a}` } })).status, 200);
+  assert.equal((await get(a, 'kea/School/notes.json')).status, 404);
+  assert.equal((await fetch(`${base}/v1/files/x`)).status, 401);
+  const exp = await call('GET', '/v1/me/export', a);
+  assert.equal(exp.body.account.email, 'files@example.com');
+  assert.equal(exp.body.termsAgreements.length, 1);
+});
+
+// Last: publishing new terms locks everyone out until they agree again.
+test('terms change: everyone must re-agree; only changes shown; reading, export and sign-out still work', async () => {
+  const t = await register('reader@example.com', 'Rae Reader');
+  const page = await fetch(`${base}/terms`);
+  assert.equal(page.status, 200);
+  assert.match(await page.text(), /Use the official software only/);
+
+  const doc = (await call('GET', '/v1/terms')).body.terms;
+  const v1 = doc.version;
+  const next = structuredClone(doc);
+  next.label = '2026-12-01';
+  next.summary = 'Storage limits explained; new section on study groups.';
+  next.sections.find((s) => s.id === 'storage').body += '\n- Example change.';
+  next.sections.splice(9, 0, { id: 'study-groups', title: '8b. Study groups', body: 'Study groups share materials members made.' });
+  next.sections = next.sections.filter((s) => s.id !== 'minors');
+  const pub = await owner('POST', '/owner/terms', next);
+  assert.deepEqual([pub.status, pub.body.published, pub.body.n], [200, true, v1 + 1]);
+  assert.equal((await owner('POST', '/owner/terms', next)).body.published, false, 'same text is not a new version');
+
+  // Locked out of everything that uses the Hub...
+  const blocked = await call('GET', '/v1/classes', t);
+  assert.deepEqual([blocked.status, blocked.body.termsRequired, blocked.body.current, blocked.body.accepted], [428, true, v1 + 1, v1]);
+  assert.equal((await call('POST', '/v1/auth/token', t, {})).status, 428);
+  assert.equal((await fetch(`${base}/v1/files/a`, { headers: { authorization: `Bearer ${t}` } })).status, 428);
+  // ...but can see their status, read what changed, export, and sign out.
+  assert.equal((await call('GET', '/v1/me', t)).body.terms.needsAgreement, true);
+  const ch = await call('GET', '/v1/terms/changes', t);
+  assert.deepEqual([ch.body.added.map((s) => s.id), ch.body.changed.map((s) => s.id), ch.body.removed.map((s) => s.id)], [['study-groups'], ['storage'], ['minors']]);
+  assert.equal((await call('GET', '/v1/me/export', t)).status, 200);
+  const diffPage = await (await fetch(`${base}/terms?since=${v1}`)).text();
+  assert.match(diffPage, /Changes from version 1 to version 2/);
+  assert.match(diffPage, /New<\/span><h2>8b\. Study groups/);
+  assert.doesNotMatch(diffPage, /Use the official software only/, 'unchanged sections are left out');
+
+  // Agreeing to the old version, or to only part of the new one, doesn't count.
+  assert.equal((await call('POST', '/v1/terms/accept', t, { termsVersion: v1, termsSections: doc.sections.map((s) => s.id) })).status, 409);
+  assert.equal((await call('POST', '/v1/terms/accept', t, { termsVersion: v1 + 1, termsSections: ['storage'] })).status, 400);
+  const acc = await call('POST', '/v1/terms/accept', t, { termsVersion: v1 + 1, termsSections: next.sections.map((s) => s.id) });
+  assert.deepEqual([acc.status, acc.body.terms.needsAgreement], [200, false]);
+  assert.equal((await call('GET', '/v1/classes', t)).status, 200);
+  assert.equal((await owner('GET', '/owner/terms')).body.agreedToCurrent, 1);
+  assert.equal((await owner('POST', '/owner/terms', { sections: [{ id: 'Bad Id', title: 'x', body: 'y' }] })).status, 400);
+  assert.equal((await call('POST', '/v1/auth/logout', t)).status, 200);
 });

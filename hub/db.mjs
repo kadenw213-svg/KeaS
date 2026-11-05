@@ -91,13 +91,38 @@ CREATE TABLE IF NOT EXISTS xp_events (
 );
 CREATE INDEX IF NOT EXISTS xp_class ON xp_events(class_id, at);
 CREATE INDEX IF NOT EXISTS xp_account ON xp_events(account_id, day);
+CREATE TABLE IF NOT EXISTS terms_versions (
+  n INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '',
+  sections TEXT NOT NULL, published_at INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS terms_no_update BEFORE UPDATE ON terms_versions BEGIN SELECT RAISE(ABORT, 'published terms never change'); END;
+CREATE TABLE IF NOT EXISTS terms_acceptances (
+  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, version INTEGER NOT NULL REFERENCES terms_versions(n),
+  sections TEXT NOT NULL, at INTEGER NOT NULL, ip TEXT, client TEXT,
+  PRIMARY KEY (account_id, version)
+);
+CREATE TABLE IF NOT EXISTS files (
+  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, path TEXT NOT NULL,
+  blob TEXT NOT NULL, size INTEGER NOT NULL, version INTEGER NOT NULL, sha256 TEXT NOT NULL, updated_at INTEGER NOT NULL,
+  PRIMARY KEY (account_id, path)
+);
+CREATE TABLE IF NOT EXISTS google_tokens_used (token_hash TEXT PRIMARY KEY, at INTEGER NOT NULL);
 `;
+
+// Columns added after the first release, applied to existing databases.
+const COLUMNS = [
+  ['accounts', 'quota_bytes', 'INTEGER'],
+  ['accounts', 'google_sub', 'TEXT'],
+];
 
 export function openDb(file) {
   mkdirSync(dirname(file), { recursive: true });
   const db = new DatabaseSync(file);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
   db.exec(SCHEMA);
+  for (const [table, col, type] of COLUMNS) {
+    if (!db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+  }
   const cache = new Map();
   const st = (sql) => { let s = cache.get(sql); if (!s) { s = db.prepare(sql); cache.set(sql, s); } return s; };
   return {

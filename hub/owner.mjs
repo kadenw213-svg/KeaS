@@ -1,6 +1,7 @@
 // Owner tools, run on the Hub's own PC. Nothing here is reachable through the Hub's API.
 //   node hub/owner.mjs make-owner <email>     the account must exist (sign up in Kea or KeaS first)
 //   node hub/owner.mjs console <path> [json]  call the owner console, e.g. `console GET /owner/stats`
+//   node hub/owner.mjs publish-terms [file]   publish edited terms (hub/terms/terms.json); everyone re-agrees
 //   node hub/owner.mjs where                  where the Hub keeps its data
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -27,8 +28,18 @@ if (cmd === 'make-owner') {
   const port = Number(process.env.KEA_HUB_OWNER_PORT) || 4861;
   const r = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers: { 'x-kea-owner-key': key, 'content-type': 'application/json' }, body: json });
   console.log(r.status, JSON.stringify(await r.json(), null, 2));
+} else if (cmd === 'publish-terms') {
+  // Edit hub/terms/terms.json (keep each section's id the same when you only change its wording; give new sections
+  // new ids), then run this. Everyone has to agree again before they can use the Hub; the apps show only what changed.
+  const file = args[0] || new URL('./terms/terms.json', import.meta.url);
+  const key = readFileSync(join(DATA_DIR, 'owner.key'), 'utf8').trim();
+  const port = Number(process.env.KEA_HUB_OWNER_PORT) || 4861;
+  const r = await fetch(`http://127.0.0.1:${port}/owner/terms`, { method: 'POST', headers: { 'x-kea-owner-key': key, 'content-type': 'application/json' }, body: readFileSync(file, 'utf8') });
+  const j = await r.json();
+  if (!r.ok) { console.error(j.error); process.exit(1); }
+  console.log(j.published ? `Published terms version ${j.n}. Everyone will be asked to agree again.` : `Nothing changed; version ${j.n} is still current.`);
 } else if (cmd === 'where') {
   console.log(DATA_DIR);
 } else {
-  console.log('Commands: make-owner <email> | console [METHOD] <path> [json] | where');
+  console.log('Commands: make-owner <email> | publish-terms [file] | console [METHOD] <path> [json] | where');
 }
