@@ -214,6 +214,35 @@ export function createHub({
   const quotaOf = (a) => (a.quota_bytes == null ? defaultQuotaBytes : a.quota_bytes);
   const usedBy = (accountId) => h.get('SELECT COALESCE(SUM(size),0) AS s FROM files WHERE account_id = ?', accountId).s;
   const blobPath = (accountId, blob) => join(storageDir, accountId, blob);
+  // A storage "space": one person's files, or a course section's shared folder. Same rules for both: files on disk
+  // under random names, versions in the database, atomic writes.
+  const spaces = {
+    user: (id) => ({ table: 'files', col: 'account_id', id, dir: join(storageDir, id) }),
+    course: (key) => ({ table: 'course_files', col: 'course_key', id: key, dir: join(storageDir, 'courses', sha(`course:${key}`).slice(0, 32)) }),
+  };
+  const spaceRow = (sp, p) => h.get(`SELECT * FROM ${sp.table} WHERE ${sp.col} = ? AND path = ?`, sp.id, p);
+  const spaceList = (sp, prefix = '', since = 0) =>
+    h.all(`SELECT path, size, version, sha256, updated_at FROM ${sp.table} WHERE ${sp.col} = ? AND substr(path, 1, length(?)) = ? AND updated_at > ? ORDER BY path`, sp.id, prefix, prefix, since)
+      .map((f) => ({ path: f.path, size: f.size, version: f.version, sha256: f.sha256, updatedAt: f.updated_at }));
+  const spaceRead = (sp, row) => readFileSync(join(sp.dir, row.blob));
+  function spaceWrite(sp, p, data) {
+    const row = spaceRow(sp, p);
+    const blob = randomUUID();
+    mkdirSync(sp.dir, { recursive: true });
+    writeFileSync(join(sp.dir, `${blob}.tmp`), data);
+    renameSync(join(sp.dir, `${blob}.tmp`), join(sp.dir, blob));
+    const version = (row?.version ?? 0) + 1;
+    const hash = createHash('sha256').update(data).digest('hex');
+    h.run(`INSERT INTO ${sp.table} (${sp.col},path,blob,size,version,sha256,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(${sp.col},path) DO UPDATE SET blob=excluded.blob, size=excluded.size, version=excluded.version, sha256=excluded.sha256, updated_at=excluded.updated_at`,
+      sp.id, p, blob, data.length, version, hash, now());
+    if (row) rmSync(join(sp.dir, row.blob), { force: true });
+    return { path: p, version, size: data.length, sha256: hash };
+  }
+  function spaceDeletePrefix(sp, prefix) {
+    for (const r of h.all(`SELECT * FROM ${sp.table} WHERE ${sp.col} = ? AND substr(path, 1, length(?)) = ?`, sp.id, prefix, prefix)) rmSync(join(sp.dir, r.blob), { force: true });
+    h.run(`DELETE FROM ${sp.table} WHERE ${sp.col} = ? AND substr(path, 1, length(?)) = ?`, sp.id, prefix, prefix);
+  }
+  const rawOut = (data, headers = {}) => ({ __raw: data, headers });
 
   const publicAccount = (a) => ({
     id: a.id, email: a.email, displayName: a.display_name, role: a.role, status: a.status,
@@ -836,9 +865,32 @@ export function createHub({
       return { status: 'joined', message: d.reason, job: jobOut(h.get('SELECT * FROM scan_jobs WHERE id = ?', d.jobId)), allowance: allowance(me) };
     }
     const id = randomUUID();
-    h.run('INSERT INTO scan_jobs (id,account_id,kind,course_key,chapter,detail,created_at) VALUES (?,?,?,?,?,?,?)', id, me.id, kind, key, chapter,
-      body.detail == null ? null : JSON.stringify(body.detail).slice(0, 4000), t);
-    return { status: 'queued', job: jobOut(h.get('SELECT * FROM scan_jobs WHERE id = ?', id)), allowance: allowance(me) };
+    // Scans need what the person's Kea collected from their class site: they upload it to
+    // scan-inbox/<job id>/ in their own Kea storage, then say it's ready. Question batches work from the course's
+    // shared material, so they're ready at once.
+    const ready = kind === 'more_questions' ? 1 : 0;
+    h.run('INSERT INTO scan_jobs (id,account_id,kind,course_key,chapter,detail,created_at,ready) VALUES (?,?,?,?,?,?,?,?)', id, me.id, kind, key, chapter,
+      body.detail == null ? null : JSON.stringify(body.detail).slice(0, 4000), t, ready);
+    return { status: 'queued', job: jobOut(h.get('SELECT * FROM scan_jobs WHERE id = ?', id)), uploadTo: ready ? null : `scan-inbox/${id}/`, allowance: allowance(me) };
+  });
+  R('POST', '/v1/scan/:id/ready', ({ me, params }) => {
+    const j = h.get("SELECT * FROM scan_jobs WHERE id = ? AND account_id = ? AND status = 'queued'", params.id, me.id) ?? notFound('Nothing waiting with that id.');
+    const files = spaceList(spaces.user(me.id), `scan-inbox/${j.id}/`);
+    if (!files.length) bad(`Upload your class content to scan-inbox/${j.id}/ first.`);
+    h.run('UPDATE scan_jobs SET ready = 1 WHERE id = ?', j.id);
+    return { job: jobOut(h.get('SELECT * FROM scan_jobs WHERE id = ?', j.id)), files: files.length };
+  });
+  // A course section's shared material (what the shared Claude made), for anyone in that section.
+  const courseAccess = (me, key) => {
+    if (!key) bad('Say which course.');
+    if (me.role !== 'owner' && !h.get('SELECT 1 FROM course_members WHERE course_key = ? AND account_id = ?', key, me.id)) notFound('Course not found.');
+    return spaces.course(key);
+  };
+  R('GET', '/v1/course-files', ({ me, query }) => ({ files: spaceList(courseAccess(me, query.course), String(query.prefix ?? ''), Number(query.since) || 0) }));
+  R('GET', '/v1/course-file', ({ me, query }) => {
+    const sp = courseAccess(me, query.course);
+    const row = spaceRow(sp, String(query.path ?? '')) ?? notFound('No such file.');
+    return rawOut(spaceRead(sp, row), { etag: `"${row.version}"`, 'x-kea-sha256': row.sha256 });
   });
   R('GET', '/v1/scan', ({ me }) => {
     const order = queueOrder();
@@ -877,7 +929,7 @@ export function createHub({
     const done = new Map(h.all("SELECT account_id, COUNT(*) AS n FROM scan_jobs WHERE started_at >= ? AND status IN ('running','done') GROUP BY account_id", dayStart()).map((r) => [r.account_id, r.n]));
     const owners = ownerIds();
     const globalUsedToday = h.get(`SELECT COUNT(*) AS n FROM scan_jobs WHERE started_at >= ? AND status IN ('running','done','failed') AND account_id NOT IN (SELECT id FROM accounts WHERE role = 'owner')`, dayStart()).n;
-    const j = pickNext(h.all("SELECT * FROM scan_jobs WHERE status = 'queued'"), { doneTodayByAccount: done, ownerIds: owners, globalUsedToday, limits: getSetting('limits', {}), paused: (getSetting('pausedUntil', 0) || 0) > now() });
+    const j = pickNext(h.all("SELECT * FROM scan_jobs WHERE status = 'queued' AND ready = 1"), { doneTodayByAccount: done, ownerIds: owners, globalUsedToday, limits: getSetting('limits', {}), paused: (getSetting('pausedUntil', 0) || 0) > now() });
     if (!j) return { job: null };
     h.run("UPDATE scan_jobs SET status = 'running', started_at = ? WHERE id = ?", now(), j.id);
     const members = h.all('SELECT a.id, a.email FROM accounts a WHERE a.id = ? OR a.id IN (SELECT account_id FROM scan_job_members WHERE job_id = ?)', j.account_id, j.id);
@@ -889,8 +941,35 @@ export function createHub({
     h.tx(() => {
       h.run('UPDATE scan_jobs SET status = ?, finished_at = ?, note = ? WHERE id = ?', ok ? 'done' : 'failed', now(), V.str(body.note, 'note', { optional: true, max: 2000 }), j.id);
       if (ok && j.kind !== 'more_questions') h.run('INSERT INTO course_materials (course_key,first_job_id,created_at,updated_at) VALUES (?,?,?,?) ON CONFLICT(course_key) DO UPDATE SET updated_at = excluded.updated_at', j.course_key, j.id, now(), now());
+      // The uploaded class content isn't kept once the job is over.
+      spaceDeletePrefix(spaces.user(j.account_id), `scan-inbox/${j.id}/`);
     });
     return { ok: true };
+  });
+  // What the person's Kea uploaded for this job.
+  const runningJob = (id) => h.get("SELECT * FROM scan_jobs WHERE id = ? AND status = 'running'", id) ?? notFound('No running job with that id.');
+  O('GET', '/owner/scan/:id/inbox', ({ params }) => {
+    const j = runningJob(params.id);
+    return { files: spaceList(spaces.user(j.account_id), `scan-inbox/${j.id}/`) };
+  });
+  O('GET', '/owner/scan/:id/inbox-file', ({ params, query }) => {
+    const j = runningJob(params.id);
+    const p = String(query.path ?? '');
+    if (!p.startsWith(`scan-inbox/${j.id}/`)) forbidden('Only this job’s uploads.');
+    const sp = spaces.user(j.account_id);
+    return rawOut(spaceRead(sp, spaceRow(sp, p) ?? notFound()));
+  });
+  // Results: shared ones into the course section's folder; private ones (a person's own assignment guides) into
+  // that person's storage. Only while the job runs, and only for its own course and members.
+  O('PUT', '/owner/scan/:id/course-file', ({ params, query, raw }) => {
+    const j = runningJob(params.id);
+    return spaceWrite(spaces.course(j.course_key), checkPath(String(query.path ?? '')), raw);
+  });
+  O('PUT', '/owner/scan/:id/member-file', ({ params, query, raw }) => {
+    const j = runningJob(params.id);
+    const who = String(query.account ?? '');
+    if (who !== j.account_id && !h.get('SELECT 1 FROM scan_job_members WHERE job_id = ? AND account_id = ?', j.id, who)) forbidden('Not in this job.');
+    return spaceWrite(spaces.user(who), `kea-results/${checkPath(String(query.path ?? ''))}`, raw);
   });
   // The plan hit its limit, or the owner needs it: others' jobs wait until then (hours null = resume now).
   O('POST', '/owner/scan/pause', ({ body }) => {
@@ -1060,6 +1139,11 @@ export function createHub({
       }
       if (fileRoute) return await handleFile(req, res, ctx, decodeURIComponent(fileMatch[1]), t0);
       let out = await r.handler(ctx);
+      if (out && out.__raw) {
+        res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': out.__raw.length, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...out.headers });
+        res.end(out.__raw);
+        return;
+      }
       if (out && 'body' in out && (typeof out.status === 'number' || 'token' in out || 'clearCookie' in out)) {
         if (out.token) cookies = [sessionCookie(out.token, SESSION_DAYS * 86400, secure)];
         if (out.clearCookie) cookies = [sessionCookie('', 0, secure)];
@@ -1177,9 +1261,15 @@ export function createHub({
       if (given.length !== ownerKey.length || !timingSafeEqual(given, ownerKey)) throw new HttpError(401, 'Owner key required.');
       const url = new URL(req.url, 'http://localhost');
       const { r, params } = own.find(req.method, url.pathname);
-      let body = {};
-      if (req.method === 'POST') { const raw = await readBody(req); if (raw.trim()) { try { body = JSON.parse(raw); } catch { bad('Invalid JSON.'); } } body = V.obj(body); }
-      payload = await r.handler({ params, body, query: Object.fromEntries(url.searchParams) });
+      let body = {}, raw = null;
+      if (req.method === 'POST') { const text = await readBody(req); if (text.trim()) { try { body = JSON.parse(text); } catch { bad('Invalid JSON.'); } } body = V.obj(body); }
+      if (req.method === 'PUT') raw = await readRaw(req, maxFileBytes);
+      payload = await r.handler({ params, body, raw, query: Object.fromEntries(url.searchParams) });
+      if (payload && payload.__raw) {
+        res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': payload.__raw.length, 'cache-control': 'no-store', ...payload.headers });
+        res.end(payload.__raw);
+        return;
+      }
     } catch (e) {
       if (e instanceof HttpError) { status = e.status; payload = { error: e.message, ...(e.extra || {}) }; }
       else { status = 500; payload = { error: 'internal error' }; console.error(e); }

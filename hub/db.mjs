@@ -126,6 +126,13 @@ CREATE TABLE IF NOT EXISTS scan_job_members (
 CREATE TABLE IF NOT EXISTS course_materials (
   course_key TEXT PRIMARY KEY, first_job_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
+-- A course section's shared folder: what the shared Claude made for it (textbook chapters, question pools), read by
+-- everyone in course_members. Same layout as files, keyed by course instead of account.
+CREATE TABLE IF NOT EXISTS course_files (
+  course_key TEXT NOT NULL, path TEXT NOT NULL,
+  blob TEXT NOT NULL, size INTEGER NOT NULL, version INTEGER NOT NULL, sha256 TEXT NOT NULL, updated_at INTEGER NOT NULL,
+  PRIMARY KEY (course_key, path)
+);
 CREATE TABLE IF NOT EXISTS course_members (
   course_key TEXT NOT NULL, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, joined_at INTEGER NOT NULL,
   PRIMARY KEY (course_key, account_id)
@@ -147,6 +154,8 @@ CREATE TABLE IF NOT EXISTS flags (
 const COLUMNS = [
   ['accounts', 'quota_bytes', 'INTEGER'],
   ['accounts', 'google_sub', 'TEXT'],
+  // A scan waits (ready = 0) until the person's Kea has uploaded what it collected from their class site.
+  ['scan_jobs', 'ready', 'INTEGER NOT NULL DEFAULT 1'],
 ];
 
 export function openDb(file) {

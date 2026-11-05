@@ -366,15 +366,44 @@ test('shared Claude: verified only, classmates share one scan, batches of 25, li
   assert.equal((await call('POST', '/v1/scan', a, { kind: 'initial_scan', course })).body.code, 'already_scanned');
   assert.equal((await call('POST', '/v1/scan', a, { kind: 'regenerate', course })).body.code, 'no_regenerate');
 
+  // A's Kea uploads what it collected from the class site, then says it's ready. Not before.
+  const jobId = qa.body.job.id;
+  assert.equal(qa.body.uploadTo, `scan-inbox/${jobId}/`);
+  assert.equal((await owner('POST', '/owner/scan/next')).body.job, null, 'waits for the upload');
+  assert.equal((await call('POST', `/v1/scan/${jobId}/ready`, a)).status, 400, 'nothing uploaded yet');
+  const up = await fetch(`${base}/v1/files/scan-inbox/${jobId}/content.md`, { method: 'PUT', headers: { authorization: `Bearer ${a}` }, body: '# CHEM 1110\nWeek 1: atoms' });
+  assert.equal(up.status, 201);
+  assert.equal((await call('POST', `/v1/scan/${jobId}/ready`, a)).status, 200);
+
   // The worker on the owner's PC runs it; then C gets it shared, with no Claude at all.
   const next = await owner('POST', '/owner/scan/next');
-  assert.equal(next.body.job.id, qa.body.job.id);
+  assert.equal(next.body.job.id, jobId);
   assert.deepEqual(next.body.job.members.map((m) => m.email).sort(), ['scan-a@example.com', 'scan-b@example.com']);
   assert.equal((await owner('POST', '/owner/scan/next')).body.job, null, 'one at a time');
-  await owner('POST', `/owner/scan/${qa.body.job.id}/finish`, { ok: true });
+  const inbox = await owner('GET', `/owner/scan/${jobId}/inbox`);
+  assert.deepEqual(inbox.body.files.map((f) => f.path), [`scan-inbox/${jobId}/content.md`]);
+  const got = await fetch(`${ownerBase}/owner/scan/${jobId}/inbox-file?path=${encodeURIComponent(`scan-inbox/${jobId}/content.md`)}`, { headers: { 'x-kea-owner-key': hub.ownerKey } });
+  assert.equal(await got.text(), '# CHEM 1110\nWeek 1: atoms');
+  // Results: a shared textbook chapter for the section, and a private file for one member.
+  const putOwner = (p, data) => fetch(`${ownerBase}${p}`, { method: 'PUT', headers: { 'x-kea-owner-key': hub.ownerKey }, body: data });
+  assert.equal((await putOwner(`/owner/scan/${jobId}/course-file?path=textbook/ch01.md`, '# Atoms')).status, 200);
+  const bId = next.body.job.members.find((m) => m.email === 'scan-b@example.com').id;
+  assert.equal((await putOwner(`/owner/scan/${jobId}/member-file?account=${bId}&path=guides.json`, '{"private":true}')).status, 200);
+  assert.equal((await putOwner(`/owner/scan/${jobId}/member-file?account=nobody&path=x`, 'x')).status, 403);
+  await owner('POST', `/owner/scan/${jobId}/finish`, { ok: true });
+  assert.equal((await call('GET', '/v1/files?prefix=scan-inbox/', a)).body.files.length, 0, 'the upload is deleted after the job');
+  assert.equal((await putOwner(`/owner/scan/${jobId}/course-file?path=late.md`, 'x')).status, 404, 'no writes after the job ends');
+  assert.equal((await call('GET', '/v1/files?prefix=kea-results/', b)).body.files[0].path, 'kea-results/guides.json');
+
   const sc = await call('POST', '/v1/scan', c, { kind: 'initial_scan', course });
   assert.equal(sc.body.status, 'shared');
   assert.equal(sc.body.allowance.today, 0, 'sharing costs nothing');
+  const key = next.body.job.course;
+  const cf = await call('GET', `/v1/course-files?course=${encodeURIComponent(key)}`, c);
+  assert.deepEqual(cf.body.files.map((f) => f.path), ['textbook/ch01.md']);
+  const ch = await fetch(`${base}/v1/course-file?course=${encodeURIComponent(key)}&path=textbook/ch01.md`, { headers: { authorization: `Bearer ${c}` } });
+  assert.equal(await ch.text(), '# Atoms');
+  assert.equal((await call('GET', `/v1/course-files?course=${encodeURIComponent(key)}`, unverified)).status, 404, 'only people in the section');
 
   // Updates: once per cooldown for the whole section.
   assert.equal((await call('POST', '/v1/scan', b, { kind: 'update_scan', course })).body.code, 'cooldown');
