@@ -1,7 +1,7 @@
 {
   "title": "Kea Terms of Use",
-  "label": "2026-11-05",
-  "summary": "First version of the Kea terms.",
+  "label": "2026-11-05.2",
+  "summary": "New section: a parent or guardian signs off before a member under 18 uses Kea’s shared Claude.",
   "sections": [
     {
       "id": "about",
@@ -72,6 +72,11 @@
       "id": "minors",
       "title": "13. Members under 18",
       "body": "- Members aged 13 to 17 can use Kea. Their leaderboard and profile settings start private.\n- Organizations employing minors are responsible for minor-labor rules and any parent notices.\n- A parent or guardian can ask the developer to delete a minor's account."
+    },
+    {
+      "id": "parent-sign-off",
+      "title": "13b. Parent or guardian sign-off for Kea's shared Claude",
+      "body": "- Kea asks for the year you were born. If you are under 18, a parent or guardian has to sign off before Kea's shared Claude does anything for you. Everything else in Kea works without it.\n- You give Kea your parent's or guardian's email. They sign off by signing in to Google with that email: on your computer in Kea, or on a page they open from a link you send them. Google tells Kea only their email address.\n- Kea keeps the sign-off, the parent's email and when it happened, for as long as your account exists.\n- A parent or guardian can withdraw the sign-off at any time by contacting Kea support. The developer can also review, approve or withdraw a sign-off by hand.\n- Giving a false birth year, or signing off as someone's parent when you aren't, breaks these terms and the account can be suspended."
     },
     {
       "id": "third-party",

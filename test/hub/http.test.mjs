@@ -353,7 +353,7 @@ test('Kea storage: write, read, versions and conflicts, quota, path safety, isol
 
 test('shared Claude: verified only, classmates share one scan, batches of 25, limits, owner queue and pause', async () => {
   const course = { school: 'UCCS', code: 'CHEM 1110', term: 'Spring 2027', section: '001' };
-  const mk = async (email) => { const t = await register(email); await owner('POST', `/owner/accounts/${email}`, { emailVerified: true }); return t; };
+  const mk = async (email) => { const t = await register(email, undefined, undefined, { birthYear: 1995 }); await owner('POST', `/owner/accounts/${email}`, { emailVerified: true }); return t; };
   const unverified = await register('nov@example.com');
   assert.equal((await call('POST', '/v1/scan', unverified, { kind: 'initial_scan', course })).body.code, 'verify');
   const a = await mk('scan-a@example.com'), b = await mk('scan-b@example.com'), c = await mk('scan-c@example.com');
@@ -439,7 +439,7 @@ test('shared Claude: verified only, classmates share one scan, batches of 25, li
 });
 
 test('shared Claude: an account sending requests like a script is suspended and flagged for review', async () => {
-  const t = await register('spam@example.com');
+  const t = await register('spam@example.com', undefined, undefined, { birthYear: 1990 });
   await owner('POST', '/owner/accounts/spam@example.com', { emailVerified: true });
   await owner('POST', '/owner/settings', { limits: { requestsBeforeSuspend: 12, refusalsBeforeFlag: 4 } });
   const course = { school: 'X', code: 'Y 1', term: 'Z' };
@@ -458,7 +458,7 @@ test('shared Claude: an account sending requests like a script is suspended and 
 
 test('relay: the worker browses through the person’s own Kea; their Kea folder is open to the worker only while the job runs', async () => {
   const email = 'relay@example.com';
-  const t = await register(email);
+  const t = await register(email, undefined, undefined, { birthYear: 1990 });
   await owner('POST', `/owner/accounts/${email}`, { emailVerified: true });
   const other = await register('relay-other@example.com');
   const course = { school: 'Relay U', code: 'HIS 101', term: 'Fall 2027' };
@@ -525,6 +525,131 @@ test('big downloads are paced to the owner’s send limit; small sync files are 
   const list = await call('GET', '/v1/files', t);
   assert.equal(list.body.now, clock);
   await owner('POST', '/owner/settings', { limits: { maxSendMbps: 10 } });
+});
+
+// Runs the queue until the given job is the running one (earlier tests leave jobs behind; they're finished as they come).
+async function runUntil(jobId) {
+  for (const j of (await owner('GET', '/owner/scan/queue')).body.jobs.filter((x) => x.status === 'running' && x.id !== jobId)) await owner('POST', `/owner/scan/${j.id}/finish`, { ok: false, note: 'test' });
+  for (let n = await owner('POST', '/owner/scan/next'); n.body.job && n.body.job.id !== jobId; n = await owner('POST', '/owner/scan/next')) await owner('POST', `/owner/scan/${n.body.job.id}/finish`, { ok: false, note: 'test' });
+}
+const putOwnerFile = (p, data) => fetch(ownerBase + p, { method: 'PUT', headers: { 'x-kea-owner-key': hub.ownerKey }, body: data });
+const putMine = (t, p, data) => fetch(`${base}/v1/files/${p}`, { method: 'PUT', headers: { authorization: `Bearer ${t}` }, body: data });
+const readMine = async (t, p) => (await fetch(`${base}/v1/files/${p.split('/').map(encodeURIComponent).join('/')}`, { headers: { authorization: `Bearer ${t}` } })).text();
+
+test('under 18: birth year, a parent signs off with Google (link page or in Kea), the owner can override', async () => {
+  const course = { school: 'Teen High', code: 'BIO 100', term: 'Fall 2026', section: '3' };
+  const ask = (t) => call('POST', '/v1/scan', t, { kind: 'more_questions', course, chapter: 'Ch 1' });
+  assert.match((await call('POST', '/v1/auth/register', null, { email: 'kid@example.com', password: 'lantern velvet orbit', displayName: 'Kid', age13: true, birthYear: 2016, ...(await agreement()) }, freshIp())).body.error, /13/);
+
+  // No birth year yet: asked for first; then set once, and it can't be changed to dodge the sign-off.
+  const t = await register('teen@example.com', 'Tess Teen');
+  await owner('POST', '/owner/accounts/teen@example.com', { emailVerified: true });
+  assert.equal((await ask(t)).body.code, 'birth_year');
+  const by = await call('POST', '/v1/me/birth-year', t, { birthYear: 2011 });
+  assert.deepEqual([by.body.account.minor, by.body.account.parentSignOff], [true, 'needed']);
+  assert.equal((await call('POST', '/v1/me/birth-year', t, { birthYear: 1990 })).status, 403);
+  assert.equal((await ask(t)).body.code, 'parent_consent');
+
+  // Ask a parent: not their own email; the link opens a page naming them both.
+  assert.equal((await call('POST', '/v1/me/consent', t, { parentEmail: 'teen@example.com' })).status, 400);
+  const req = await call('POST', '/v1/me/consent', t, { parentEmail: 'Parent@Example.com' });
+  assert.equal(req.body.parentSignOff, 'pending');
+  const link = new URL(req.body.link);
+  assert.equal(link.pathname, '/consent');
+  const page = await fetch(`${base}/consent${link.search}`);
+  assert.equal(page.status, 200);
+  assert.match(page.headers.get('content-security-policy'), /accounts\.google\.com\/gsi\/client/);
+  const html = await page.text();
+  assert.match(html, /Tess Teen/);
+  assert.match(html, /parent@example\.com/);
+  assert.equal((await fetch(`${base}/consent?t=${'0'.repeat(48)}`)).status, 404);
+
+  // Confirming takes Google sign-in as that parent: the member's own Google, or another address, don't count.
+  const token = link.searchParams.get('t');
+  const confirm = (claims, approve = true) => call('POST', '/v1/consent/confirm', null, { token, approve, idToken: googleToken(claims) }, freshIp());
+  assert.equal((await confirm({ email: 'someone@example.com', sub: 'g-x1' })).status, 400);
+  assert.equal((await confirm({ email: 'teen@example.com', sub: 'g-x2' })).status, 400);
+  assert.equal((await confirm({ email: 'parent@example.com', sub: 'g-parent' })).body.status, 'approved');
+  assert.match(await (await fetch(`${base}/consent${link.search}`)).text(), /Signed off/);
+  assert.equal((await call('GET', '/v1/me', t)).body.account.parentSignOff, 'approved');
+  assert.equal((await ask(t)).body.status, 'queued');
+
+  // In Kea instead: the parent signs in to Google on the member's computer.
+  const t2 = await register('teen2@example.com', 'Theo Teen', undefined, { birthYear: 2010 });
+  assert.equal((await call('POST', '/v1/me/consent/google', t2, { idToken: googleToken({ email: 'mom@example.com', sub: 'g-mom' }) })).status, 400, 'ask first');
+  await call('POST', '/v1/me/consent', t2, { parentEmail: 'mom@example.com' });
+  assert.equal((await call('POST', '/v1/me/consent/google', t2, { idToken: googleToken({ email: 'dad@example.com', sub: 'g-dad' }) })).status, 400);
+  const ok2 = await call('POST', '/v1/me/consent/google', t2, { idToken: googleToken({ email: 'mom@example.com', sub: 'g-mom2' }) });
+  assert.equal(ok2.body.account.parentSignOff, 'approved');
+  assert.equal((await call('GET', '/v1/me/consent', t2)).body.requests[0].method, 'google-kea');
+
+  // A parent who declines.
+  const t3 = await register('teen3@example.com', 'Tia Teen', undefined, { birthYear: 2012 });
+  const link3 = new URL((await call('POST', '/v1/me/consent', t3, { parentEmail: 'gran@example.com' })).body.link);
+  const dec = await call('POST', '/v1/consent/confirm', null, { token: link3.searchParams.get('t'), approve: false, idToken: googleToken({ email: 'gran@example.com', sub: 'g-gran' }) }, freshIp());
+  assert.equal(dec.body.status, 'declined');
+  assert.equal((await call('GET', '/v1/me', t3)).body.account.parentSignOff, 'needed');
+
+  // The owner sees who's waiting and can approve or withdraw by hand.
+  const list = await owner('GET', '/owner/consents');
+  assert.ok(list.body.waiting.some((w) => w.email === 'teen3@example.com'));
+  assert.ok(list.body.consents.some((c) => c.email === 'teen@example.com' && c.status === 'approved' && c.method === 'google-link'));
+  assert.equal((await owner('POST', '/owner/accounts/teen3@example.com/consent', { approved: true, note: 'Parent emailed' })).body.account.parentSignOff, 'approved');
+  assert.equal((await owner('POST', '/owner/accounts/teen@example.com/consent', { approved: false })).body.account.parentSignOff, 'needed');
+  assert.equal((await owner('POST', '/owner/accounts/teen@example.com', { birthYear: 1999 })).body.account.minor, false, 'the owner can correct a birth year');
+  // Adults never see any of it.
+  const adult = await register('adult@example.com', 'Ada', undefined, { birthYear: 1980 });
+  assert.equal((await call('GET', '/v1/me', adult)).body.account.parentSignOff, 'not_needed');
+  assert.equal((await call('POST', '/v1/me/consent', adult, { parentEmail: 'x@example.com' })).status, 400);
+});
+
+test('course material: a question batch reaches everyone who asked; classmates who joined a scan get its material; later ones share it', async () => {
+  const mk = async (email) => { const t = await register(email, undefined, undefined, { birthYear: 1999 }); await owner('POST', `/owner/accounts/${email}`, { emailVerified: true }); return t; };
+  const a = await mk('mat-a@example.com'), b = await mk('mat-b@example.com'), c = await mk('mat-c@example.com'), d = await mk('mat-d@example.com');
+  const course = { school: 'Material State', code: 'BIO 2010', term: 'Spring 2027', section: '5' };
+  assert.equal((await call('POST', '/v1/scan', a, { kind: 'more_questions', course, chapter: 'Ch 4', target: '../x' })).status, 400, 'only a Kea folder');
+
+  // A asks for 25 more on Ch 4; B (same section) joins. Each says where their Kea's folder is.
+  const qa = await call('POST', '/v1/scan', a, { kind: 'more_questions', course, chapter: 'Ch 4', target: 'kea/Kea/School/', detail: { courseCode: 'BIO 2010', chapter: 'Ch 4' } });
+  assert.equal(qa.body.status, 'queued');
+  assert.equal((await call('POST', '/v1/scan', b, { kind: 'more_questions', course, chapter: 'Ch 4', target: 'kea/Kea/Biology' })).body.status, 'joined');
+  const jobId = qa.body.job.id;
+  await runUntil(jobId);
+  const info = await owner('GET', `/owner/scan/${jobId}`);
+  assert.deepEqual([info.body.job.kind, info.body.job.chapter, info.body.job.target, info.body.job.batchSize, info.body.job.detail.courseCode], ['more_questions', 'Ch 4', 'kea/Kea/School/', 25, 'BIO 2010']);
+  assert.deepEqual(info.body.members.map((m) => m.target), ['kea/Kea/Biology/']);
+  // The worker adds the batch to the section's pool; the Hub copies it to both when the job finishes.
+  const set = JSON.stringify({ entry: { id: 'exam-q1', kind: 'exam', chapters: ['Ch 4'] }, set: { questions: [{ q: 'What is ATP?', choices: ['a', 'b'], answer: 0 }] } });
+  assert.equal((await putOwnerFile(`/owner/scan/${jobId}/course-file?path=material/questions/exam-q1.json`, set)).status, 200);
+  assert.deepEqual((await owner('GET', `/owner/scan/${jobId}/course-files?prefix=material/`)).body.files.map((f) => f.path), ['material/questions/exam-q1.json']);
+  const fin = await owner('POST', `/owner/scan/${jobId}/finish`, { ok: true });
+  assert.equal(fin.body.delivered, 2);
+  assert.equal(await readMine(a, 'kea/Kea/School/Shared/questions/exam-q1.json'), set);
+  assert.equal(await readMine(b, 'kea/Kea/Biology/Shared/questions/exam-q1.json'), set);
+
+  // A first scan: C asks; D joins without saying where (D's Kea folder is found from what D already syncs).
+  const course2 = { ...course, code: 'BIO 2020' };
+  assert.equal((await putMine(d, 'kea/Kea/Dee/Devices/primary.json', '{"id":"d1"}')).status, 201);
+  const sc = await call('POST', '/v1/scan', c, { kind: 'initial_scan', course: course2, target: 'kea/Kea/School/' });
+  assert.equal((await call('POST', '/v1/scan', d, { kind: 'initial_scan', course: course2 })).body.status, 'joined');
+  const scanId = sc.body.job.id;
+  await putMine(c, `scan-inbox/${scanId}/job.json`, '{}');
+  await call('POST', `/v1/scan/${scanId}/ready`, c);
+  await runUntil(scanId);
+  await putOwnerFile(`/owner/scan/${scanId}/course-file?path=material/Textbooks/BIO 2020/Chapter 1.pdf`, '%PDF chapter one');
+  assert.equal((await owner('POST', `/owner/scan/${scanId}/finish`, { ok: true })).body.delivered, 1, 'the requester already has it (the worker wrote their folder)');
+  assert.equal(await readMine(d, 'kea/Kea/Dee/Shared/Textbooks/BIO 2020/Chapter 1.pdf'), '%PDF chapter one');
+  assert.equal((await call('GET', '/v1/files?prefix=kea/Kea/School/Shared/', c)).body.files.length, 0);
+
+  // Someone in the section later: shared at once, material included, no Claude.
+  const sh = await call('POST', '/v1/scan', a, { kind: 'initial_scan', course: course2, target: 'kea/Kea/School/' });
+  assert.deepEqual([sh.body.status, sh.body.delivered], ['shared', 1]);
+  assert.equal(await readMine(a, 'kea/Kea/School/Shared/Textbooks/BIO 2020/Chapter 1.pdf'), '%PDF chapter one');
+  // A failed job delivers nothing.
+  const qf = await call('POST', '/v1/scan', d, { kind: 'more_questions', course, chapter: 'Ch 9', target: 'kea/Kea/Dee/' });
+  await runUntil(qf.body.job.id);
+  await putOwnerFile(`/owner/scan/${qf.body.job.id}/course-file?path=material/questions/exam-bad.json`, '{}');
+  assert.equal((await owner('POST', `/owner/scan/${qf.body.job.id}/finish`, { ok: false, note: 'Claude stopped' })).body.delivered, 0);
 });
 
 // Last: publishing new terms locks everyone out until they agree again.

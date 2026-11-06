@@ -20,6 +20,9 @@ export const DEFAULTS = {
   questionBatchesPerDay: 2,
   globalDaily: 40, // jobs per day for everyone but the owner, together
   requireVerifiedEmail: true,
+  // Members younger than this (by birth year) need a parent's or guardian's sign-off before the shared Claude does
+  // anything for them. 0 turns the check off.
+  parentConsentUnder: 18,
   refusalsBeforeFlag: 15, // refused requests in a day before the account is flagged for review
   requestsBeforeSuspend: 200, // requests in a day before it's suspended automatically (a script, not a person)
   defaultJobMinutes: 12, // for wait estimates until there's history
@@ -38,6 +41,15 @@ export function courseKey({ school, code, term, section } = {}) {
 }
 
 /**
+ * Under the age, by birth year alone (only the year is ever asked for): the age someone turns this year. Born in 2009,
+ * they count as under 18 for all of 2026 and as 18 from 1 January 2027.
+ */
+export function isMinor(birthYear, year, under = 18) {
+  if (!Number.isInteger(birthYear) || !under) return false;
+  return year - birthYear < under;
+}
+
+/**
  * Decides one request. `facts` are counts from the database; returns
  *   { action: 'queue' } | { action: 'share', reason } | { action: 'join', jobId, reason } | { action: 'refuse', reason, code }
  */
@@ -48,6 +60,11 @@ export function decide(kind, limits, facts) {
   if (!KINDS.includes(kind)) return no('bad_kind', 'Unknown request.');
   if (facts.owner) return facts.joinJobId ? { action: 'join', jobId: facts.joinJobId, reason: 'Already waiting in the queue.' } : { action: 'queue' };
   if (L.requireVerifiedEmail && !facts.verified) return no('verify', 'Verify your email (Verify with Google) to use Kea’s shared Claude.');
+  if (L.parentConsentUnder > 0) {
+    if (facts.birthYear == null) return no('birth_year', 'Tell Kea the year you were born first (Your account).');
+    if (isMinor(facts.birthYear, facts.year, L.parentConsentUnder) && !facts.parentApproved)
+      return no('parent_consent', 'You’re under 18, so a parent or guardian has to sign off before Kea’s shared Claude works for you. Ask one under Your account → Parent sign-off.');
+  }
 
   if (kind === 'initial_scan') {
     if (facts.alreadyScannedByMe) return no('already_scanned', 'This class was already scanned for you. Updates come automatically; for practice, ask for 25 more questions on a chapter.');

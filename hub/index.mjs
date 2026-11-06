@@ -11,8 +11,9 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync,
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkTerms, diffTerms, sameSections, termsPage } from './lib/terms.mjs';
-import { DEFAULTS as BUDGET, courseKey, decide, pickNext } from './lib/budget.mjs';
+import { DEFAULTS as BUDGET, courseKey, decide, isMinor, pickNext } from './lib/budget.mjs';
 import { googleKeys, verifyGoogleIdToken } from './lib/google.mjs';
+import { consentPage, consentCsp } from './lib/consentPage.mjs';
 import { openDb, DATA_DIR } from './db.mjs';
 import { hashPassword, verifyPassword, needsRehash, passwordProblem } from './lib/passwords.mjs';
 import { newSecret, checkCode, otpauthUri } from './lib/totp.mjs';
@@ -135,6 +136,11 @@ export function createHub({
   // Verify with Google: the Kea OAuth client IDs whose tokens are accepted, and how to get Google's keys.
   googleClientIds = String(process.env.KEA_GOOGLE_CLIENT_IDS || '').split(',').map((s) => s.trim()).filter(Boolean),
   googleKeyFn = null,
+  // The web client for the /consent page's Google button (a parent signs in there, in their own browser). Its tokens
+  // are accepted too. The page needs the Hub's public address listed as an authorized JavaScript origin of this client.
+  googleWebClientId = String(process.env.KEA_GOOGLE_WEB_CLIENT_ID || '').trim() || null,
+  // The Hub's public address, for the sign-off links members send (default: the address the request came to).
+  publicUrl = String(process.env.KEA_HUB_PUBLIC_URL || '').trim().replace(/\/+$/, '') || null,
   termsFile = join(dirname(fileURLToPath(import.meta.url)), 'terms', 'terms.json'),
   // The relay: how long a person's Kea waits for calls per request, and how long the worker waits for an answer.
   relayWaitMs = 20_000,
@@ -173,7 +179,16 @@ export function createHub({
     audit('owner', 'terms.publish', String(r.lastInsertRowid), { label: t.label }, 'local');
     return { n: Number(r.lastInsertRowid), published: true };
   };
-  if (!currentTerms()) publishTerms(JSON.parse(readFileSync(termsFile, 'utf8')));
+  // The terms file that ships with the Hub: published the first time, and again whenever an update of the Hub brings a
+  // changed file (everyone then re-agrees to only what changed). Terms the owner published from the console stay until
+  // the file itself changes.
+  {
+    const text = readFileSync(termsFile, 'utf8');
+    const fileHash = sha(text);
+    const seen = h.get("SELECT value FROM settings WHERE key = 'termsFileHash'");
+    if (!currentTerms() || (seen && JSON.parse(seen.value) !== fileHash)) publishTerms(JSON.parse(text));
+    h.run("INSERT INTO settings (key,value) VALUES ('termsFileHash',?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify(fileHash));
+  }
   const acceptedVersion = (accountId) => h.get('SELECT MAX(version) AS v FROM terms_acceptances WHERE account_id = ?', accountId)?.v ?? null;
   const termsStatus = (accountId) => {
     const cur = currentTerms();
@@ -194,7 +209,7 @@ export function createHub({
   const google = async (idToken) => {
     if (typeof idToken !== 'string' || idToken.length > 8000) bad('Missing Google sign-in.');
     let g;
-    try { g = await verifyGoogleIdToken(idToken, { clientIds: googleClientIds, keys: gKeys, nowMs: now() }); }
+    try { g = await verifyGoogleIdToken(idToken, { clientIds: googleWebClientId ? [...googleClientIds, googleWebClientId] : googleClientIds, keys: gKeys, nowMs: now() }); }
     catch (e) { throw new HttpError(e.status ?? 401, e.message); }
     // Each Google sign-in can be used once.
     const th = sha(`google:${idToken}`);
@@ -270,7 +285,33 @@ export function createHub({
     id: a.id, email: a.email, displayName: a.display_name, role: a.role, status: a.status,
     emailVerified: !!a.email_verified, verifiedBy: a.verified_by, identityVerified: !!a.identity_verified,
     canHost: !!a.can_host || a.role === 'owner', totpEnabled: !!a.totp_enabled, owner: a.role === 'owner', createdAt: a.created_at,
+    birthYear: a.birth_year ?? null, ...consentOf(a),
   });
+  // ---------- parent or guardian sign-off (members under 18, before the shared Claude) ----------
+  const thisYear = () => new Date(now()).getUTCFullYear();
+  const parentApproved = (accountId) => !!h.get("SELECT 1 FROM parent_consents WHERE account_id = ? AND status = 'approved'", accountId);
+  /** { minor, parentSignOff: 'not_needed' | 'needed' | 'pending' | 'approved', parentEmail } for the apps. */
+  function consentOf(a) {
+    const under = limitsNow().parentConsentUnder;
+    const minor = a.role !== 'owner' && isMinor(a.birth_year, thisYear(), under);
+    if (!minor) return { minor: false, parentSignOff: 'not_needed', parentEmail: null };
+    const last = h.get("SELECT * FROM parent_consents WHERE account_id = ? AND status IN ('pending','approved') ORDER BY created_at DESC LIMIT 1", a.id);
+    if (last?.status === 'approved' || parentApproved(a.id)) return { minor: true, parentSignOff: 'approved', parentEmail: last?.parent_email ?? null };
+    if (last && last.expires_at > now()) return { minor: true, parentSignOff: 'pending', parentEmail: last.parent_email };
+    return { minor: true, parentSignOff: 'needed', parentEmail: null };
+  }
+  const birthYearOf = (v) => {
+    const y = V.int(v, 'Birth year', { min: 1900, max: thisYear() });
+    if (thisYear() - y < 13) bad('Kea accounts are for people 13 and older.');
+    return y;
+  };
+  function approveConsent(c, method, g, ip) {
+    h.tx(() => {
+      h.run("UPDATE parent_consents SET status = 'approved', method = ?, parent_google_sub = ?, decided_at = ? WHERE id = ?", method, g?.sub ?? null, now(), c.id);
+      h.run("UPDATE parent_consents SET status = 'revoked', decided_at = ? WHERE account_id = ? AND status = 'pending' AND id != ?", now(), c.account_id, c.id);
+    });
+    audit(c.account_id, 'consent.approve', c.id, { method, parent: c.parent_email }, ip);
+  }
   const newSession = (accountId, client) => {
     const token = randomBytes(32).toString('hex');
     const t = now();
@@ -329,6 +370,7 @@ export function createHub({
     if (body.age13 !== true) bad('Kea accounts are for people 13 and older.');
     const problem = passwordProblem(body.password, { email, name: displayName });
     if (problem) bad(problem, { field: 'password' });
+    const birthYear = body.birthYear == null ? null : birthYearOf(body.birthYear);
     if (h.get('SELECT 1 FROM accounts WHERE email = ?', email)) throw new HttpError(409, 'An account with that email already exists. Sign in instead.');
     const cur = currentTerms();
     if (body.termsVersion !== cur.n) throw new HttpError(409, 'The terms changed. Read the latest version and agree to it.', { termsVersion: cur.n });
@@ -338,7 +380,7 @@ export function createHub({
     const t = now();
     const pwHash = await hashPassword(body.password);
     h.tx(() => {
-      h.run('INSERT INTO accounts (id,email,display_name,pw_hash,created_at,updated_at) VALUES (?,?,?,?,?,?)', id, email, displayName, pwHash, t, t);
+      h.run('INSERT INTO accounts (id,email,display_name,pw_hash,created_at,updated_at,birth_year) VALUES (?,?,?,?,?,?,?)', id, email, displayName, pwHash, t, t, birthYear);
       recordAgreement(id, body, ip, client);
       if (g) markGoogleVerified(id, g);
     });
@@ -490,6 +532,71 @@ export function createHub({
     h.run('UPDATE accounts SET display_name = ?, updated_at = ? WHERE id = ?', name, now(), me.id);
     return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', me.id)) };
   });
+  // Birth year: set once by the member (only the owner can change it after that), so it can't be edited to skip the
+  // parent sign-off.
+  R('POST', '/v1/me/birth-year', ({ me, body, ip }) => {
+    const y = birthYearOf(body.birthYear);
+    if (me.birth_year != null && me.birth_year !== y) forbidden('Your birth year is already set. Contact Kea support to correct it.');
+    h.run('UPDATE accounts SET birth_year = ?, updated_at = ? WHERE id = ?', y, now(), me.id);
+    audit(me.id, 'account.birth_year', me.id, null, ip);
+    return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', me.id)) };
+  });
+  const consentOut = (c) => c && ({ id: c.id, parentEmail: c.parent_email, status: c.status, method: c.method, createdAt: c.created_at, expiresAt: c.expires_at, decidedAt: c.decided_at });
+  R('GET', '/v1/me/consent', ({ me }) => ({
+    ...consentOf(me),
+    requests: h.all('SELECT * FROM parent_consents WHERE account_id = ? ORDER BY created_at DESC LIMIT 10', me.id).map(consentOut),
+    googleOnWeb: !!googleWebClientId,
+  }));
+  // Ask a parent or guardian: their email, and a link they open (sent by the member however they like). The parent
+  // proves the email with Google, on the link's page or in the member's Kea.
+  R('POST', '/v1/me/consent', ({ me, body, ip, origin }) => {
+    limit('join', me.id);
+    const st = consentOf(me);
+    if (!st.minor) bad(me.birth_year == null ? 'Tell Kea the year you were born first.' : 'You don’t need a parent’s sign-off.');
+    if (st.parentSignOff === 'approved') return { ...st, link: null };
+    const parentEmail = V.email(body.parentEmail);
+    if (parentEmail === me.email) bad('Use your parent’s or guardian’s own email, not yours.');
+    const token = randomBytes(24).toString('hex');
+    const id = randomUUID();
+    h.tx(() => {
+      h.run("UPDATE parent_consents SET status = 'revoked', decided_at = ? WHERE account_id = ? AND status = 'pending'", now(), me.id);
+      h.run('INSERT INTO parent_consents (id,account_id,parent_email,token_hash,created_at,expires_at) VALUES (?,?,?,?,?,?)', id, me.id, parentEmail, sha(`consent:${token}`), now(), now() + 14 * DAY_MS);
+    });
+    audit(me.id, 'consent.request', id, { parent: parentEmail }, ip);
+    return { ...consentOf(me), link: `${publicUrl || origin}/consent?t=${token}` };
+  });
+  // The parent, at the member's computer: Kea opens Google sign-in for the parent's email.
+  R('POST', '/v1/me/consent/google', async ({ me, body, ip }) => {
+    const c = h.get("SELECT * FROM parent_consents WHERE account_id = ? AND status = 'pending' AND expires_at > ? ORDER BY created_at DESC LIMIT 1", me.id, now()) ?? bad('Ask for a sign-off first: enter your parent’s or guardian’s email.');
+    const g = await google(body.idToken);
+    if (g.email === me.email) bad('That’s your own Google account. Your parent or guardian signs in with theirs.');
+    if (g.email !== c.parent_email) bad(`That Google account is ${g.email}, but the sign-off is for ${c.parent_email}.`);
+    approveConsent(c, 'google-kea', g, ip);
+    return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', me.id)) };
+  });
+  // The link's page (/consent) calls this once the parent has signed in with Google there.
+  const consentByToken = (token) => {
+    const t = String(token ?? '');
+    if (!/^[0-9a-f]{48}$/.test(t)) return null;
+    return h.get('SELECT c.*, a.display_name, a.email AS member_email FROM parent_consents c JOIN accounts a ON a.id = c.account_id WHERE c.token_hash = ?', sha(`consent:${t}`));
+  };
+  R('POST', '/v1/consent/confirm', async ({ body, ip }) => {
+    limit('login', ip);
+    const c = consentByToken(body.token);
+    if (!c || c.status === 'revoked' || c.expires_at <= now()) notFound('This sign-off link has expired or was replaced. Ask for a new one.');
+    if (c.status !== 'pending') return { status: c.status };
+    const approve = V.bool(body.approve, 'approve');
+    const g = await google(body.idToken);
+    if (g.email !== c.parent_email) bad(`You signed in to Google as ${g.email}, but this sign-off was sent to ${c.parent_email}. Sign in with that account.`);
+    if (g.email === c.member_email) bad('A member can’t sign off for themselves.');
+    if (approve) approveConsent(c, 'google-link', g, ip);
+    else {
+      h.run("UPDATE parent_consents SET status = 'declined', method = 'google-link', parent_google_sub = ?, decided_at = ? WHERE id = ?", g.sub, now(), c.id);
+      audit(c.account_id, 'consent.decline', c.id, { parent: c.parent_email }, ip);
+    }
+    return { status: approve ? 'approved' : 'declined' };
+  }, { auth: false });
+
   R('POST', '/v1/me/password', async ({ me, body, token, ip }) => {
     if (!(await verifyPassword(body.current ?? '', me.pw_hash))) { fails.fail(nameHash(me.email)); throw new HttpError(401, 'Your current password is wrong.'); }
     const problem = passwordProblem(body.next, { email: me.email, name: me.display_name });
@@ -857,6 +964,63 @@ export function createHub({
     }
   };
 
+  // ---------- Course material into each person's own Kea storage ----------
+  // What the shared Claude made for a course section (textbook chapters, new questions) is kept in the section's
+  // folder under material/. Everyone who asked for it, joined it, or shares the section gets a copy in their own
+  // storage, under <their Kea folder>/Shared/, which their Kea takes in on its next sync.
+  function targetOf(v) {
+    const t = checkPath(V.str(v, 'Target', { min: 5, max: 300 }).replace(/\/+$/, ''));
+    if (!t.startsWith('kea/')) bad('Course material can only go into your Kea folder.');
+    return `${t}/`;
+  }
+  /** Their Kea folder when their Kea didn't say: the one profile folder in their storage, if there's exactly one. */
+  function guessTarget(accountId) {
+    const roots = new Set(h.all("SELECT path FROM files WHERE account_id = ? AND path LIKE 'kea/%/Devices/%'", accountId).map((r) => r.path.slice(0, r.path.indexOf('/Devices/') + 1)));
+    return roots.size === 1 ? [...roots][0] : null;
+  }
+  /** Copies course files (material/<rel>) to each person's <target>Shared/<rel>. Returns how many copies were made. */
+  function deliver(key, files, people) {
+    const sp = spaces.course(key);
+    let n = 0;
+    for (const p of people) {
+      const target = p.target || guessTarget(p.id);
+      const a = h.get('SELECT * FROM accounts WHERE id = ?', p.id);
+      if (!a) continue;
+      if (!target) { audit('system', 'material.no_folder', p.id, { course: key }, 'local'); continue; }
+      const user = spaces.user(p.id);
+      let room = quotaOf(a) - usedBy(p.id);
+      for (const f of files) {
+        if (!f.path.startsWith('material/')) continue;
+        let dest;
+        try { dest = checkPath(`${target}Shared/${f.path.slice('material/'.length)}`); } catch { continue; }
+        const mine = spaceRow(user, dest);
+        if (mine?.sha256 === f.sha256) continue; // already there
+        if (f.size - (mine?.size ?? 0) > room) { audit('system', 'material.storage_full', p.id, { course: key, path: f.path }, 'local'); break; }
+        const row = spaceRow(sp, f.path);
+        if (!row) continue;
+        spaceWrite(user, dest, spaceRead(sp, row));
+        room -= f.size - (mine?.size ?? 0);
+        n++;
+      }
+    }
+    return n;
+  }
+  // When a job finishes: what it added to the section's material, to everyone in it. A scan's requester already has
+  // theirs (the worker wrote their whole folder as their primary device); a question batch goes to everyone.
+  function deliverJob(j) {
+    if (j.delivered) return 0;
+    const files = spaceList(spaces.course(j.course_key), 'material/').filter((f) => f.updatedAt >= (j.started_at ?? 0));
+    const people = [
+      ...(j.kind === 'more_questions' ? [{ id: j.account_id, target: j.target }] : []),
+      ...h.all('SELECT account_id AS id, target FROM scan_job_members WHERE job_id = ?', j.id),
+    ];
+    const n = files.length ? deliver(j.course_key, files, people) : 0;
+    h.run('UPDATE scan_jobs SET delivered = 1 WHERE id = ?', j.id);
+    // Classmates who joined a first scan now share the section's material from here on.
+    if (j.kind === 'initial_scan') for (const p of people) h.run('INSERT OR IGNORE INTO course_members (course_key,account_id,joined_at,target) VALUES (?,?,?,?)', j.course_key, p.id, now(), p.target);
+    return n;
+  }
+
   R('POST', '/v1/scan', ({ me, body, ip }) => {
     limit('join', me.id);
     const kind = V.str(body.kind, 'Kind', { min: 1, max: 40 });
@@ -866,8 +1030,11 @@ export function createHub({
     const t = now();
     const mats = key ? h.get('SELECT * FROM course_materials WHERE course_key = ?', key) : null;
     const same = key ? h.get(`SELECT * FROM scan_jobs WHERE kind = ? AND course_key = ? AND status IN ('queued','running') ${kind === 'more_questions' ? 'AND chapter = ?' : ''} ORDER BY created_at LIMIT 1`, ...[kind, key, ...(kind === 'more_questions' ? [chapter] : [])]) : null;
+    // Where course material for them goes in their own Kea storage (their Kea's folder for this profile).
+    const target = body.target == null ? null : targetOf(body.target);
     const facts = {
       verified: !!me.email_verified, owner: me.role === 'owner', chapter,
+      birthYear: me.birth_year ?? null, year: thisYear(), parentApproved: parentApproved(me.id),
       alreadyScannedByMe: !!(key && h.get('SELECT 1 FROM course_members WHERE course_key = ? AND account_id = ?', key, me.id)),
       courseHasMaterials: !!mats, hoursSinceCourseUpdate: mats ? (t - mats.updated_at) / 3600_000 : null,
       joinJobId: same && same.account_id !== me.id ? same.id : same ? same.id : null,
@@ -880,10 +1047,17 @@ export function createHub({
     const d = decide(kind, getSetting('limits', {}), facts);
     watchRequests(me, kind, d.action === 'refuse' ? `refuse:${d.code}` : d.action, ip);
     if (d.action === 'refuse') throw new HttpError(429, d.reason, { code: d.code, allowance: allowance(me) });
-    if (kind === 'initial_scan') h.run('INSERT OR IGNORE INTO course_members (course_key,account_id,joined_at) VALUES (?,?,?)', key, me.id, t);
-    if (d.action === 'share') return { status: 'shared', message: d.reason, allowance: allowance(me) };
+    if (kind === 'initial_scan') {
+      h.run('INSERT OR IGNORE INTO course_members (course_key,account_id,joined_at) VALUES (?,?,?)', key, me.id, t);
+      if (target) h.run('UPDATE course_members SET target = ? WHERE course_key = ? AND account_id = ?', target, key, me.id);
+    }
+    if (d.action === 'share') {
+      // The section's material, copied into their own Kea storage now: their Kea takes it in on its next sync.
+      const copied = deliver(key, spaceList(spaces.course(key), 'material/'), [{ id: me.id, target }]);
+      return { status: 'shared', message: d.reason, delivered: copied, allowance: allowance(me) };
+    }
     if (d.action === 'join') {
-      h.run('INSERT OR IGNORE INTO scan_job_members (job_id,account_id,joined_at) VALUES (?,?,?)', d.jobId, me.id, t);
+      h.run('INSERT OR IGNORE INTO scan_job_members (job_id,account_id,joined_at,target) VALUES (?,?,?,?)', d.jobId, me.id, t, target);
       return { status: 'joined', message: d.reason, job: jobOut(h.get('SELECT * FROM scan_jobs WHERE id = ?', d.jobId)), allowance: allowance(me) };
     }
     const id = randomUUID();
@@ -891,8 +1065,9 @@ export function createHub({
     // scan-inbox/<job id>/ in their own Kea storage, then say it's ready. Question batches work from the course's
     // shared material, so they're ready at once.
     const ready = kind === 'more_questions' ? 1 : 0;
-    h.run('INSERT INTO scan_jobs (id,account_id,kind,course_key,chapter,detail,created_at,ready) VALUES (?,?,?,?,?,?,?,?)', id, me.id, kind, key, chapter,
-      body.detail == null ? null : JSON.stringify(body.detail).slice(0, 4000), t, ready);
+    const detail = body.detail == null ? null : JSON.stringify(body.detail);
+    if (detail && detail.length > 4000) bad('The request’s details are too long.');
+    h.run('INSERT INTO scan_jobs (id,account_id,kind,course_key,chapter,detail,created_at,ready,target) VALUES (?,?,?,?,?,?,?,?,?)', id, me.id, kind, key, chapter, detail, t, ready, target);
     return { status: 'queued', job: jobOut(h.get('SELECT * FROM scan_jobs WHERE id = ?', id)), uploadTo: ready ? null : `scan-inbox/${id}/`, allowance: allowance(me) };
   });
   R('POST', '/v1/scan/:id/ready', ({ me, params }) => {
@@ -1011,7 +1186,8 @@ export function createHub({
       spaceDeletePrefix(spaces.user(j.account_id), `scan-inbox/${j.id}/`);
     });
     dropRelay(j.id, 'The job has finished.');
-    return { ok: true };
+    const delivered = ok ? deliverJob(h.get('SELECT * FROM scan_jobs WHERE id = ?', j.id)) : 0;
+    return { ok: true, delivered };
   });
   const runningJob = (id) => h.get("SELECT * FROM scan_jobs WHERE id = ? AND status = 'running'", id) ?? notFound('No running job with that id.');
   // The worker's side of the relay: one call, answered by the person's Kea (or an error if it's closed).
@@ -1145,11 +1321,32 @@ export function createHub({
     if (body.emailVerified != null) { set('email_verified', V.bool(body.emailVerified, 'emailVerified') ? 1 : 0); set('verified_by', body.emailVerified ? 'owner' : null); }
     if (body.identityVerified != null) set('identity_verified', V.bool(body.identityVerified, 'identityVerified') ? 1 : 0);
     if (body.canHost != null) set('can_host', V.bool(body.canHost, 'canHost') ? 1 : 0);
+    if ('birthYear' in body) set('birth_year', body.birthYear == null ? null : V.int(body.birthYear, 'birthYear', { min: 1900, max: thisYear() }));
     if (body.status != null) {
       set('status', V.enum(body.status, 'status', ['active', 'suspended']));
       if (body.status === 'suspended') h.run('DELETE FROM sessions WHERE account_id = ?', a.id);
     }
     audit('owner', 'owner.account_update', a.id, body, 'local');
+    return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', a.id)) };
+  });
+  // Parent sign-offs: see them all, and approve or withdraw one by hand (for example after a parent emailed).
+  O('GET', '/owner/consents', ({ query }) => ({
+    consents: h.all(`SELECT c.*, a.email, a.display_name, a.birth_year FROM parent_consents c JOIN accounts a ON a.id = c.account_id ${query.status ? 'WHERE c.status = ?' : ''} ORDER BY c.created_at DESC LIMIT 500`, ...(query.status ? [String(query.status)] : []))
+      .map((c) => ({ id: c.id, accountId: c.account_id, email: c.email, name: c.display_name, birthYear: c.birth_year, parentEmail: c.parent_email, status: c.status, method: c.method, note: c.note, createdAt: c.created_at, decidedAt: c.decided_at })),
+    waiting: h.all("SELECT id, email, display_name, birth_year FROM accounts WHERE birth_year IS NOT NULL AND role != 'owner' AND id NOT IN (SELECT account_id FROM parent_consents WHERE status = 'approved')")
+      .filter((a) => isMinor(a.birth_year, thisYear(), limitsNow().parentConsentUnder))
+      .map((a) => ({ accountId: a.id, email: a.email, name: a.display_name, birthYear: a.birth_year })),
+  }));
+  O('POST', '/owner/accounts/:id/consent', ({ params, body }) => {
+    const a = getAccount(params.id);
+    const approved = V.bool(body.approved, 'approved');
+    const note = V.str(body.note, 'note', { optional: true, max: 2000 });
+    if (approved) {
+      const parentEmail = body.parentEmail == null ? 'set by the owner' : V.email(body.parentEmail);
+      h.run("INSERT INTO parent_consents (id,account_id,parent_email,token_hash,status,method,note,created_at,expires_at,decided_at) VALUES (?,?,?,?,'approved','owner',?,?,?,?)",
+        randomUUID(), a.id, parentEmail, sha(`owner:${randomUUID()}`), note, now(), now(), now());
+    } else h.run("UPDATE parent_consents SET status = 'revoked', note = COALESCE(?, note), decided_at = ? WHERE account_id = ? AND status IN ('pending','approved')", note, now(), a.id);
+    audit('owner', approved ? 'owner.consent_approve' : 'owner.consent_revoke', a.id, { note }, 'local');
     return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', a.id)) };
   });
   O('POST', '/owner/accounts/:id/unlock', ({ params }) => {
@@ -1196,6 +1393,22 @@ export function createHub({
     return { used: usedBy(a.id), quota: quotaOf(h.get('SELECT * FROM accounts WHERE id = ?', a.id)) };
   });
 
+  // (After /owner/scan/queue, so that one isn't taken for a job id.)
+  // The running job, for the worker: what was asked for and where it goes.
+  O('GET', '/owner/scan/:id', ({ params }) => {
+    const j = runningJob(params.id);
+    return {
+      job: { ...jobOut(j), detail: j.detail ? JSON.parse(j.detail) : null, target: j.target, batchSize: limitsNow().questionBatchSize },
+      members: h.all('SELECT a.id, a.email, m.target FROM scan_job_members m JOIN accounts a ON a.id = m.account_id WHERE m.job_id = ?', j.id),
+    };
+  });
+  // The section's material so far (the worker checks new questions against the shared pool, so none repeat).
+  O('GET', '/owner/scan/:id/course-files', ({ params, query }) => ({ files: spaceList(spaces.course(runningJob(params.id).course_key), String(query.prefix ?? '')) }));
+  O('GET', '/owner/scan/:id/course-file', ({ params, query }) => {
+    const sp = spaces.course(runningJob(params.id).course_key);
+    return rawOut(spaceRead(sp, spaceRow(sp, String(query.path ?? '')) ?? notFound()));
+  });
+
   // ================= request handling =================
   const clientIp = (req) => {
     // Behind one trusted proxy (Tailscale Funnel), X-Forwarded-For's LAST entry is the address the proxy saw; earlier
@@ -1215,6 +1428,8 @@ export function createHub({
     let status = 200, payload, cookies = [];
     // The readable terms page (Kea opens it in a window; anyone can read it).
     if (url.pathname === '/terms' && req.method === 'GET') return serveTermsPage(url, res);
+    // The page a parent opens from a member's sign-off link.
+    if (url.pathname === '/consent' && req.method === 'GET') return serveConsentPage(url, res);
     try {
       const fileMatch = /^\/v1\/files\/(.+)$/.exec(url.pathname);
       const fileRoute = fileMatch && ['GET', 'PUT', 'DELETE'].includes(req.method);
@@ -1233,7 +1448,7 @@ export function createHub({
         if (!sameOrigin(req, secure)) forbidden('Cross-site request refused.');
         if (cookieToken && req.headers['x-kea'] !== '1') forbidden('Missing X-Kea header.');
       }
-      const ctx = { params, body, query: Object.fromEntries(url.searchParams), ip: clientIp(req), client: String(req.headers['x-kea-client'] || req.headers['user-agent'] || '').slice(0, 120), token: bearer || cookieToken };
+      const ctx = { params, body, query: Object.fromEntries(url.searchParams), ip: clientIp(req), client: String(req.headers['x-kea-client'] || req.headers['user-agent'] || '').slice(0, 120), token: bearer || cookieToken, origin: `${secure ? 'https' : 'http'}://${String(req.headers.host || 'localhost').replace(/[^\w.:[\]-]/g, '')}` };
       if (r.auth) {
         if (!ctx.token) throw new HttpError(401, 'Sign in first.');
         const s = h.get('SELECT * FROM sessions WHERE token_hash = ?', sha(ctx.token));
@@ -1285,6 +1500,21 @@ export function createHub({
     res.writeHead(200, {
       'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer',
       'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+    });
+    res.end(html);
+  }
+
+  function serveConsentPage(url, res) {
+    const token = url.searchParams.get('t') || '';
+    const c = consentByToken(token);
+    const nonce = randomBytes(16).toString('base64');
+    const html = consentPage({
+      found: !!c, status: c?.status, expired: !!c && c.status === 'pending' && c.expires_at <= now(),
+      memberName: c?.display_name, parentEmail: c?.parent_email, webClientId: googleWebClientId,
+    }, { nonce, token });
+    res.writeHead(c ? 200 : 404, {
+      'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer',
+      'content-security-policy': consentCsp(nonce),
     });
     res.end(html);
   }

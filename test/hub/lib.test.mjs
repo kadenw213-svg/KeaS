@@ -10,7 +10,7 @@ import { loadOrCreateKey, signToken, verifyToken } from '../../hub/lib/tokens.mj
 import { Windows, lockFor, FREE, MAX_LOCK_MS } from '../../hub/lib/limiter.mjs';
 import { scoreAnswer, POINTS, INTERVAL_DAYS, levelOf, xpForLevel, streak, weekStart, capped, DAILY_CAP } from '../../hub/lib/study.mjs';
 import { seal, open } from '../../hub/backup.mjs';
-import { courseKey, decide, pickNext, DEFAULTS } from '../../hub/lib/budget.mjs';
+import { courseKey, decide, isMinor, pickNext, DEFAULTS } from '../../hub/lib/budget.mjs';
 
 test('claude budget: course keys match however they are typed', () => {
   assert.equal(courseKey({ school: 'UCCS', code: 'BIO 1010', term: 'Spring 2027', section: '002' }), courseKey({ school: ' uccs ', code: 'bio-1010', term: 'spring  2027', section: '002' }));
@@ -18,7 +18,7 @@ test('claude budget: course keys match however they are typed', () => {
 });
 
 test('claude budget: decisions', () => {
-  const base = { verified: true, owner: false, myQueued: 0, myJobsToday: 0, myJobsThisWeek: 0, myBatchesThisChapter: 0, myBatchesToday: 0 };
+  const base = { verified: true, owner: false, birthYear: 1990, year: 2026, parentApproved: false, myQueued: 0, myJobsToday: 0, myJobsThisWeek: 0, myBatchesThisChapter: 0, myBatchesToday: 0 };
   const d = (kind, f) => decide(kind, {}, { ...base, ...f });
   assert.equal(d('regenerate').code, 'no_regenerate');
   assert.equal(decide('regenerate', {}, { ...base, owner: true }).code, 'no_regenerate', 'not even the owner regenerates on the shared queue');
@@ -37,6 +37,20 @@ test('claude budget: decisions', () => {
   assert.equal(d('initial_scan', { myJobsThisWeek: DEFAULTS.perAccountWeekly }).code, 'week_cap');
   assert.equal(decide('initial_scan', { perAccountDaily: 10 }, { ...base, myJobsToday: 5 }).action, 'queue', 'owner settings override defaults');
   assert.equal(decide('initial_scan', {}, { ...base, owner: true, myJobsToday: 99, verified: false }).action, 'queue', 'the owner has no limits');
+  // Under 18: a parent's or guardian's sign-off first (and the birth year has to be known to tell).
+  assert.equal(d('initial_scan', { birthYear: null }).code, 'birth_year');
+  assert.equal(d('more_questions', { chapter: 'Ch 1', birthYear: 2010 }).code, 'parent_consent');
+  assert.equal(d('more_questions', { chapter: 'Ch 1', birthYear: 2010, parentApproved: true }).action, 'queue');
+  assert.equal(decide('initial_scan', { parentConsentUnder: 0 }, { ...base, birthYear: null }).action, 'queue', 'the owner can turn the check off');
+  assert.equal(decide('initial_scan', {}, { ...base, owner: true, birthYear: 2012 }).action, 'queue', 'not for the owner');
+});
+
+test('claude budget: under 18 by birth year alone', () => {
+  assert.equal(isMinor(2009, 2026), true, 'turns 17 this year');
+  assert.equal(isMinor(2008, 2026), false, 'turns 18 this year');
+  assert.equal(isMinor(null, 2026), false);
+  assert.equal(isMinor(2010, 2026, 0), false, 'check off');
+  assert.equal(isMinor(2012, 2026, 16), true);
 });
 
 test('claude budget: turn order is fair and the owner goes first', () => {

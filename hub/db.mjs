@@ -142,6 +142,16 @@ CREATE TABLE IF NOT EXISTS scan_requests (
   kind TEXT NOT NULL, outcome TEXT NOT NULL, at INTEGER NOT NULL, day TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS scan_requests_day ON scan_requests(account_id, day);
+-- Parent or guardian sign-off for members under 18, before they can ask the shared Claude for anything. The parent
+-- proves their email with Google (in the member's Kea, or on the Hub's /consent page from a link the member sends).
+CREATE TABLE IF NOT EXISTS parent_consents (
+  id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  parent_email TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','declined','revoked')),
+  method TEXT, parent_google_sub TEXT, note TEXT,
+  created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, decided_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS parent_consents_account ON parent_consents(account_id, created_at);
 -- Accounts flagged for the owner's review (overuse, scripts). Suspension can be automatic; lifting it is the owner's.
 CREATE TABLE IF NOT EXISTS flags (
   id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -156,6 +166,15 @@ const COLUMNS = [
   ['accounts', 'google_sub', 'TEXT'],
   // A scan waits (ready = 0) until the person's Kea has uploaded what it collected from their class site.
   ['scan_jobs', 'ready', 'INTEGER NOT NULL DEFAULT 1'],
+  // Birth year (asked at sign-up, or before the first shared-Claude request): under 18 needs a parent's sign-off.
+  ['accounts', 'birth_year', 'INTEGER'],
+  // Where course material for this person goes in their Kea storage: "kea/Kea/<profile>/" (their Kea says when it
+  // asks or joins), so a shared scan's material lands in the folder their Kea syncs.
+  ['scan_jobs', 'target', 'TEXT'],
+  ['scan_job_members', 'target', 'TEXT'],
+  ['course_members', 'target', 'TEXT'],
+  // Material from a finished job already copied into each person's storage (so a retry never copies twice).
+  ['scan_jobs', 'delivered', 'INTEGER NOT NULL DEFAULT 0'],
 ];
 
 export function openDb(file) {
