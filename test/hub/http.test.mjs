@@ -690,7 +690,8 @@ test('course material: a question batch reaches everyone who asked; classmates w
   // A asks for 25 more on Ch 4; B (same section) joins. Each says where their Kea's folder is.
   const qa = await call('POST', '/v1/scan', a, { kind: 'more_questions', course, chapter: 'Ch 4', target: 'kea/Kea/School/', detail: { courseCode: 'BIO 2010', chapter: 'Ch 4' } });
   assert.equal(qa.body.status, 'queued');
-  assert.equal((await call('POST', '/v1/scan', b, { kind: 'more_questions', course, chapter: 'Ch 4', target: 'kea/Kea/Biology' })).body.code, 'not_in_section');
+  // (B isn't in A's section yet: asking makes a request to A instead of joining A's batch.)
+  assert.equal((await call('POST', '/v1/scan', b, { kind: 'more_questions', course, chapter: 'Ch 4', target: 'kea/Kea/Biology' })).body.status, 'pending');
   const code = (await call('POST', '/v1/course-sections/code', a, { course })).body.code;
   assert.match(code, /^[A-HJ-NP-Z2-9]{10}$/);
   assert.equal((await call('POST', '/v1/course-sections/code', b, { course })).status, 404, 'only people in the section see its code');

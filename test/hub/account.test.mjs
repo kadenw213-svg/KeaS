@@ -417,7 +417,7 @@ test('notifications for existing events: org approved, join approved, sign-off d
   }
   const ja = ok(await call('POST', '/v1/scan', a.token, { kind: 'more_questions', course, chapter: 'Ch 3', detail: { courseCode: 'HIS 101' } }));
   // (B gets into the section with the code A shares.)
-  assert.equal((await call('POST', '/v1/scan', b.token, { kind: 'more_questions', course, chapter: 'Ch 3' })).body.code, 'not_in_section');
+  assert.equal((await call('POST', '/v1/scan', b.token, { kind: 'more_questions', course, chapter: 'Ch 3' })).body.status, 'pending');
   const sectionCode = ok(await call('POST', '/v1/course-sections/code', a.token, { course })).code;
   assert.equal(ok(await call('POST', '/v1/scan', b.token, { kind: 'more_questions', course, chapter: 'Ch 3', joinCode: sectionCode })).status, 'joined');
   let next = ok(await owner('POST', '/owner/scan/next')).job;

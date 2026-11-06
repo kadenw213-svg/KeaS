@@ -1309,7 +1309,7 @@ export function createHub({
   }
   const requestOut = (r) => ({ id: r.id, course: r.course_key, label: r.label, status: r.status, createdAt: r.created_at, decidedAt: r.decided_at });
   function askToJoin(me, key, target, label, ip) {
-    const PENDING = 'Someone in this section has to let you in. They got your request in Kea. Or ask one of them for the section code.';
+    const PENDING = 'Someone in this course section has to let you in first. They got your request in Kea. Or ask one of them for the section code.';
     const open = h.get("SELECT * FROM course_join_requests WHERE course_key = ? AND account_id = ? AND status = 'pending'", key, me.id);
     if (open) {
       if (target) h.run('UPDATE course_join_requests SET target = ? WHERE id = ?', target, open.id);
@@ -1401,10 +1401,9 @@ export function createHub({
         audit(me.id, 'course.join_code', null, { course: key }, ip);
         if (kind === 'initial_scan') return { status: 'shared', message: 'You’re in this section now. Its material comes into Kea with the next sync.', delivered: got.delivered, allowance: allowance(me) };
         // (Asking for something else, like more questions: carry on with that now they're in.)
-      } else if (kind === 'initial_scan') {
-        return askToJoin(me, key, target, sectionLabel(body), ip);
       } else {
-        throw new HttpError(403, 'Join this section first: ask for its class scan, or use the section code from someone in it.', { code: 'not_in_section', allowance: allowance(me) });
+        // (Whatever they asked for: once someone lets them in, they get the section's material and can ask again.)
+        return askToJoin(me, key, target, sectionLabel(body), ip);
       }
     }
     // The first person in a section (by asking for anything on it) is its first member, and can let others in.
