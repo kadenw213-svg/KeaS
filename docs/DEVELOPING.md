@@ -50,13 +50,17 @@ test/           node:test suites for the Hub and the workforce server
   `payrollDir` in `keas-config.json`). Without the app: `KEAS_VAULT=1 KEAS_HUB_URL=http://127.0.0.1:4860 KEA_DB=<file> npm run server:dev`.
 - **Encryption:** AES-256-GCM with a key derived from the vault passphrase by scrypt (`server/lib/vault.mjs`). SSNs
   and addresses (`people.pii_enc`), bank details (`people.deposit`, `orgs.bank`, `legal_entities.bank_enc`), signed
-  forms, I-9 Section 2 and documents are sealed. The key is only in memory while the vault is open; closing the
+  forms, I-9 Section 2 and documents are sealed by the code. Pay amounts, birthdates and emails (`SEALED_VALUES` in
+  `server/payroll/schema.mjs`) are sealed by triggers as they're written and opened by `server/db.mjs` as they're
+  read, so nothing may filter or sum them in SQL. The key is only in memory while the vault is open; closing the
   Payroll window stops the server. Changing the passphrase re-encrypts every sealed column.
-- **Sign-in:** the Kea Hub account (the vault relays the password to the Hub once, gets an Ed25519 token for the
-  audience `keas-payroll` and checks it with the Hub's `/v1/keys`) plus the passphrase; a local account
-  (scrypt) works when the Hub can't be reached.
+- **Sign-in:** the Kea Hub account (the vault relays the password to the Hub the KeaS app names, never one a
+  request names, gets an Ed25519 token for the audience `keas-payroll` and checks it against the Hub key pinned at
+  setup) plus the passphrase. A local password (16+ characters, scrypt) works only while the Hub can't be reached,
+  and only if the owner turned it on in the KeaS app. Wrong tries are limited per account and address.
 - **The workforce server** (`npm run dev`) runs the same payroll and HR code on its sample data with its vault opened
-  by a passphrase kept next to the database (`<db>.vaultkey`), so every screen can be tried there.
+  by a passphrase kept next to the database (`<db>.vaultkey`, development only: `devKeyFile`), so every screen can be
+  tried there. The KeaS app passes an organization server's passphrase in memory, kept with Windows DPAPI.
 - **Code:** `server/payroll/` (one module per area: vault sign-in, approvals, org structure, pay structure, leave,
   pay run, onboarding, documents and expenses, reports, import, year-end, hiring and performance), screens in
   `web/src/screens/`, tests in `test/server/payroll.test.mjs` and `test/server/vault.test.mjs`.

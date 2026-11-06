@@ -9,7 +9,7 @@ import { openDb, DEFAULT_DB, rowToPerson, rowToOrg, rowToShift, rowToPosition, r
 import { seed } from './seed.mjs';
 import { mergeRules, checkAssignment, timecard, unforceable, isBlocked } from './lib/rules.mjs';
 import { makeVault, openDevVault, VaultLocked } from './payroll/vaultstate.mjs';
-import { makeHubClient } from './payroll/hub.mjs';
+import { makeHubClient, checkHubUrl } from './payroll/hub.mjs';
 import { makeTables } from './payroll/run.mjs';
 import { makeApprovals } from './payroll/approvals.mjs';
 import { registerPayroll } from './payroll/index.mjs';
@@ -59,15 +59,21 @@ function sameOrigin(req, secure) {
 /**
  * vault: true runs the payroll vault (the payroll admin's own PC): it starts locked and empty, and payroll admins sign
  * in with their Kea Hub account plus the vault passphrase. Otherwise the workforce server runs with its vault opened by
- * a passphrase kept next to the database, and fills an empty database with the sample workplace.
+ * `passphrase` (the KeaS app keeps it protected by Windows), and fills an empty database with the sample workplace.
+ *
+ * hubUrl: the Kea Hub payroll admins sign in at, set by the KeaS app (never by a request). localSignIn: true, or a
+ * function returning it, when the owner turned on local passwords in the KeaS app. devKeyFile: development and tests
+ * only, keep a generated passphrase in a file next to the database (never for a real organization's data).
  */
 export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = process.env.KEAS_WEB_DIR || DEFAULT_WEB_DIR, log = true, now = () => Date.now(),
-  vault: vaultMode = process.env.KEAS_VAULT === '1', hubUrl = process.env.KEAS_HUB_URL || null, sharedDir = SHARED, passphrase = process.env.KEAS_VAULT_PASSPHRASE || null, fetchImpl = globalThis.fetch } = {}) {
+  vault: vaultMode = process.env.KEAS_VAULT === '1', hubUrl = process.env.KEAS_HUB_URL || null, sharedDir = SHARED, passphrase = process.env.KEAS_VAULT_PASSPHRASE || null, fetchImpl = globalThis.fetch,
+  localSignIn = false, devKeyFile = dbFile === DEFAULT_DB || dbFile === ':memory:' || process.env.KEAS_DEV_KEYFILE === '1' } = {}) {
+  const fixedHubUrl = checkHubUrl(hubUrl);
   const h = openDb(dbFile);
   const vault = makeVault(h);
   if (vaultMode) h.run('DELETE FROM sessions');
   else {
-    openDevVault(vault, dbFile, passphrase);
+    try { openDevVault(vault, dbFile, passphrase, { keyFile: devKeyFile }); } catch (e) { h.close(); throw e; }
     if (h.isEmpty()) seed(h, { now: now(), vault });
   }
   const us = readJson(join(sharedDir, 'labor', 'US.json'));
@@ -473,7 +479,8 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
   });
   const ctx = {
     mode: vaultMode ? 'vault' : 'org', h, route, V, HttpError, bad, need, has, privileged, audit, now, iso, vault, approvals,
-    hub: makeHubClient({ fetchImpl, now }), defaultHubUrl: hubUrl,
+    hub: makeHubClient({ fetchImpl, now }), defaultHubUrl: fixedHubUrl,
+    localSignIn: typeof localSignIn === 'function' ? localSignIn : () => !!localSignIn,
     uid: (p) => `${p}-${randomUUID()}`, today: (org) => localDate(now(), org.tz),
     getPerson, getShift, loadOrg, rulesFor, tablesFor, computeTimecard, positionsOf,
     periodOf, currentPeriod, lastCompleted, parsePeriod, newSession, sessionCookie,
@@ -503,6 +510,9 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
       return;
     }
     try {
+      // The payroll vault answers only to its own address on this computer, so a web page that points its own domain
+      // name at 127.0.0.1 (DNS rebinding) can't reach it.
+      if (vaultMode && !ownHost(req.headers.host)) throw new HttpError(421, 'This payroll vault only answers at its own address on this computer.');
       const r = routes.find((x) => x.method === req.method && x.re.test(url.pathname));
       if (!r) throw new HttpError(routes.some((x) => x.re.test(url.pathname)) ? 405 : 404, 'not found');
       const params = {}; const m = url.pathname.match(r.re); r.keys.forEach((k, i) => (params[k] = decodeURIComponent(m[i + 1])));
@@ -513,7 +523,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
         if (raw.trim()) { try { body = JSON.parse(raw); } catch { bad('invalid JSON'); } }
         body = V.obj(body);
       }
-      const ctx = { params, body, query: Object.fromEntries(url.searchParams), secure };
+      const ctx = { params, body, query: Object.fromEntries(url.searchParams), secure, ip: req.socket.remoteAddress || null };
       // Credentials: a bearer header (apps, scripts) or the web app's HttpOnly cookie.
       const auth = req.headers.authorization;
       const bearer = auth ? /^Bearer ([0-9a-f]{64})$/.exec(auth)?.[1] ?? null : null;
@@ -563,8 +573,24 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
   }
 
   const server = http.createServer((req, res) => { handle(req, res).catch((e) => { console.error(e); try { res.writeHead(500); res.end('{"error":"internal error"}'); } catch {} }); });
+  function ownHost(host) {
+    const port = server.address()?.port;
+    return [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`].includes(String(host || '').toLowerCase());
+  }
   return {
     server, h, vault,
+    /**
+     * The owner (in the KeaS app, never over HTTP) accepts the Kea Hub's current signing key, after the Hub was moved
+     * or reinstalled. Returns the pinned key ids.
+     */
+    async repinHub() {
+      if (!vaultMode || !vault.initialized()) throw new Error('Set up payroll first.');
+      if (!fixedHubUrl) throw new Error('No Kea Hub is set for payroll on this computer.');
+      const keys = await ctx.hub.fetchKeys(fixedHubUrl);
+      vault.setSetting('hubPin', { url: fixedHubUrl, iss: 'kea-hub', keys, at: iso(now()) });
+      audit(h.get('SELECT id FROM orgs LIMIT 1')?.id ?? null, 'keas-app', 'vault_hub_key_pinned', null, { kids: keys.map((k) => k.kid) });
+      return keys.map((k) => k.kid);
+    },
     listen(port = Number(process.env.KEA_PORT) || 4850) { return new Promise((resolve) => server.listen(port, HOST, () => resolve(server.address().port))); },
     close() { return new Promise((resolve) => server.close(() => { h.close(); resolve(); })); },
   };

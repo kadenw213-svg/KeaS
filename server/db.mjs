@@ -3,7 +3,9 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { migratePayroll } from './payroll/schema.mjs';
+import { migratePayroll, sealTriggersSql, SEALED_VALUE_NAMES } from './payroll/schema.mjs';
+import { isSealed } from './lib/vault.mjs';
+import { VaultLocked } from './payroll/vaultstate.mjs';
 
 export const DEFAULT_DB = join(dirname(fileURLToPath(import.meta.url)), 'data', 'demo.db');
 
@@ -72,17 +74,31 @@ CREATE TABLE IF NOT EXISTS audit_log (
 export function openDb(file = DEFAULT_DB) {
   if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });
   const db = new DatabaseSync(file);
-  db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 3000;');
+  // secure_delete: overwritten and deleted values are zeroed in the file, so a sealed value leaves no plaintext behind.
+  db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 3000; PRAGMA secure_delete = ON;');
+  // Pay amounts, birthdates and emails are sealed as they're written (triggers call keas_seal) and opened as they're
+  // read (openRow), with the vault's key, which the vault hands over when it's unlocked (setSealer).
+  let sealer = null;
+  const needSealer = () => { if (!sealer) throw new VaultLocked(); return sealer; };
+  db.function('keas_seal', { deterministic: false }, (v) => (v == null ? null : needSealer().seal(v)));
   db.exec(SCHEMA);
   migratePayroll(db);
+  db.exec(sealTriggersSql());
+  const openRow = (r) => {
+    if (!r) return r;
+    for (const k of SEALED_VALUE_NAMES) if (isSealed(r[k])) r[k] = needSealer().open(r[k]);
+    return r;
+  };
   const cache = new Map();
   let depth = 0;
   const st = (sql) => { let s = cache.get(sql); if (!s) { s = db.prepare(sql); cache.set(sql, s); } return s; };
   return {
     db,
-    all: (sql, ...p) => st(sql).all(...p),
-    get: (sql, ...p) => st(sql).get(...p),
+    all: (sql, ...p) => st(sql).all(...p).map(openRow),
+    get: (sql, ...p) => openRow(st(sql).get(...p)),
     run: (sql, ...p) => st(sql).run(...p),
+    /** { seal(value) -> sealed text, open(sealed) -> value } while the vault is open; null when it's locked. */
+    setSealer(s) { sealer = s; },
     tx(fn) {
       // Nested calls join the outer transaction.
       if (depth > 0) { depth++; try { return fn(); } finally { depth--; } }

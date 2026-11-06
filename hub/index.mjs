@@ -617,6 +617,9 @@ export function createHub({
   // A short-lived signed token for an org server or Kea to check offline (aud names who it's for).
   R('POST', '/v1/auth/token', ({ me, body }) => {
     const aud = V.str(body.aud ?? 'kea', 'Audience', { min: 1, max: 200 });
+    // Only audiences something checks: Kea, the payroll vault, and an org server (org:<id>). A token for one never
+    // works at another, and nobody can mint one named after something else.
+    if (!['kea', 'keas-payroll'].includes(aud) && !/^org:[A-Za-z0-9_-]{1,64}$/.test(aud)) bad('Unknown audience.');
     const t = Math.floor(now() / 1000);
     const token = signToken(key, {
       iss: 'kea-hub', sub: me.id, aud, iat: t, exp: t + TOKEN_MINUTES * 60,

@@ -156,7 +156,7 @@ export function resetDb(file = DEFAULT_DB) {
   for (const f of [file, file + '-wal', file + '-shm', file + '.vaultkey']) rmSync(f, { force: true });
   const h = openDb(file);
   const vault = makeVault(h);
-  openDevVault(vault, file, process.env.KEAS_VAULT_PASSPHRASE || null);
+  openDevVault(vault, file, process.env.KEAS_VAULT_PASSPHRASE || null, { keyFile: true });
   const r = seed(h, { vault });
   h.close();
   return r;
@@ -169,7 +169,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   } else {
     const h = openDb(process.env.KEA_DB || DEFAULT_DB);
     const vault = makeVault(h);
-    openDevVault(vault, process.env.KEA_DB || DEFAULT_DB, process.env.KEAS_VAULT_PASSPHRASE || null);
+    openDevVault(vault, process.env.KEA_DB || DEFAULT_DB, process.env.KEAS_VAULT_PASSPHRASE || null, { keyFile: true });
     if (h.isEmpty()) { const r = seed(h, { vault }); console.log(`Seeded (anchor ${r.anchor}).`); } else console.log('Database already has data; use --reset to wipe and reseed.');
     h.close();
   }

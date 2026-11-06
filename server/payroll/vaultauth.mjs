@@ -1,43 +1,101 @@
-// Setting up and signing in to the payroll vault: the payroll admin's Kea Hub account (or a local account when the Hub
-// can't be reached) plus the vault passphrase, which unlocks the encrypted data for this run of the server.
+// Setting up and signing in to the payroll vault: the payroll admin's Kea Hub account plus the vault passphrase, which
+// unlocks the encrypted data for this run of the server.
+//
+// - The Kea Hub is the one the KeaS app on this computer names (c.defaultHubUrl), never one a request names, and its
+//   signing key is pinned at setup (see hub.mjs). The owner accepts a new key in the KeaS app only (c.repinHub).
+// - A local password is a fallback for when that Hub can't be reached. It is off unless the owner turns it on in the
+//   KeaS app on this computer (c.localSignIn()), needs a long passphrase-style password, works only while the Hub
+//   really can't be reached, and is rate-limited per account.
+// - Wrong tries are counted per account and per address, never for everyone at once: someone else's wrong guesses
+//   can't lock out a payroll admin who signs in at the Hub (password and two-step code) with the right passphrase.
 import { hashLocalPassword, checkLocalPassword } from '../lib/vault.mjs';
-import { HubUnreachable, HubRefused } from './hub.mjs';
+import { HubUnreachable, HubRefused, ISSUER } from './hub.mjs';
 import { addDays, weekStartOf } from '../lib/time.mjs';
+
+/** Wrong-try counting by key ('acct:<email>', 'ip:<address>', 'user:<id>'): 5 free, then a doubling wait up to 15 minutes. */
+export function makeLimiter({ now, free = 5, baseMs = 30_000, capMs = 15 * 60_000, maxKeys = 10_000 }) {
+  const m = new Map();
+  return {
+    /** Milliseconds to wait before this key may try again (0: go ahead). */
+    wait(key) { const e = key && m.get(key); return e && e.until > now() ? e.until - now() : 0; },
+    fail(key) {
+      if (!key) return;
+      if (m.size >= maxKeys) for (const [k, e] of m) { if (e.until <= now() && now() - e.at > capMs) m.delete(k); if (m.size < maxKeys / 2) break; }
+      const e = m.get(key) || { n: 0, until: 0, at: 0 };
+      e.n++; e.at = now();
+      if (e.n >= free) e.until = now() + Math.min(capMs, baseMs * 2 ** (e.n - free));
+      m.set(key, e);
+    },
+    clear(key) { if (key) m.delete(key); },
+  };
+}
+
+/** A local password strong enough to stand in for a Hub sign-in with two-step codes: a passphrase, not a word. */
+export function checkLocalStrength(pw, { email, passphrase } = {}) {
+  const s = String(pw ?? '');
+  if (s.length < 16) return 'The local password needs at least 16 characters. A few unrelated words work well.';
+  if (s.length > 300) return 'The local password can be 300 characters at most.';
+  if (new Set(s.toLowerCase()).size < 8) return 'The local password repeats too few different characters.';
+  const low = s.toLowerCase();
+  if (email && low.includes(String(email).toLowerCase().split('@')[0])) return 'The local password can’t contain your email name.';
+  if (passphrase && s === passphrase) return 'The local password can’t be the vault passphrase.';
+  return null;
+}
+
+const LOCAL_OFF = 'Signing in with a local password is turned off. The owner can turn it on in the KeaS app on this computer (Payroll, Advanced).';
+const LOCAL_HUB_UP = 'The Kea Hub can be reached, so sign in with your Kea Hub account. A local password only works while the Hub can’t be reached.';
+const isLoopback = (ip) => !ip || ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
 
 export function registerVaultAuth(c) {
   const { h, route, V, bad, need, HttpError, uid, audit, vault, hub, now, iso } = c;
-  const hubUrl = () => vault.setting('hubUrl', c.defaultHubUrl || null);
-  const fails = { n: 0, until: 0 };
-  const guard = () => { if (now() < fails.until) throw new HttpError(429, `Too many wrong tries. Wait ${Math.ceil((fails.until - now()) / 1000)} seconds.`); };
-  const failed = () => { fails.n++; if (fails.n >= 5) fails.until = now() + Math.min(15 * 60000, 30000 * 2 ** (fails.n - 5)); };
+  const hubUrl = () => c.defaultHubUrl || null;
+  const localOn = () => !!c.localSignIn();
+  const pin = () => vault.setting('hubPin', null);
+  const limiter = makeLimiter({ now });
+  const guard = (...keys) => {
+    const ms = Math.max(0, ...keys.map((k) => limiter.wait(k)));
+    if (ms) throw new HttpError(429, `Too many wrong tries. Wait ${Math.ceil(ms / 1000)} seconds.`);
+  };
+  // Per-address counting only means something for other machines: everything on this PC shares 127.0.0.1.
+  const ipKey = (ip) => (isLoopback(ip) ? null : `ip:${ip}`);
+  const WRONG = 'Wrong email, password or vault passphrase.';
 
   route('GET', '/v1/vault/status', () => ({
     mode: c.mode, initialized: vault.initialized(), locked: !vault.unlocked(), hubUrl: hubUrl(),
     org: vault.initialized() ? h.get('SELECT name FROM orgs LIMIT 1')?.name ?? null : null,
-    localAccounts: !!h.get('SELECT 1 FROM vault_users WHERE local_pw IS NOT NULL'),
+    localSignIn: localOn(),
+    localAccounts: localOn() && !!h.get('SELECT 1 FROM vault_users WHERE local_pw IS NOT NULL'),
+    hubKeyPinned: !!pin(),
   }), { auth: false, open: true });
 
-  /** Check the person at the Hub (or locally); returns the vault user row or throws. */
-  async function identify(user, { mode, email, password, code }) {
-    if (mode === 'local') {
-      if (!user?.local_pw || !checkLocalPassword(password, user.local_pw)) return null;
-      return user;
-    }
+  /** The Hub sign-in as an HTTP error the page understands. */
+  function hubError(e, user) {
+    if (e instanceof HubUnreachable) return new HttpError(503, e.message, { hubUnreachable: true, localAvailable: localOn() && !!user?.local_pw });
+    if (e instanceof HubRefused) return new HttpError(e.status === 429 ? 429 : e.status === 401 || e.status === 403 ? 401 : 400, e.extra?.hubKeyChanged ? e.message : e.status === 401 || e.status === 403 ? WRONG : e.message, { hub: true, ...(e.extra || {}) });
+    return e;
+  }
+  /** Pins the Hub's key the first time (a vault set up before keys were pinned trusts the KeaS app's own Hub once). */
+  const savePin = (keys) => vault.setSetting('hubPin', { url: hubUrl(), iss: ISSUER, keys: keys.map((k) => ({ kty: 'OKP', crv: 'Ed25519', x: k.x, kid: k.kid ?? null })), at: iso(now()) });
+
+  /** Checks the person at the Hub; returns the vault user row, or null when it isn't them. */
+  async function identifyAtHub(user, { email, password, code }) {
     let who;
-    try { who = await hub.signIn(hubUrl(), { email, password, code }); }
-    catch (e) {
-      if (e instanceof HubUnreachable) throw new HttpError(503, e.message, { hubUnreachable: true, localAvailable: !!user?.local_pw });
-      if (e instanceof HubRefused) { if (e.status === 401 || e.status === 403) return null; throw new HttpError(e.status === 429 ? 429 : 400, e.message, { hub: true }); }
-      throw e;
-    }
+    try { who = await hub.signIn(hubUrl(), { email, password, code }, { pin: pin() }); }
+    catch (e) { if (e instanceof HubRefused && (e.status === 401 || e.status === 403) && !e.extra?.hubKeyChanged) return null; throw hubError(e, user); }
     if (!user || who.email !== user.email || (user.hub_sub && user.hub_sub !== who.sub)) return null;
-    if (!user.hub_sub) h.run('UPDATE vault_users SET hub_sub = ? WHERE id = ?', who.sub, user.id);
+    if (!user.hub_sub) {
+      // Linking an account for the first time: only one whose email the Hub has verified.
+      if (!who.emailVerified) throw new HttpError(403, 'Verify your email address in your Kea Hub account first, then sign in here.');
+      h.run('UPDATE vault_users SET hub_sub = ? WHERE id = ?', who.sub, user.id);
+    }
+    if (!pin()) savePin(who.keys);
     return user;
   }
 
   route('POST', '/v1/vault/setup', async ({ body, secure }) => {
     if (c.mode !== 'vault') throw new HttpError(404, 'not found');
     if (vault.initialized()) throw new HttpError(409, 'This vault is already set up. Sign in instead.');
+    if (body.hubUrl !== undefined) bad('The Kea Hub for payroll is set in the KeaS app on this computer, not here.');
     const passphrase = V.str(body.passphrase, 'passphrase', { min: 12, max: 500 });
     const o = body.org || {}, a = body.admin || {}, s = body.signIn || {};
     const email = V.str(a.email, 'email', { min: 3, max: 200 }).trim().toLowerCase();
@@ -46,14 +104,23 @@ export function registerVaultAuth(c) {
     const tz = V.str(o.tz ?? 'America/Denver', 'tz', { min: 3, max: 60 });
     try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); } catch { bad('unknown time zone'); }
     const mode = V.enum(s.mode ?? 'hub', 'signIn.mode', ['hub', 'local']);
-    if (body.hubUrl) vault.setSetting('hubUrl', V.str(body.hubUrl, 'hubUrl', { max: 300 }));
-    let hubSub = null, localPw = null;
+    const strong = (pw) => { const why = checkLocalStrength(pw, { email, passphrase }); if (why) bad(why); return hashLocalPassword(String(pw)); };
+    let hubSub = null, localPw = null, keys = null;
     if (mode === 'hub') {
-      try { const who = await hub.signIn(hubUrl(), { email, password: s.password, code: s.code }); if (who.email !== email) bad('That Kea Hub account has a different email.'); hubSub = who.sub; }
-      catch (e) { if (e instanceof HubUnreachable) throw new HttpError(503, e.message, { hubUnreachable: true }); if (e instanceof HubRefused) throw new HttpError(401, e.message); throw e; }
-      if (s.localPassword) localPw = hashLocalPassword(V.str(s.localPassword, 'localPassword', { min: 10, max: 300 }));
-    } else localPw = hashLocalPassword(V.str(s.password, 'password', { min: 10, max: 300 }));
+      let who;
+      try { who = await hub.signIn(hubUrl(), { email, password: String(s.password ?? ''), code: s.code ? String(s.code) : undefined }); }
+      catch (e) { if (e instanceof HubRefused && (e.status === 401 || e.status === 403)) throw new HttpError(401, e.message); throw hubError(e, null); }
+      if (who.email !== email) bad('That Kea Hub account has a different email.');
+      if (!who.emailVerified) throw new HttpError(403, 'Verify your email address in your Kea Hub account first, then set up payroll.');
+      hubSub = who.sub; keys = who.keys;
+      if (s.localPassword) { if (!localOn()) throw new HttpError(403, LOCAL_OFF); localPw = strong(s.localPassword); }
+    } else {
+      if (!localOn()) throw new HttpError(403, LOCAL_OFF);
+      if (await hub.reachable(hubUrl())) throw new HttpError(409, 'The Kea Hub can be reached, so set up payroll with your Kea Hub account.');
+      localPw = strong(s.password);
+    }
     vault.create(passphrase);
+    if (keys) savePin(keys);
     const orgId = uid('org'), pid = uid('p');
     const today = new Date(now()).toISOString().slice(0, 10);
     const anchor = o.payPeriodAnchor ? V.date(o.payPeriodAnchor, 'payPeriodAnchor') : weekStartOf(today, 0);
@@ -66,24 +133,43 @@ export function registerVaultAuth(c) {
     return c.newSession(pid, secure);
   }, { auth: false, open: true });
 
-  route('POST', '/v1/vault/signin', async ({ body, secure }) => {
+  route('POST', '/v1/vault/signin', async ({ body, secure, ip }) => {
     if (c.mode !== 'vault') throw new HttpError(404, 'not found');
     if (!vault.initialized()) throw new HttpError(409, 'Set up the vault first.');
-    guard();
     const email = V.str(body.email, 'email', { min: 3, max: 200 }).trim().toLowerCase();
     const mode = V.enum(body.mode ?? 'hub', 'mode', ['hub', 'local']);
-    const wasLocked = !vault.unlocked();
-    if (!vault.unlock(V.str(body.passphrase, 'passphrase', { min: 1, max: 500 }))) { failed(); throw new HttpError(401, 'Wrong email, password or vault passphrase.'); }
+    const passphrase = V.str(body.passphrase, 'passphrase', { min: 1, max: 500 });
+    const password = String(body.password ?? '');
+    const where = ipKey(ip), acct = `acct:${email}`;
     const user = h.get('SELECT * FROM vault_users WHERE email = ?', email);
-    let ok = null;
-    try { ok = await identify(user, { mode, email, password: String(body.password ?? ''), code: body.code ? String(body.code) : undefined }); }
-    catch (e) { if (wasLocked && !h.get('SELECT 1 FROM sessions')) vault.lock(); throw e; }
-    if (!ok) { failed(); if (wasLocked && !h.get('SELECT 1 FROM sessions')) vault.lock(); throw new HttpError(401, 'Wrong email, password or vault passphrase.'); }
-    fails.n = 0; fails.until = 0;
-    h.run('UPDATE vault_users SET last_login = ? WHERE id = ?', iso(now()), user.id);
-    const p = h.get('SELECT org_id FROM people WHERE id = ?', user.person_id);
-    audit(p.org_id, user.person_id, 'vault_signin', user.id, { mode });
-    return c.newSession(user.person_id, secure);
+    const wasLocked = !vault.unlocked();
+    const relock = () => { if (wasLocked && !h.get('SELECT 1 FROM sessions')) vault.lock(); };
+    let who = null;
+    if (mode === 'local') {
+      // Off unless the owner turned it on; only while the Hub can't be reached; counted per account and address.
+      if (!localOn()) throw new HttpError(403, LOCAL_OFF);
+      guard(acct, where);
+      if (await hub.reachable(hubUrl())) throw new HttpError(409, LOCAL_HUB_UP);
+      const okPw = !!user?.local_pw && checkLocalPassword(password, user.local_pw);
+      if (!okPw || !vault.unlock(passphrase)) { limiter.fail(acct); limiter.fail(where); relock(); throw new HttpError(401, WRONG); }
+      limiter.clear(acct);
+      who = user;
+    } else {
+      // The Hub checks the password and two-step code (with its own limits) before the passphrase is even tried, so
+      // only the account's owner can spend that account's passphrase tries.
+      guard(where);
+      who = await identifyAtHub(user, { email, password, code: body.code ? String(body.code) : undefined });
+      if (!who) { limiter.fail(where); throw new HttpError(401, WRONG); }
+      const mine = `user:${who.id}`;
+      guard(mine);
+      if (!vault.unlock(passphrase)) { limiter.fail(mine); relock(); throw new HttpError(401, WRONG); }
+      limiter.clear(mine);
+    }
+    limiter.clear(where);
+    h.run('UPDATE vault_users SET last_login = ? WHERE id = ?', iso(now()), who.id);
+    const p = h.get('SELECT org_id FROM people WHERE id = ?', who.person_id);
+    audit(p.org_id, who.person_id, 'vault_signin', who.id, { mode });
+    return c.newSession(who.person_id, secure);
   }, { auth: false, open: true });
 
   route('POST', '/v1/vault/lock', ({ me, org, secure }) => {
@@ -94,15 +180,18 @@ export function registerVaultAuth(c) {
   });
   route('POST', '/v1/vault/passphrase', ({ me, org, body }) => {
     need(me, 'owner', 'payroll');
+    const key = `pass:${me.id}`;
+    guard(key);
     const next = V.str(body.next, 'next', { min: 12, max: 500 });
-    if (!vault.rekey(V.str(body.current, 'current', { min: 1, max: 500 }), next)) { failed(); throw new HttpError(401, 'The current passphrase is wrong.'); }
+    if (!vault.rekey(V.str(body.current, 'current', { min: 1, max: 500 }), next)) { limiter.fail(key); throw new HttpError(401, 'The current passphrase is wrong.'); }
+    limiter.clear(key);
     audit(org.id, me.id, 'vault_passphrase_change', null, null);
     return { ok: true };
   });
 
   route('GET', '/v1/vault/users', ({ me, org }) => {
     need(me, 'owner', 'payroll');
-    return { users: h.all('SELECT v.*, p.name FROM vault_users v JOIN people p ON p.id = v.person_id WHERE p.org_id = ? ORDER BY p.name', org.id).map((u) => ({ id: u.id, personId: u.person_id, name: u.name, email: u.email, hubLinked: !!u.hub_sub, localPassword: !!u.local_pw, lastLogin: u.last_login })), hubUrl: hubUrl() };
+    return { users: h.all('SELECT v.*, p.name FROM vault_users v JOIN people p ON p.id = v.person_id WHERE p.org_id = ? ORDER BY p.name', org.id).map((u) => ({ id: u.id, personId: u.person_id, name: u.name, email: u.email, hubLinked: !!u.hub_sub, localPassword: !!u.local_pw, lastLogin: u.last_login })), hubUrl: hubUrl(), localSignIn: localOn(), hubKeyPinned: !!pin() };
   });
   route('POST', '/v1/vault/users', ({ me, org, body }) => {
     need(me, 'owner');
@@ -127,19 +216,16 @@ export function registerVaultAuth(c) {
   route('POST', '/v1/vault/local-password', ({ me, org, body }) => {
     const u = h.get('SELECT * FROM vault_users WHERE person_id = ?', me.id);
     if (!u) throw new HttpError(404, 'you don’t have a vault sign-in');
-    if (body.password == null) { h.run('UPDATE vault_users SET local_pw = NULL WHERE id = ?', u.id); return { ok: true, localPassword: false }; }
-    h.run('UPDATE vault_users SET local_pw = ? WHERE id = ?', hashLocalPassword(V.str(body.password, 'password', { min: 10, max: 300 })), u.id);
+    if (body.password == null) { h.run('UPDATE vault_users SET local_pw = NULL WHERE id = ?', u.id); audit(org.id, me.id, 'vault_local_password_off', u.id, null); return { ok: true, localPassword: false }; }
+    if (!localOn()) throw new HttpError(403, LOCAL_OFF);
+    const why = checkLocalStrength(V.str(body.password, 'password', { min: 1, max: 300 }), { email: u.email });
+    if (why) bad(why);
+    h.run('UPDATE vault_users SET local_pw = ? WHERE id = ?', hashLocalPassword(body.password), u.id);
     audit(org.id, me.id, 'vault_local_password', u.id, null);
     return { ok: true, localPassword: true };
   });
-  route('POST', '/v1/vault/hub-url', ({ me, org, body }) => {
-    need(me, 'owner');
-    const url = V.str(body.hubUrl, 'hubUrl', { max: 300 }).trim();
-    if (url && !/^https?:\/\/[^\s/]+/.test(url)) bad('the Hub address starts with https://');
-    vault.setSetting('hubUrl', url || null);
-    audit(org.id, me.id, 'vault_hub_url', null, { url });
-    return { hubUrl: hubUrl() };
-  });
+  // (The Hub address can't be changed over HTTP: the KeaS app on this computer sets it.)
+  route('POST', '/v1/vault/hub-url', () => { throw new HttpError(410, 'The Kea Hub for payroll is set in the KeaS app on this computer.'); });
 
   // Org-wide payroll settings (each key validated).
   route('GET', '/v1/org/settings', ({ me, org }) => { need(me, 'manager', 'payroll'); return { settings: org.settings, org: { name: org.name, state: org.state, tz: org.tz, payFrequency: org.payFrequency, payPeriodAnchor: org.payPeriodAnchor, futaExempt: org.futaExempt, sutaRate: org.sutaRate } }; });

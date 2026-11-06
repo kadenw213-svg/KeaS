@@ -33,14 +33,14 @@ const login = async (personId) => (await call('POST', '/v1/auth/demo-login', nul
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), 'keas-payroll-test-'));
   // Which year is the last completed period paid in? Build verified tables for exactly that year.
-  const probe = createApp({ dbFile: join(dir, 'probe.db'), log: false });
+  const probe = createApp({ dbFile: join(dir, 'probe.db'), log: false, devKeyFile: true });
   const port0 = await probe.listen(0);
   base = `http://127.0.0.1:${port0}`;
   const t = await login('p03');
   const year = (await call('GET', '/v1/payrun/preview', t)).body.year;
   await probe.close();
   verifiedDir = verifiedTables(year);
-  app = createApp({ dbFile: join(dir, 'payroll.db'), log: false, sharedDir: verifiedDir });
+  app = createApp({ dbFile: join(dir, 'payroll.db'), log: false, sharedDir: verifiedDir, devKeyFile: true });
   base = `http://127.0.0.1:${await app.listen(0)}`;
 });
 after(async () => { await app?.close(); rmSync(dir, { recursive: true, force: true }); });
@@ -57,7 +57,7 @@ test('SSNs and bank details are sealed at rest', () => {
 });
 
 test('the real tables are unverified, so the real server refuses to finalize', async () => {
-  const real = createApp({ dbFile: join(dir, 'real.db'), log: false });
+  const real = createApp({ dbFile: join(dir, 'real.db'), log: false, devKeyFile: true });
   const port = await real.listen(0);
   const saved = base;
   base = `http://127.0.0.1:${port}`;
@@ -276,13 +276,15 @@ test('import: Gusto-style employees, then YTD and time-off balances mid-year', a
   assert.ok(pv.body.rows[1].problems.some((p) => /SSN/.test(p)));
   const cm = await call('POST', '/v1/import/commit', pay, { kind: 'employees', source: 'gusto', csv });
   assert.equal(cm.body.created, 2);
-  const ana = app.h.get(`SELECT id FROM people WHERE email = 'ana@example.org'`).id;
+  // (Emails are sealed in the database, so they're matched here, not in SQL.)
+  const byEmail = (e) => app.h.all('SELECT id, email FROM people').find((p) => p.email === e).id;
+  const ana = byEmail('ana@example.org');
   const prof = (await call('GET', `/v1/people/${ana}/profile`, pay)).body.profile;
   assert.equal(prof.ssnMasked, '***-**-6780');
   assert.equal(prof.address.line1, '5 Oak St, Apt 2');
   assert.equal(prof.deposit[0].accountLast4, '6655');
   assert.equal(prof.w4.filing, 'married');
-  const ben = app.h.get(`SELECT id FROM people WHERE email = 'ben@example.org'`).id;
+  const ben = byEmail('ben@example.org');
   assert.equal((await call('GET', `/v1/people/${ben}/rates`, pay)).body.rates[0].kind, 'salary');
   const ytd = 'Employee ID,Gross Pay,Federal Income Tax,Social Security,Medicare,State Income Tax,Net Pay\r\nE-77,"$12,000.00",900.00,744.00,174.00,480.00,"9,702.00"\r\n';
   const yc = await call('POST', '/v1/import/commit', pay, { kind: 'ytd', source: 'adp', csv: ytd, year: 2030, asOf: '2030-06-30' });

@@ -18,7 +18,7 @@ before(async () => {
   writeFileSync(join(web, 'assets', 'app-abc123.js'), 'console.log(1)');
   writeFileSync(join(web, 'manifest.webmanifest'), '{"name":"KeaS"}');
   writeFileSync(join(dir, 'secret.txt'), 'outside');
-  app = createApp({ dbFile: join(dir, 'test.db'), webDir: web, log: false });
+  app = createApp({ dbFile: join(dir, 'test.db'), webDir: web, log: false, devKeyFile: true });
   port = await app.listen(0);
   base = `http://127.0.0.1:${port}`;
 });
@@ -135,7 +135,7 @@ test('static: path traversal is impossible', async () => {
 const built = existsSync(join(DEFAULT_WEB_DIR, 'index.html'));
 test('the real built web app is served with the CSP', { skip: built ? false : 'web/dist is missing: run "npm run web:build" to include this check' }, async () => {
   const d = mkdtempSync(join(tmpdir(), 'keas-web-real-'));
-  const real = createApp({ dbFile: join(d, 'test.db'), log: false });
+  const real = createApp({ dbFile: join(d, 'test.db'), log: false, devKeyFile: true });
   const p = await real.listen(0);
   try {
     const r = await fetch(`http://127.0.0.1:${p}/`);
