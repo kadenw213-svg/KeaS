@@ -3,6 +3,7 @@ import { Plus } from 'lucide-react';
 import { useWork, can, money, fmtDay, loadWork } from '../store';
 import { api } from '../api';
 import { act, useLoad, Loading, Page, Table, Tag, FormDialog, statusTone, human, type Field } from '../kit';
+import { toast } from '../ui';
 
 /** Employees: the payroll profile (job, pay rates, raises, tax setup, SSN, address, direct deposit). */
 export function Employees() {
@@ -81,7 +82,10 @@ function Profile({ id, back }: { id: string; back: () => void }) {
   const deptName = (d: string | null) => org?.departments?.find((x: any) => x.id === d)?.name || '—';
   const opt = (list: any[] = [], label = (x: any) => x.name) => list.map((x) => ({ value: x.id, label: label(x) }));
   const save = (path: string) => async (v: any) => {
-    if (await act(api('POST', path, v), 'Saved.')) {
+    // A rate above the current one (or back-dated) comes back as a raise waiting for approval: say so.
+    const r = await act(api('POST', path, v));
+    if (r) toast(r.message || 'Saved.');
+    if (r) {
       setEdit(null);
       reload();
       loadWork();

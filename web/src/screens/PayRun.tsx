@@ -77,9 +77,9 @@ export function PayRun() {
         <Stat label="People" value={totals.people ?? lines.length} />
       </div>
       <div className="pr-row">
-        {!run.finalized && run.needsApproval && !run.approval && (
+        {!run.finalized && run.needsApproval && (!run.approval || run.approval.changedSinceApproval) && (
           <button className="btn" onClick={async () => (await act(api('POST', '/v1/payrun/submit', { periodStart: ps }), 'Sent for approval.')) && reload()}>
-            Send for approval
+            {run.approval?.changedSinceApproval ? 'Send for approval again (the run changed)' : 'Send for approval'}
           </button>
         )}
         {run.approval && <Tag tone={run.approval.status === 'approved' ? 'ok' : 'warn'}>Approval: {human(run.approval.status)}</Tag>}

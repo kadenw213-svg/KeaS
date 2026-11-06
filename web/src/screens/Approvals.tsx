@@ -104,7 +104,9 @@ function List({ scope }: { scope: 'mine' | 'requested' | 'all' }) {
 }
 
 function Chains() {
-  const { people } = useWork();
+  const { people, me } = useWork();
+  // Only the owner changes who approves what (payroll and managers can see the chains).
+  const owner = can(me, 'owner');
   const { data, error, reload } = useLoad<any>('/v1/approval-chains');
   const { data: org } = useLoad<any>('/v1/org-structure');
   const [edit, setEdit] = useState<any | null>(null);
@@ -122,11 +124,15 @@ function Chains() {
   return (
     <>
       <p className="muted">Without a chain, each kind uses its default (shown below). A chain can apply to one department or only above an amount; the most specific one wins.</p>
-      <div className="pr-row">
-        <button className="btn primary" onClick={() => setEdit({ kind: 'time_off' })}>
-          <Plus size={15} /> Add a chain
-        </button>
-      </div>
+      {owner ? (
+        <div className="pr-row">
+          <button className="btn primary" onClick={() => setEdit({ kind: 'time_off' })}>
+            <Plus size={15} /> Add a chain
+          </button>
+        </div>
+      ) : (
+        <p className="muted small">Only the owner changes approval chains.</p>
+      )}
       <Table
         cols={[
           { key: 'kind', label: 'For', render: (c: any) => KIND_LABEL[c.kind] },
@@ -136,7 +142,7 @@ function Chains() {
           { key: 'active', label: 'On', render: (c: any) => (c.active ? <Check size={15} /> : '') }
         ]}
         rows={data.chains}
-        onRow={(c: any) => setEdit(c)}
+        onRow={owner ? (c: any) => setEdit(c) : undefined}
         empty="No chains yet: every kind uses its default."
       />
       <h3 className="work-h2">Defaults</h3>
