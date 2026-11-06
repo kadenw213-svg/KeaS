@@ -320,6 +320,15 @@ test('3 L-f: names are cleaned, and names that pass for Kea or the owner are kep
   assert.equal(cleanText(' A\u200bl\u202eex \u0007 Smith\u2028 '), 'Alex Smith');
   for (const n of ['Kea', 'kea hub', 'Ｋｅａ Support', 'K e a', 'Кеа', 'Hidden', 'H1dden', 'Admin', 'The Kea_Support team', 'KeaS']) assert.ok(isReservedName(n), n);
   for (const n of ['Keaton', 'Mikea Hubert', 'Ana']) assert.ok(!isReservedName(n), n);
+  // Staff words next to "Kea", in either order, with any separators and look-alikes.
+  for (const n of ['Kea Security', 'Kea Moderator', 'Kea Trust and Safety', 'Kea Billing', 'Security Kea', 'Kea-Admin', 'KeaStaff', 'Team of Kea', 'Kea’s Support', 'Official Kea', 'Kea System', 'kea help', 'K e a Hub', 'Kea\u3164Support', 'Ke\u0430 Supp\u043Ert']) assert.ok(isReservedName(n), n);
+  // Armenian, Cherokee, Lisu, small capitals and IPA look-alikes.
+  for (const n of ['\u13E6ea', 'K\u0435\u0251', 'Ke\u0251', '\uA4D7ea', '\u1D0Bea', 'Ke\u0251 Supp\u0585rt']) assert.ok(isReservedName(n), n);
+  for (const n of ['Hub B\u0585ss', 'Hub Bo\u0455s']) assert.ok(isReservedName(n, ['Hub Boss']), n);
+  // "Kea:" anywhere, and a colon before account or security wording.
+  for (const n of ['Kea: hello', 'From Kea: hello', 'kea\uFF1A hi', 'K\u0435a\uA789 hi', 'Notice: account suspended', 'Hi: verify now', 'x\uA789 Security']) assert.ok(isReservedName(n), n);
+  // Ordinary names stay allowed.
+  for (const n of ['Kea Smith', 'Kea Lani', 'Team Rocket', 'Security Guard', 'Support Group', 'Keanu Reeves', 'Dr. Ana: PhD', 'Aram \u0531\u0580\u0561\u0574', 'Maria Jos\u00e9', '\u674e\u5a1c', 'Book Club: Dune']) assert.ok(!isReservedName(n), n);
   const o = await H.person('lf-owner@example.com', 'Kaden Walsh');
   H.hub.h.run("UPDATE accounts SET role = 'owner', totp_enabled = 1 WHERE id = ?", o.id);
   const a = await H.person('lf-a@example.com', 'Plain Name');
