@@ -1,6 +1,7 @@
 // Payroll and HR tables. Columns ending in _enc hold sealed (AES-256-GCM) values; see server/lib/vault.mjs.
 export const PAYROLL_SCHEMA = `
 CREATE TABLE IF NOT EXISTS vault_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS vault_limits (k TEXT PRIMARY KEY, n INTEGER NOT NULL, until INTEGER NOT NULL, at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS vault_users (
   id TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES people(id), email TEXT NOT NULL UNIQUE, hub_sub TEXT,
   local_pw TEXT, created_at TEXT NOT NULL, last_login TEXT
@@ -199,6 +200,8 @@ const ADD_COLUMNS = {
     ['default_allocations', "TEXT NOT NULL DEFAULT '[]'"], ['pii_enc', 'TEXT'], ['holiday_calendar_id', 'TEXT'],
     ['ytd_year', 'INTEGER'], ['legal_name', 'TEXT'],
   ],
+  // What an approval was given for (a pay run: a hash of its lines and totals); acting on something else is refused.
+  approval_requests: [['bind_hash', 'TEXT']],
 };
 
 export function migratePayroll(db) {
@@ -210,40 +213,51 @@ export function migratePayroll(db) {
 }
 
 /**
- * Values sealed as they're written: pay amounts, birthdates and personal emails. A trigger seals each one on insert or
- * update (keas_seal, with the vault's key), and the database layer opens them as they're read, so the code using them
- * sees plain numbers and text. Nothing filters or sums these in SQL. [table, columns]
+ * Every sealed column, by table: [table, row key columns, sealed columns]. A trigger seals each value as it's written
+ * (keas_seal, with the vault's key and the value's place as AES-GCM additional data), and the database layer opens
+ * them as they're read (db.mjs), so the code using them sees plain numbers and text. Nothing filters, sorts or sums
+ * these in SQL. A row's key must never change once the row is written.
  */
-export const SEALED_VALUES = [
-  ['people', ['pay_rate_cents', 'birthdate', 'email', 'ytd_wages_cents']],
-  ['pay_rates', ['rate_cents']],
-  ['raises', ['old_rate_cents', 'new_rate_cents', 'retro_cents']],
-  ['offers', ['rate_cents']],
-  ['payrun_lines', ['gross', 'net', 'withheld', 'employer_total', 'detail']],
+export const SEALED = [
+  ['people', ['id'], ['pay_rate_cents', 'birthdate', 'email', 'ytd_wages_cents', 'deposit', 'pii_enc', 'legal_name']],
+  ['orgs', ['id'], ['bank']],
+  ['legal_entities', ['id'], ['bank_enc']],
+  ['pay_rates', ['id'], ['rate_cents']],
+  ['raises', ['id'], ['old_rate_cents', 'new_rate_cents', 'retro_cents']],
+  ['offers', ['id'], ['rate_cents', 'body']],
+  ['extra_earnings', ['id'], ['cents', 'detail']],
+  ['payruns', ['id'], ['totals']],
+  ['payrun_lines', ['run_id', 'person_id'], ['gross', 'net', 'withheld', 'employer_total', 'detail']],
+  ['ytd_imports', ['id'], ['cents']],
+  ['contractor_payments', ['id'], ['cents']],
+  ['aca_months', ['person_id', 'year', 'month'], ['offer_code', 'contribution_cents', 'safe_harbor']],
+  ['form_submissions', ['id'], ['data_enc']],
+  ['i9_records', ['person_id'], ['section2_enc']],
+  ['documents', ['id'], ['content_enc']],
+  ['audit_log', ['id'], ['detail']],
+  ['approval_requests', ['id'], ['title', 'detail', 'amount_cents']],
+  ['time_off_requests', ['id'], ['note']],
+  ['leave_cases', ['id'], ['reason', 'notes']],
+  ['leave_usage', ['id'], ['note']],
+  ['candidates', ['id'], ['name', 'email', 'phone', 'answers', 'notes']],
+  ['interviews', ['id'], ['feedback']],
+  ['reviews', ['id'], ['self_answers', 'manager_answers']],
+  ['checkins', ['id'], ['notes', 'private_notes']],
 ];
-/** Column names whose sealed values are opened when read (a plain value in a same-named column is left alone). */
-export const SEALED_VALUE_NAMES = [...new Set(SEALED_VALUES.flatMap(([, cols]) => cols))];
-const notSealed = (v) => `${v} IS NOT NULL AND NOT (typeof(${v}) = 'text' AND substr(${v}, 1, 3) = 'v1.')`;
-/** The triggers that seal SEALED_VALUES as they're written. */
-export function sealTriggersSql() {
-  const out = [];
-  for (const [table, cols] of SEALED_VALUES) for (const col of cols) {
-    const body = `BEGIN UPDATE ${table} SET ${col} = keas_seal(NEW.${col}) WHERE rowid = NEW.rowid; END;`;
-    out.push(`CREATE TRIGGER IF NOT EXISTS seal_${table}_${col}_ins AFTER INSERT ON ${table} WHEN ${notSealed(`NEW.${col}`)} ${body}`);
-    out.push(`CREATE TRIGGER IF NOT EXISTS seal_${table}_${col}_upd AFTER UPDATE OF ${col} ON ${table} WHEN ${notSealed(`NEW.${col}`)} ${body}`);
+/** Tables whose writes go on while the vault is locked (sign-in and lock events): their sealed values are dropped then. */
+export const SEALED_SOFT_TABLES = ['audit_log'];
+/** [table, keys, column] for every sealed column. */
+export const SEALED_COLUMNS = SEALED.flatMap(([table, keys, cols]) => cols.map((col) => [table, keys, col]));
+
+/** The triggers that seal SEALED columns as they're written (any older sealing triggers are dropped first). */
+export function sealTriggersSql(existing = []) {
+  const out = existing.filter((n) => /^seal\d?_[A-Za-z0-9_]+$/.test(n)).map((n) => `DROP TRIGGER IF EXISTS ${n};`);
+  for (const [table, keys, col] of SEALED_COLUMNS) {
+    const args = `'${table}', '${col}', NEW.${col}, ${keys.map((k) => `NEW.${k}`).join(', ')}`;
+    const when = `NEW.${col} IS NOT NULL AND keas_needs_seal(${args})`;
+    const body = `BEGIN UPDATE ${table} SET ${col} = keas_seal(${args}) WHERE rowid = NEW.rowid; END;`;
+    out.push(`CREATE TRIGGER seal2_${table}_${col}_ins AFTER INSERT ON ${table} WHEN ${when} ${body}`);
+    out.push(`CREATE TRIGGER seal2_${table}_${col}_upd AFTER UPDATE OF ${col} ON ${table} WHEN ${when} ${body}`);
   }
   return out.join('\n');
 }
-
-/** Columns the code seals itself (JSON or text blobs). [table, key column, sealed column] */
-export const SEALED_TEXT_COLUMNS = [
-  ['people', 'id', 'deposit'],
-  ['people', 'id', 'pii_enc'],
-  ['orgs', 'id', 'bank'],
-  ['legal_entities', 'id', 'bank_enc'],
-  ['form_submissions', 'id', 'data_enc'],
-  ['i9_records', 'person_id', 'section2_enc'],
-  ['documents', 'id', 'content_enc'],
-];
-/** Every sealed column, so changing the passphrase can re-encrypt all of them. [table, key column, sealed column] */
-export const SEALED_COLUMNS = [...SEALED_TEXT_COLUMNS, ...SEALED_VALUES.flatMap(([table, cols]) => cols.map((col) => [table, 'rowid', col]))];

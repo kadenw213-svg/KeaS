@@ -100,7 +100,13 @@ export function registerYearEnd(c) {
     const T = c.tablesFor(org.state, year);
     const threshold = T.us?.form1099?.necThresholdCents ?? null;
     const defEnt = h.get('SELECT * FROM legal_entities WHERE org_id = ? ORDER BY is_default DESC LIMIT 1', org.id);
-    const rows = h.all(`SELECT person_id, SUM(cents) AS total, COUNT(*) AS n FROM contractor_payments WHERE org_id = ? AND substr(date,1,4) = ? GROUP BY person_id`, org.id, String(year)).map((r) => {
+    // (Amounts are sealed, so they're added up here rather than in SQL.)
+    const sums = new Map();
+    for (const r of h.all('SELECT id, person_id, cents FROM contractor_payments WHERE org_id = ? AND substr(date,1,4) = ?', org.id, String(year))) {
+      const t = sums.get(r.person_id) || { person_id: r.person_id, total: 0, n: 0 };
+      t.total += Number(r.cents) || 0; t.n++; sums.set(r.person_id, t);
+    }
+    const rows = [...sums.values()].map((r) => {
       const p = c.getPerson(r.person_id, org.id), pii = vault.openJson(p.piiRaw) || {};
       return { personId: p.id, name: p.legalName || p.name, tin: pii.ssn || null, address: pii.address || null, box1: r.total, payments: r.n, meetsThreshold: threshold == null ? null : r.total >= threshold };
     });

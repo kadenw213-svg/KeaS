@@ -46,14 +46,16 @@ before(async () => {
 after(async () => { await app?.close(); rmSync(dir, { recursive: true, force: true }); });
 
 test('SSNs and bank details are sealed at rest', () => {
-  const rows = app.h.all('SELECT deposit, pii_enc FROM people');
+  // (app.h.db reads the file as it is; app.h opens sealed values.)
+  const rows = app.h.db.prepare('SELECT deposit, pii_enc FROM people').all();
   assert.ok(rows.length > 5);
   for (const r of rows) {
-    assert.match(r.deposit, /^v1\./);
-    assert.match(r.pii_enc, /^v1\./);
+    assert.match(r.deposit, /^v2\./);
+    assert.match(r.pii_enc, /^v2\./);
     assert.ok(!r.pii_enc.includes('98765'));
   }
-  assert.match(app.h.get('SELECT bank FROM orgs').bank, /^v1\./);
+  assert.match(app.h.db.prepare('SELECT bank FROM orgs').get().bank, /^v2\./);
+  assert.match(app.h.get('SELECT deposit FROM people WHERE id = ?', 'p04').deposit, /"routing"/, 'the app reads them as usual');
 });
 
 test('the real tables are unverified, so the real server refuses to finalize', async () => {
@@ -312,8 +314,8 @@ test('documents: sealed file cabinet, e-sign, retention and legal hold', async (
   const content = Buffer.from('%PDF-1.4 signed handbook page');
   const up = await call('POST', '/v1/documents', pay, { personId: 'p05', category: 'tax_form', title: 'Old W-4', filename: 'w4.pdf', mime: 'application/pdf', contentBase64: content.toString('base64'), needsSignature: true });
   assert.equal(up.status, 201);
-  const raw = app.h.get('SELECT content_enc FROM documents WHERE id = ?', up.body.document.id).content_enc;
-  assert.match(raw, /^v1\./);
+  const raw = app.h.db.prepare('SELECT content_enc FROM documents WHERE id = ?').get(up.body.document.id).content_enc;
+  assert.match(raw, /^v2\./);
   const dl = await call('GET', `/v1/documents/${up.body.document.id}/download`, pay);
   assert.deepEqual(dl.body, content);
   assert.equal((await call('GET', `/v1/documents/${up.body.document.id}/download`, await login('p04'))).status, 403);

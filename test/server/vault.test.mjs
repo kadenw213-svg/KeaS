@@ -12,7 +12,7 @@ import { createApp } from '../../server/index.mjs';
 import { openDb } from '../../server/db.mjs';
 import { makeVault } from '../../server/payroll/vaultstate.mjs';
 import { loadOrCreateKey, signToken } from '../../hub/lib/tokens.mjs';
-import { createVaultMeta, openVault, seal, unseal, canonical, isSealed } from '../../server/lib/vault.mjs';
+import { createVaultMeta, createLegacyVaultMeta, openVault, seal, unseal, sealV1, sealContext, canonical, isSealed, VaultDamaged, KDF_MIN } from '../../server/lib/vault.mjs';
 import { parseCsv, toCsv } from '../../server/lib/csv.mjs';
 import { simplePdf } from '../../server/lib/pdf.mjs';
 import { apportion } from '../../server/payroll/run.mjs';
@@ -78,16 +78,27 @@ function rawPost(path, body, headers) {
 }
 const signin = (extra = {}) => call('POST', '/v1/vault/signin', null, { email: ACCOUNT.email, password: ACCOUNT.password, passphrase: PASS, ...extra });
 
-test('crypto: AES-256-GCM sealing, wrong passphrase, tampering', () => {
+test('crypto: AES-256-GCM sealing bound to its place, wrong passphrase, tampering, KDF bounds', () => {
   const { key: k, meta } = createVaultMeta('a long vault passphrase');
-  assert.ok(openVault('a long vault passphrase', meta));
+  assert.deepEqual(meta.kdf, { N: 2 ** 17, r: 8, p: 1 }, 'scrypt N = 2^17');
+  assert.ok(openVault('a long vault passphrase', meta).key.equals(k));
   assert.equal(openVault('a long vault passphrasE', meta), null);
-  const s = seal(k, '123-45-6789');
-  assert.equal(unseal(k, s), '123-45-6789');
+  const here = sealContext('people', 'deposit', ['p1']);
+  const s = seal(k, '123-45-6789', here);
+  assert.equal(unseal(k, s, here), '123-45-6789');
+  assert.throws(() => unseal(k, s, sealContext('people', 'deposit', ['p2'])), 'moved to another row: refused');
+  assert.throws(() => unseal(k, s, sealContext('people', 'pii_enc', ['p1'])), 'moved to another column: refused');
+  assert.throws(() => unseal(k, s, sealContext('offers', 'deposit', ['p1'])), 'moved to another table: refused');
+  assert.throws(() => seal(k, 'x'), /context/, 'nothing is sealed without its place');
   const parts = s.split('.');
   parts[3] = Buffer.from('xxxx').toString('base64url');
-  assert.throws(() => unseal(k, parts.join('.')));
+  assert.throws(() => unseal(k, parts.join('.'), here));
   assert.throws(() => createVaultMeta('short'), /12 characters/);
+  // Stored KDF parameters are checked before use: a vault edited to make guessing cheap doesn't open.
+  for (const kdf of [{ N: 2 ** 10, r: 8, p: 1 }, { N: 2 ** 15 + 2, r: 8, p: 1 }, { N: 2 ** 17, r: 1, p: 1 }, { N: 2 ** 17, r: 8, p: 0 }, { N: 2 ** 30, r: 8, p: 1 }, null, { N: '131072', r: 8, p: 1 }]) {
+    assert.throws(() => openVault('a long vault passphrase', { ...meta, kdf }), VaultDamaged, JSON.stringify(kdf));
+  }
+  assert.throws(() => openVault('a long vault passphrase', { ...meta, salt: 'AAAA' }), VaultDamaged, 'a short salt');
   assert.equal(canonical({ b: 1, a: [2, { d: 1, c: 2 }] }), '{"a":[2,{"c":2,"d":1}],"b":1}');
 });
 
@@ -286,33 +297,70 @@ test('M3: pay amounts, birthdates and emails are sealed in the database file; th
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
-test('M3: rows written before sealing are sealed when the vault opens, and old plaintext is cleared from the file', () => {
+test('M3/L5: a vault from an older KeaS is upgraded at unlock: new key (N = 2^17), values bound to their rows, plaintext columns sealed, old pages cleared', () => {
   const d = mkdtempSync(join(tmpdir(), 'keas-vault-mig-'));
   try {
     const file = join(d, 'old.db');
     let h = openDb(file);
-    let v = makeVault(h);
-    v.create(PASS);
-    h.run(`INSERT INTO orgs (id,name,state,tz,pay_period_anchor) VALUES ('o1','Org','CO','America/Denver','2030-01-06')`);
-    // As an older KeaS wrote them: plain values (the sealing triggers didn't exist yet).
-    for (const r of h.db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'seal_%'").all()) h.db.exec(`DROP TRIGGER ${r.name}`);
-    h.run(`INSERT INTO people (id,org_id,name,email,birthdate,pay_rate_cents) VALUES ('p1','o1','Old Row','old.row@example.net','1985-12-24',2500)`);
-    h.run(`INSERT INTO pay_rates (id,person_id,kind,rate_cents,effective_from,created_at) VALUES ('r1','p1','hourly',2500,'2030-01-01','2030-01-01')`);
+    // As an older KeaS wrote it: the key straight from the passphrase (N = 2^15), v1 values with no place bound to
+    // them, and columns that weren't sealed at all (the sealing triggers didn't exist yet).
+    for (const r of h.db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'seal%'").all()) h.db.exec(`DROP TRIGGER ${r.name}`);
+    const old = createLegacyVaultMeta(PASS);
+    const v1 = (x) => sealV1(old.key, JSON.stringify(x));
+    h.run("INSERT INTO vault_meta (k, v) VALUES ('crypto', ?)", JSON.stringify(old.meta));
+    h.run(`INSERT INTO orgs (id,name,state,tz,pay_period_anchor,bank) VALUES ('o1','Org','CO','America/Denver','2030-01-06',?)`, v1({ originRouting: '990000013' }));
+    h.run(`INSERT INTO people (id,org_id,name,email,birthdate,pay_rate_cents,deposit,legal_name) VALUES ('p1','o1','Old Row',?,'1985-12-24',2500,?,'Oldrow Legalname')`, v1('old.row@example.net'), v1({ routing: '990000013', account: '55554444333' }));
+    h.run(`INSERT INTO pay_rates (id,person_id,kind,rate_cents,effective_from,created_at) VALUES ('r1','p1','hourly',?,'2030-01-01','2030-01-01')`, v1(2500));
+    h.run(`INSERT INTO leave_cases (id,org_id,person_id,law,reason,start_date,entitlement_hours,notes,created_at) VALUES ('lc1','o1','p1','fmla','serious_health','2030-01-02',480,'CANCERDIAGNOSIS chemotherapy','2030-01-01')`);
+    h.run(`INSERT INTO audit_log (org_id,actor,action,target,detail,at) VALUES ('o1','p1','rate_add','p1','{"rateCents":777123}','2030-01-01')`);
     h.close();
     h = openDb(file);
-    v = makeVault(h);
+    const v = makeVault(h);
     assert.equal(v.unlock(PASS), true);
+    const meta = JSON.parse(h.get("SELECT v FROM vault_meta WHERE k = 'crypto'").v);
+    assert.equal(meta.v, 2);
+    assert.equal(meta.kdf.N, 2 ** 17);
     const p = h.get(`SELECT * FROM people WHERE id = 'p1'`);
-    assert.deepEqual([p.email, p.birthdate, p.pay_rate_cents], ['old.row@example.net', '1985-12-24', 2500]);
+    assert.deepEqual([p.email, p.birthdate, p.pay_rate_cents, p.legal_name], ['old.row@example.net', '1985-12-24', 2500, 'Oldrow Legalname']);
+    assert.equal(v.openJson(p.deposit).account, '55554444333');
+    assert.equal(v.openJson(h.get(`SELECT bank FROM orgs WHERE id = 'o1'`).bank).originRouting, '990000013');
     assert.equal(h.get(`SELECT rate_cents FROM pay_rates WHERE id = 'r1'`).rate_cents, 2500);
-    const raw = h.db.prepare(`SELECT email, birthdate, pay_rate_cents FROM people WHERE id = 'p1'`).get();
-    for (const x of Object.values(raw)) assert.ok(isSealed(x));
+    assert.equal(h.get(`SELECT notes FROM leave_cases WHERE id = 'lc1'`).notes, 'CANCERDIAGNOSIS chemotherapy');
+    const raw = h.db.prepare(`SELECT email, birthdate, pay_rate_cents, deposit, legal_name FROM people WHERE id = 'p1'`).get();
+    for (const x of Object.values(raw)) assert.ok(isSealed(x), String(x));
+    assert.ok(isSealed(h.db.prepare('SELECT detail FROM audit_log').get().detail));
     v.lock();
     assert.throws(() => h.get(`SELECT * FROM people WHERE id = 'p1'`), /locked/, 'locked: sealed values can’t be read');
     assert.throws(() => h.run(`UPDATE people SET birthdate = '2000-01-01' WHERE id = 'p1'`), /locked/, 'locked: nothing can be written unsealed');
+    assert.equal(v.unlock('the wrong passphrase'), false);
+    assert.equal(v.unlock(PASS), true, 'the upgraded vault opens with the same passphrase');
+    assert.equal(h.get(`SELECT pay_rate_cents FROM people WHERE id = 'p1'`).pay_rate_cents, 2500);
     h.close();
     const bytes = Buffer.concat([file, file + '-wal'].filter(existsSync).map((f) => readFileSync(f)));
-    for (const needle of ['old.row@example.net', '1985-12-24']) assert.equal(bytes.indexOf(Buffer.from(needle)), -1, needle);
+    for (const needle of ['old.row@example.net', '1985-12-24', 'Oldrow Legalname', 'CANCERDIAGNOSIS', '777123', '55554444333']) assert.equal(bytes.indexOf(Buffer.from(needle)), -1, needle);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('L5: a vault whose stored KDF is weaker than today’s is rewrapped at unlock (same data, N = 2^17)', () => {
+  const d = mkdtempSync(join(tmpdir(), 'keas-vault-kdf-'));
+  try {
+    const file = join(d, 'v.db');
+    let h = openDb(file);
+    let v = makeVault(h);
+    v.create(PASS);
+    h.run(`INSERT INTO orgs (id,name,state,tz,pay_period_anchor) VALUES ('o1','Org','CO','America/Denver','2030-01-06')`);
+    h.run(`INSERT INTO people (id,org_id,name,pay_rate_cents) VALUES ('p1','o1','A',3100)`);
+    // The same data key, wrapped the weaker way an older version of this format might have.
+    const dataKey = openVault(PASS, JSON.parse(h.get("SELECT v FROM vault_meta WHERE k = 'crypto'").v)).key;
+    h.run("UPDATE vault_meta SET v = ? WHERE k = 'crypto'", JSON.stringify(createVaultMeta(PASS, { kdf: KDF_MIN, dataKey }).meta));
+    v.lock(); h.close();
+    h = openDb(file); v = makeVault(h);
+    assert.equal(v.unlock(PASS), true);
+    assert.equal(JSON.parse(h.get("SELECT v FROM vault_meta WHERE k = 'crypto'").v).kdf.N, 2 ** 17);
+    assert.equal(h.get(`SELECT pay_rate_cents FROM people WHERE id = 'p1'`).pay_rate_cents, 3100);
+    v.lock();
+    assert.equal(v.unlock(PASS), true);
+    h.close();
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 

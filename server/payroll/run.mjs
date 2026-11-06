@@ -379,7 +379,8 @@ export function registerRun(c) {
       add('gross', d.gross); add('net', d.net);
       for (const t of d.taxes || []) add(t.code, t.cents);
     }
-    for (const r of h.all('SELECT code, SUM(cents) AS c FROM ytd_imports WHERE person_id = ? AND year = ? GROUP BY code', personId, Number(year))) add(r.code, r.c);
+    // (Amounts are sealed, so they're added up here rather than in SQL.)
+    for (const r of h.all('SELECT id, code, cents FROM ytd_imports WHERE person_id = ? AND year = ?', personId, Number(year))) add(r.code, Number(r.cents) || 0);
     if (!finalized) { add('gross', l.gross); add('net', l.net); for (const t of l.taxes) add(t.code, t.cents); }
     const person = c.getPerson(personId, org.id);
     return { org: { name: org.name }, person: { id: person.id, name: person.name, employeeNumber: person.employeeNumber }, period, payDate, finalized, line: l, ytd, balances: l.balances || [] };

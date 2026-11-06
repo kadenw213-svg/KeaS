@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { openDb, DEFAULT_DB, rowToPerson, rowToOrg, rowToShift, rowToPosition, rowToCertType, rowToPunch, rowToRequest, rowToSwap } from './db.mjs';
 import { seed } from './seed.mjs';
 import { mergeRules, checkAssignment, timecard, unforceable, isBlocked } from './lib/rules.mjs';
-import { makeVault, openDevVault, VaultLocked } from './payroll/vaultstate.mjs';
+import { makeVault, openDevVault, VaultLocked, VaultDamaged, SealError } from './payroll/vaultstate.mjs';
 import { makeHubClient, checkHubUrl } from './payroll/hub.mjs';
 import { makeTables } from './payroll/run.mjs';
 import { makeApprovals } from './payroll/approvals.mjs';
@@ -562,6 +562,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     } catch (e) {
       if (e instanceof HttpError) { status = e.status; payload = { error: e.message, ...(e.extra || {}) }; }
       else if (e instanceof VaultLocked) { status = 423; payload = { error: e.message, locked: true }; }
+      else if (e instanceof SealError || e instanceof VaultDamaged) { status = 500; payload = { error: e.message, damaged: true }; console.error(e.message); }
       else { status = 500; payload = { error: 'internal error' }; console.error(e); }
     }
     const text = JSON.stringify(payload ?? {});

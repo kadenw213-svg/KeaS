@@ -33,17 +33,19 @@ export function registerDocuments(c) {
     const id = uid('doc');
     h.run(`INSERT INTO documents (id,org_id,person_id,category,title,filename,mime,size,sha256,content_enc,uploaded_by,created_at,needs_signature) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       id, org.id, personId, V.enum(category, 'category', DOC_CATEGORIES), V.str(title, 'title', { min: 1, max: 160 }), V.str(filename, 'filename', { min: 1, max: 200 }).replace(/[\\/:*?"<>|]/g, '_'),
-      /^[\w.+-]+\/[\w.+-]+$/.test(mime || '') ? mime : 'application/octet-stream', buf.length, createHash('sha256').update(buf).digest('hex'), vault.seal(buf.toString('base64')), me.id, iso(now()), needsSignature ? 1 : 0);
+      /^[\w.+-]+\/[\w.+-]+$/.test(mime || '') ? mime : 'application/octet-stream', buf.length, createHash('sha256').update(buf).digest('hex'), vault.sealJson(buf.toString('base64')), me.id, iso(now()), needsSignature ? 1 : 0);
     audit(org.id, me.id, 'document_upload', id, { personId, category, size: buf.length });
     return id;
   }
   c.storeDocument = store;
-  const getDoc = (id, orgId) => { const d = h.get('SELECT * FROM documents WHERE id = ? AND org_id = ?', id, orgId); if (!d) throw new HttpError(404, 'document not found'); return d; };
+  // Lists and checks read every column but the (sealed) file itself, so a list never opens every file.
+  const META = 'id, org_id, person_id, category, title, filename, mime, size, sha256, uploaded_by, created_at, retain_until, legal_hold, signature_id, needs_signature';
+  const getDoc = (id, orgId, { content = false } = {}) => { const d = h.get(`SELECT ${content ? '*' : META} FROM documents WHERE id = ? AND org_id = ?`, id, orgId); if (!d) throw new HttpError(404, 'document not found'); return d; };
 
   route('GET', '/v1/documents', ({ me, org, query }) => {
     const personId = query.personId || null;
     if (personId !== me.id) need(me, 'payroll');
-    const rows = personId ? h.all('SELECT * FROM documents WHERE org_id = ? AND person_id = ? ORDER BY created_at DESC', org.id, personId) : h.all('SELECT * FROM documents WHERE org_id = ? ORDER BY created_at DESC LIMIT 1000', org.id);
+    const rows = personId ? h.all(`SELECT ${META} FROM documents WHERE org_id = ? AND person_id = ? ORDER BY created_at DESC`, org.id, personId) : h.all(`SELECT ${META} FROM documents WHERE org_id = ? ORDER BY created_at DESC LIMIT 1000`, org.id);
     return { documents: rows.map((d) => out(d, org.id)), categories: DOC_CATEGORIES };
   });
   route('POST', '/v1/documents', ({ me, org, body }) => {
@@ -54,7 +56,7 @@ export function registerDocuments(c) {
     return { status: 201, body: { document: out(getDoc(id, org.id), org.id) } };
   }, { maxBody: 12 * 1024 * 1024 });
   route('GET', '/v1/documents/:id/download', ({ me, org, params }) => {
-    const d = getDoc(params.id, org.id);
+    const d = getDoc(params.id, org.id, { content: true });
     if (d.person_id !== me.id) need(me, 'payroll');
     audit(org.id, me.id, 'document_download', d.id, null);
     return { raw: { type: d.mime, filename: d.filename, body: Buffer.from(vault.openJson(d.content_enc), 'base64') } };
@@ -79,7 +81,7 @@ export function registerDocuments(c) {
   route('GET', '/v1/documents/purge-due', ({ me, org }) => {
     need(me, 'payroll');
     const t = today(org);
-    return { documents: h.all('SELECT * FROM documents WHERE org_id = ? AND legal_hold = 0', org.id).map((d) => out(d, org.id)).filter((d) => d.retainUntil && d.retainUntil < t) };
+    return { documents: h.all(`SELECT ${META} FROM documents WHERE org_id = ? AND legal_hold = 0`, org.id).map((d) => out(d, org.id)).filter((d) => d.retainUntil && d.retainUntil < t) };
   });
   route('POST', '/v1/documents/purge', ({ me, org, body }) => {
     need(me, 'owner', 'payroll');
@@ -87,7 +89,7 @@ export function registerDocuments(c) {
     const ids = Array.isArray(body.ids) ? body.ids.slice(0, 1000) : [];
     let n = 0;
     for (const id of ids) {
-      const d = h.get('SELECT * FROM documents WHERE id = ? AND org_id = ?', id, org.id);
+      const d = h.get(`SELECT ${META} FROM documents WHERE id = ? AND org_id = ?`, id, org.id);
       const until = d && retainUntil(d, org.id);
       if (!d || d.legal_hold || !until || until >= t) continue;
       h.run('DELETE FROM documents WHERE id = ?', id);

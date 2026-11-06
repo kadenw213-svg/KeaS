@@ -222,7 +222,8 @@ export function registerLeave(c) {
       if (r.status === 'pending' && r.approval_id) { const a = h.get('SELECT status FROM approval_requests WHERE id = ?', r.approval_id); if (a?.status === 'pending') h.run(`UPDATE approval_requests SET status = 'cancelled', decided_at = ? WHERE id = ?`, iso(now()), r.approval_id); }
       if (r.status === 'approved') {
         h.run(`INSERT OR IGNORE INTO pto_ledger (person_id,policy_id,date,hours,kind,ref,note,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)`, r.person_id, r.policy_id, r.start_date, r.hours, 'adjust', `tor-cancel:${r.id}`, 'Time off cancelled', me.id, iso(now()));
-        h.run('DELETE FROM leave_usage WHERE note = ?', `tor:${r.id}`);
+        // (Notes are sealed: find the usage this request added by reading them.)
+        if (r.leave_case_id) for (const u of h.all('SELECT id, note FROM leave_usage WHERE case_id = ?', r.leave_case_id)) if (u.note === `tor:${r.id}`) h.run('DELETE FROM leave_usage WHERE id = ?', u.id);
       }
       h.run(`UPDATE time_off_requests SET status = 'cancelled' WHERE id = ?`, r.id);
     });

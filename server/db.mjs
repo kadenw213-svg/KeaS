@@ -3,8 +3,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { migratePayroll, sealTriggersSql, SEALED_VALUE_NAMES } from './payroll/schema.mjs';
-import { isSealed } from './lib/vault.mjs';
+import { migratePayroll, sealTriggersSql, SEALED_COLUMNS, SEALED_SOFT_TABLES } from './payroll/schema.mjs';
+import { isSealed, sealContext, SealError } from './lib/vault.mjs';
 import { VaultLocked } from './payroll/vaultstate.mjs';
 
 export const DEFAULT_DB = join(dirname(fileURLToPath(import.meta.url)), 'data', 'demo.db');
@@ -71,22 +71,71 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 `;
 
+const SEALED_BY_COLUMN = new Map(SEALED_COLUMNS.map(([table, keys, col]) => [`${table}.${col}`, { table, keys, col }]));
+
 export function openDb(file = DEFAULT_DB) {
   if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });
   const db = new DatabaseSync(file);
   // secure_delete: overwritten and deleted values are zeroed in the file, so a sealed value leaves no plaintext behind.
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 3000; PRAGMA secure_delete = ON;');
-  // Pay amounts, birthdates and emails are sealed as they're written (triggers call keas_seal) and opened as they're
-  // read (openRow), with the vault's key, which the vault hands over when it's unlocked (setSealer).
-  let sealer = null;
+  // Sealed columns (schema.mjs SEALED) are sealed as they're written (triggers call keas_seal) and opened as they're
+  // read (openRow), with the vault's key, which the vault hands over when it's unlocked (setSealer). Each value is
+  // bound to its table, column and row. raw: the vault's own re-encryption writes values that are already sealed.
+  let sealer = null, raw = false;
   const needSealer = () => { if (!sealer) throw new VaultLocked(); return sealer; };
-  db.function('keas_seal', { deterministic: false }, (v) => (v == null ? null : needSealer().seal(v)));
+  const soft = (table) => SEALED_SOFT_TABLES.includes(table);
+  db.function('keas_needs_seal', { deterministic: false, varargs: true }, (table, col, v, ...keys) => {
+    if (raw || v == null) return 0;
+    if (!sealer) { if (soft(table)) return 1; throw new VaultLocked(); }
+    if (!isSealed(v)) return 1;
+    try { sealer.open(v, sealContext(table, col, keys)); return 0; } catch { return 1; }
+  });
+  db.function('keas_seal', { deterministic: false, varargs: true }, (table, col, v, ...keys) => {
+    if (v == null) return null;
+    if (!sealer && soft(table)) return null; // e.g. the audit entry for locking the vault: its detail isn't kept
+    return needSealer().seal(v, sealContext(table, col, keys));
+  });
   db.exec(SCHEMA);
   migratePayroll(db);
-  db.exec(sealTriggersSql());
-  const openRow = (r) => {
-    if (!r) return r;
-    for (const k of SEALED_VALUE_NAMES) if (isSealed(r[k])) r[k] = needSealer().open(r[k]);
+  db.exec(sealTriggersSql(db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'seal%'").all().map((r) => r.name)));
+
+  // How to open each statement's sealed columns: where each result column comes from (node:sqlite columns()), and
+  // which result columns hold that row's key. Without the key in the result, the row is found by its sealed value.
+  const plans = new Map();
+  const planOf = (sql, stmt) => {
+    let plan = plans.get(sql);
+    if (plan) return plan;
+    const byName = new Map();
+    for (const c of stmt.columns()) byName.set(c.name, c); // a later column with the same name wins, as in the row
+    plan = [];
+    for (const [name, c] of byName) {
+      if (!c.table) { plan.push({ name, expr: true }); continue; }
+      const spec = SEALED_BY_COLUMN.get(`${c.table}.${c.column}`);
+      if (!spec) continue;
+      const keyNames = spec.keys.map((k) => [...byName].find(([, c2]) => c2.table === spec.table && c2.column === k)?.[0] ?? null);
+      plan.push({ name, spec, keyNames: keyNames.every((n) => n != null) ? keyNames : null });
+    }
+    plans.set(sql, plan);
+    return plan;
+  };
+  /** The row key of the only row holding this sealed value (a copied value is in two rows: refused). */
+  const locate = (spec, v) => {
+    const rows = db.prepare(`SELECT ${spec.keys.join(', ')} FROM ${spec.table} WHERE ${spec.col} = ? LIMIT 2`).all(v);
+    if (rows.length !== 1) throw new SealError(`${spec.table}.${spec.col}`, rows.length ? 'appears in more than one row' : 'isn’t where it was read from');
+    return spec.keys.map((k) => rows[0][k]);
+  };
+  const openRow = (plan, r) => {
+    if (!r || !plan.length) return r;
+    for (const p of plan) {
+      const v = r[p.name];
+      if (v == null) continue;
+      if (p.expr) { if (isSealed(v)) throw new SealError(p.name, 'was read without its column'); continue; }
+      const where = `${p.spec.table}.${p.spec.col}`;
+      if (!isSealed(v)) throw new SealError(where, 'isn’t sealed');
+      const keys = p.keyNames ? p.keyNames.map((n) => r[n]) : locate(p.spec, v);
+      const s = needSealer();
+      try { r[p.name] = s.open(v, sealContext(p.spec.table, p.spec.col, keys)); } catch (e) { if (e instanceof VaultLocked) throw e; throw new SealError(where, 'doesn’t belong to this row'); }
+    }
     return r;
   };
   const cache = new Map();
@@ -94,11 +143,13 @@ export function openDb(file = DEFAULT_DB) {
   const st = (sql) => { let s = cache.get(sql); if (!s) { s = db.prepare(sql); cache.set(sql, s); } return s; };
   return {
     db,
-    all: (sql, ...p) => st(sql).all(...p).map(openRow),
-    get: (sql, ...p) => openRow(st(sql).get(...p)),
+    all: (sql, ...p) => { const s = st(sql), plan = planOf(sql, s); return s.all(...p).map((r) => openRow(plan, r)); },
+    get: (sql, ...p) => { const s = st(sql); return openRow(planOf(sql, s), s.get(...p)); },
     run: (sql, ...p) => st(sql).run(...p),
-    /** { seal(value) -> sealed text, open(sealed) -> value } while the vault is open; null when it's locked. */
+    /** { seal(value, ctx) -> sealed text, open(sealed, ctx) -> value } while the vault is open; null when it's locked. */
     setSealer(s) { sealer = s; },
+    /** Runs fn with the sealing triggers off: fn writes values that are already sealed (re-encryption, upgrades). */
+    rawWrites(fn) { const was = raw; raw = true; try { return fn(); } finally { raw = was; } },
     tx(fn) {
       // Nested calls join the outer transaction.
       if (depth > 0) { depth++; try { return fn(); } finally { depth--; } }
