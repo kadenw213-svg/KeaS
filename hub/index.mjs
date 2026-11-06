@@ -29,6 +29,7 @@ import { Windows, Buckets, failures } from './lib/limiter.mjs';
 import { Busy } from './lib/hashpool.mjs';
 import { hashStats } from './lib/passwords.mjs';
 import { createHubLog } from './lib/hublog.mjs';
+import { FLOW_DEFAULTS, jsonParts } from './lib/flow.mjs';
 import { clientAddress, ipBucket, isLoopback } from './lib/clientip.mjs';
 import { scoreAnswer, capped, levelOf, weekStart, dayKey, streak } from './lib/study.mjs';
 import { mountOrgs } from './org/routes.mjs';
@@ -119,21 +120,30 @@ function sameOrigin(req, secure) {
  * Reads a request body of at most `max` bytes. A body announced (Content-Length) or found to be bigger is refused
  * without reading more of it: the answer goes out with Connection: close (handleApi), so the rest is never taken in.
  */
-function readRaw(req, max, message = 'Request too large.') {
+function readRaw(req, max, message = 'Request too large.', idleMs = FLOW_DEFAULTS.bodyIdleMs) {
   return new Promise((resolve, reject) => {
     const declared = Number(req.headers['content-length']);
     if (Number.isFinite(declared) && declared > max) { req.pause(); return reject(new HttpError(413, message)); }
     let size = 0; const chunks = [];
+    // A body that stops arriving is dropped soon: what it sent so far is held in memory.
+    let idle = null;
+    const watch = () => {
+      clearTimeout(idle);
+      idle = setTimeout(() => { chunks.length = 0; reject(new HttpError(408, 'The request stopped arriving.')); req.destroy(); }, idleMs);
+      idle.unref?.();
+    };
     const onData = (c) => {
       size += c.length;
-      if (size > max) { req.off('data', onData); req.pause(); chunks.length = 0; reject(new HttpError(413, message)); } else chunks.push(c);
+      if (size > max) { clearTimeout(idle); req.off('data', onData); req.pause(); chunks.length = 0; reject(new HttpError(413, message)); } else { chunks.push(c); watch(); }
     };
+    watch();
     req.on('data', onData);
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+    req.on('end', () => { clearTimeout(idle); resolve(Buffer.concat(chunks)); });
+    req.on('error', (e) => { clearTimeout(idle); reject(e); });
+    req.on('close', () => clearTimeout(idle));
   });
 }
-const readBody = async (req, max = MAX_BODY) => (await readRaw(req, max)).toString('utf8');
+const readBody = async (req, max = MAX_BODY, idleMs) => (await readRaw(req, max, undefined, idleMs)).toString('utf8');
 // Codes people type: no 0/O/1/I/L confusion. 10 characters of 31 symbols is about 49 bits, and joining is rate-limited.
 const CODE_ALPHA = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const newCode = () => [...randomBytes(10)].map((b) => CODE_ALPHA[b % CODE_ALPHA.length]).join('');
@@ -205,7 +215,10 @@ export function createHub({
   // The relay: how long a person's Kea waits for calls per request, and how long the worker waits for an answer.
   relayWaitMs = 20_000,
   relayAnswerMs = 120_000,
+  // Limits on slow and heavy traffic (hub/lib/flow.mjs): any of them can be changed here.
+  flow = {},
 } = {}) {
+  const F = { ...FLOW_DEFAULTS, ...flow };
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(storageDir, { recursive: true });
   const h = openDb(dbFile);
@@ -259,7 +272,7 @@ export function createHub({
   const reservedFor = (me) => ({ owner: me?.role === 'owner', ownerNames });
   // ---------- load: cheap checks before anything else, and what's busy (shown in /owner/stats) ----------
   const buckets = new Buckets();
-  const busy = { rejected: 0, shed: 0, lagMs: 0, maxLagMs: 0, downloads: 0, uploads: 0, connections: 0, refusedConnections: 0 };
+  const busy = { rejected: 0, shed: 0, lagMs: 0, maxLagMs: 0, downloads: 0, uploads: 0, connections: 0, refusedConnections: 0, slowDropped: 0 };
   let lagAt = Date.now();
   const lagTimer = setInterval(() => { const t = Date.now(); busy.lagMs = Math.max(0, t - lagAt - 100); busy.maxLagMs = Math.max(busy.maxLagMs, busy.lagMs); lagAt = t; }, 100);
   lagTimer.unref?.();
@@ -468,16 +481,30 @@ export function createHub({
   const SMALL = 16 * 1024, CHUNK = 64 * 1024, DRAIN_MS = 30_000;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const activeSenders = new Map();
-  const drained = (res) => new Promise((resolve, reject) => {
-    const t = setTimeout(() => { res.destroy(); reject(new Error('The client stopped reading.')); }, DRAIN_MS);
+  const drained = (res, ms = DRAIN_MS) => new Promise((resolve, reject) => {
+    const t = setTimeout(() => { busy.slowDropped++; res.destroy(); reject(new Error('The client stopped reading.')); }, ms);
     const done = () => { clearTimeout(t); res.off('drain', done); res.off('close', done); resolve(); };
     res.once('drain', done);
     res.once('close', done);
   });
+  /**
+   * A small answer counts toward the account's egress too: a cheap counter, and it only waits when that account is over
+   * its share (many small files from many addresses are as much traffic as one big one).
+   */
+  async function countSmall(who, bytes) {
+    if (!who) return;
+    dayAdd(`out:${who}`, bytes);
+    const rate = (Math.max(1, limitsNow().maxSendMbps) * 1e6) / 8 / Math.max(1, activeSenders.size);
+    const wait = buckets.spend(`egress:${who}`, rate, F.smallEgressBurstBytes, Date.now(), bytes);
+    if (wait > 0) await sleep(Math.min(wait, 10_000));
+  }
   /** Sends a Buffer or a readable stream (headers already written), paced; `who` is the account it counts for. */
   async function sendPaced(res, src, who = null) {
-    if (Buffer.isBuffer(src) && src.length <= SMALL) { if (who) dayAdd(`out:${who}`, src.length); res.end(src); return; }
+    if (Buffer.isBuffer(src) && src.length <= SMALL) { await countSmall(who, src.length); res.end(src); return; }
     if (who) activeSenders.set(who, (activeSenders.get(who) || 0) + 1);
+    // Only the time spent waiting for the client counts here (not the pacing above, not a slow disk): a client that
+    // keeps a download open by reading a trickle is dropped.
+    let blockedMs = 0, blockedBytes = 0;
     try {
       const chunks = Buffer.isBuffer(src) ? (function* () { for (let o = 0; o < src.length; o += CHUNK) yield src.subarray(o, o + CHUNK); })() : src;
       for await (const part of chunks) {
@@ -490,7 +517,16 @@ export function createHub({
         }
         if (wait > 0) await sleep(Math.min(wait, 10_000));
         if (res.destroyed) return;
-        if (!res.write(part)) await drained(res);
+        blockedBytes += part.length;
+        if (!res.write(part)) {
+          const t = Date.now();
+          await drained(res, Math.min(DRAIN_MS, F.minRateWindowMs));
+          blockedMs += Date.now() - t;
+        }
+        if (blockedMs >= F.minRateWindowMs) {
+          if (blockedBytes < (F.minRateBytes * blockedMs) / 1000) { busy.slowDropped++; res.destroy(); return; }
+          blockedMs = 0; blockedBytes = 0;
+        }
       }
       res.end();
     } catch {
@@ -888,10 +924,33 @@ export function createHub({
   R('GET', '/v1/files', ({ me, query }) => {
     const prefix = String(query.prefix ?? '');
     const since = Number(query.since) || 0;
+    let nextPath = null;
     const paged = query.limit != null;
     const n = paged ? Math.min(5000, Math.max(1, Number(query.limit) || 1000)) : -1;
     const after = String(query.after ?? '');
-    const rows = h.all("SELECT path, size, version, sha256, updated_at FROM files WHERE account_id = ? AND substr(path, 1, length(?)) = ? AND updated_at > ? AND path > ? ORDER BY path LIMIT ?", me.id, prefix, prefix, since, after, paged ? n + 1 : -1);
+    const listSql = 'SELECT path, size, version, sha256, updated_at FROM files WHERE account_id = ? AND substr(path, 1, length(?)) = ? AND updated_at > ? AND path > ? ORDER BY path LIMIT ?';
+    // A long list goes out a batch at a time, so it's never held whole in memory (same JSON as a short one), and only a
+    // few run at once (handleApi).
+    if (paged ? n > F.listBatch : usage(me.id).file_count > F.listBatch) {
+      return { __stream: jsonParts(function* () {
+        yield ['used', usedBy(me.id)];
+        yield ['quota', quotaOf(me)];
+        yield ['now', now()];
+        yield ['files', (function* () {
+          let last = after, left = paged ? n : Infinity;
+          while (left > 0) {
+            const rows = h.all(listSql, me.id, prefix, prefix, since, last, Math.min(left, F.listBatch));
+            for (const f of rows) yield { path: f.path, size: f.size, version: f.version, sha256: f.sha256, updatedAt: f.updated_at };
+            if (rows.length < Math.min(left, F.listBatch)) { nextPath = null; return; }
+            last = rows[rows.length - 1].path;
+            left -= rows.length;
+            nextPath = last;
+          }
+        })()];
+        if (paged) yield ['next', () => (nextPath != null && h.get(listSql, me.id, prefix, prefix, since, nextPath, 1) ? nextPath : null)];
+      }(), CHUNK) };
+    }
+    const rows = h.all(listSql, me.id, prefix, prefix, since, after, paged ? n + 1 : -1);
     const more = paged && rows.length > n;
     if (more) rows.length = n;
     return {
@@ -902,30 +961,33 @@ export function createHub({
   });
 
   // Download everything the Hub keeps about you (allowed even before agreeing to new terms).
+  // (A section at a time: never all of it in memory at once.)
   R('GET', '/v1/me/export', ({ me }) => ({
-    exportedAt: new Date(now()).toISOString(),
-    account: publicAccount(me),
-    termsAgreements: h.all('SELECT version, at FROM terms_acceptances WHERE account_id = ? ORDER BY version', me.id),
-    classes: h.all('SELECT c.id, c.title, m.role, m.board, m.nickname, m.joined_at FROM class_members m JOIN classes c ON c.id = m.class_id WHERE m.account_id = ?', me.id),
-    studyAnswers: h.all('SELECT question_id, box, due_at, seen FROM review_state WHERE account_id = ?', me.id),
-    points: h.all('SELECT class_id, question_id, points, at FROM xp_events WHERE account_id = ? ORDER BY at', me.id),
-    files: h.all('SELECT path, size, version, updated_at FROM files WHERE account_id = ? ORDER BY path', me.id),
-    signIns: h.all("SELECT action, at, ip FROM audit WHERE actor = ? AND action LIKE 'auth.%' ORDER BY id DESC LIMIT 500", me.id),
-    storage: storageOut(me),
-    sharedClaude: cleanOverride(me.claude_override ? JSON.parse(me.claude_override) : null),
-    notifications: h.all('SELECT * FROM notifications WHERE account_id = ? ORDER BY id', me.id).map(noteOut),
-    parentSignOffs: h.all('SELECT * FROM parent_consents WHERE account_id = ? ORDER BY created_at', me.id).map(consentOut),
-    scanJobs: h.all('SELECT id, kind, course_key, chapter, status, created_at, started_at, finished_at, note FROM scan_jobs WHERE account_id = ? ORDER BY created_at', me.id),
-    scanJobsJoined: h.all('SELECT job_id, joined_at FROM scan_job_members WHERE account_id = ? ORDER BY joined_at', me.id),
-    scanRequests: h.all('SELECT kind, outcome, at FROM scan_requests WHERE account_id = ? ORDER BY id', me.id),
-    flags: h.all('SELECT reason, detail, auto_suspended, status, at, resolved_at FROM flags WHERE account_id = ? ORDER BY id', me.id),
-    hostingApplications: h.all('SELECT reason, status, created_at, decided_at FROM host_applications WHERE account_id = ? ORDER BY created_at', me.id),
-    courseSections: h.all('SELECT course_key, joined_at, target FROM course_members WHERE account_id = ? ORDER BY joined_at', me.id),
-    courseJoinRequests: h.all('SELECT course_key, label, status, created_at, decided_at FROM course_join_requests WHERE account_id = ? ORDER BY created_at', me.id),
-    // Course files that came from scans you started (shared with your section).
-    contributedCourseFiles: h.all('SELECT cf.course_key, cf.path, cf.size, cf.updated_at FROM course_files cf JOIN course_materials cm ON cm.course_key = cf.course_key JOIN scan_jobs j ON j.id = cm.first_job_id WHERE j.account_id = ? ORDER BY cf.course_key, cf.path', me.id),
-    orgs: h.all('SELECT org_id, role, status, joined_at FROM org_members WHERE account_id = ?', me.id),
-    activity: h.all('SELECT at, action, target, ip FROM audit WHERE actor = ? ORDER BY id DESC LIMIT 5000', me.id),
+    __stream: jsonParts(Object.entries({
+      exportedAt: () => new Date(now()).toISOString(),
+      account: () => publicAccount(me),
+      termsAgreements: () => h.all('SELECT version, at FROM terms_acceptances WHERE account_id = ? ORDER BY version', me.id),
+      classes: () => h.all('SELECT c.id, c.title, m.role, m.board, m.nickname, m.joined_at FROM class_members m JOIN classes c ON c.id = m.class_id WHERE m.account_id = ?', me.id),
+      studyAnswers: () => h.all('SELECT question_id, box, due_at, seen FROM review_state WHERE account_id = ?', me.id),
+      points: () => h.all('SELECT class_id, question_id, points, at FROM xp_events WHERE account_id = ? ORDER BY at', me.id),
+      files: () => h.all('SELECT path, size, version, updated_at FROM files WHERE account_id = ? ORDER BY path', me.id),
+      signIns: () => h.all("SELECT action, at, ip FROM audit WHERE actor = ? AND action LIKE 'auth.%' ORDER BY id DESC LIMIT 500", me.id),
+      storage: () => storageOut(me),
+      sharedClaude: () => cleanOverride(me.claude_override ? JSON.parse(me.claude_override) : null),
+      notifications: () => h.all('SELECT * FROM notifications WHERE account_id = ? ORDER BY id', me.id).map(noteOut),
+      parentSignOffs: () => h.all('SELECT * FROM parent_consents WHERE account_id = ? ORDER BY created_at', me.id).map(consentOut),
+      scanJobs: () => h.all('SELECT id, kind, course_key, chapter, status, created_at, started_at, finished_at, note FROM scan_jobs WHERE account_id = ? ORDER BY created_at', me.id),
+      scanJobsJoined: () => h.all('SELECT job_id, joined_at FROM scan_job_members WHERE account_id = ? ORDER BY joined_at', me.id),
+      scanRequests: () => h.all('SELECT kind, outcome, at FROM scan_requests WHERE account_id = ? ORDER BY id', me.id),
+      flags: () => h.all('SELECT reason, detail, auto_suspended, status, at, resolved_at FROM flags WHERE account_id = ? ORDER BY id', me.id),
+      hostingApplications: () => h.all('SELECT reason, status, created_at, decided_at FROM host_applications WHERE account_id = ? ORDER BY created_at', me.id),
+      courseSections: () => h.all('SELECT course_key, joined_at, target FROM course_members WHERE account_id = ? ORDER BY joined_at', me.id),
+      courseJoinRequests: () => h.all('SELECT course_key, label, status, created_at, decided_at FROM course_join_requests WHERE account_id = ? ORDER BY created_at', me.id),
+      // Course files that came from scans you started (shared with your section).
+      contributedCourseFiles: () => h.all('SELECT cf.course_key, cf.path, cf.size, cf.updated_at FROM course_files cf JOIN course_materials cm ON cm.course_key = cf.course_key JOIN scan_jobs j ON j.id = cm.first_job_id WHERE j.account_id = ? ORDER BY cf.course_key, cf.path', me.id),
+      orgs: () => h.all('SELECT org_id, role, status, joined_at FROM org_members WHERE account_id = ?', me.id),
+      activity: () => h.all('SELECT at, action, target, ip FROM audit WHERE actor = ? ORDER BY id DESC LIMIT 5000', me.id),
+    }), CHUNK),
   }), { terms: false, basic: true });
 
   R('POST', '/v1/auth/logout', ({ token }) => {
@@ -2347,6 +2409,7 @@ export function createHub({
   // Body size limits. Before anyone is signed in, only small bodies are read (sign-in, making an account, a parent's
   // sign-off); the big limit is only for the person whose own job is running, answering one of its relay calls.
   const PRE_AUTH_BODY = 64 * 1024;
+  const SMALL_BODY = 16 * 1024;
   const RELAY_RESULT_BODY = 48 * 1024 * 1024;
   const RELAY_RESULT = /^\/v1\/scan\/([^/]+)\/calls\/[^/]+\/result$/;
 
@@ -2364,8 +2427,15 @@ export function createHub({
       busy.rejected++;
       return quick(res, 429, 1, 'Too many requests. Slow down.');
     }
+    // In flight per client. Behind the tunnel every connection is from loopback, so the connection cap can't tell people
+    // apart; each request says who it's for.
+    const inflight = takeSlots([[`req:${ipBucket(from.ip)}`, F.clientInflight * f]]);
+    if (!inflight) { busy.rejected++; res.setHeader('connection', 'close'); return quick(res, 429, 1, 'Too many requests at once. Slow down.'); }
+    res.once('close', inflight);
+    // (This connection said something: it gets the longer limit now, see 'connection' below.)
+    req.socket.setTimeout(apiServer.timeout);
     const url = new URL(req.url, 'http://localhost');
-    if (busy.lagMs > 500 && url.pathname !== '/v1/health') { busy.shed++; return quick(res, 503, 5, 'The Kea Hub is busy. Try again in a few seconds.'); }
+    if (busy.lagMs > F.shedLagMs && url.pathname !== '/v1/health') { busy.shed++; return quick(res, 503, 5, 'The Kea Hub is busy. Try again in a few seconds.'); }
     // Everything but uploads (files and relay answers) must arrive within 30 seconds.
     if (req.method !== 'PUT' && !RELAY_RESULT.test(url.pathname)) {
       const tm = setTimeout(() => { if (!req.complete) req.socket.destroy(); }, 30_000);
@@ -2373,7 +2443,7 @@ export function createHub({
       res.once('close', () => clearTimeout(tm));
     }
     const secure = !!req.socket.encrypted || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
-    let status = 200, payload, cookies = [];
+    let status = 200, payload, cookies = [], who = null;
     // The readable terms page (Kea opens it in a window; anyone can read it).
     if (url.pathname === '/terms' && req.method === 'GET') return serveTermsPage(url, res);
     // The page a parent opens from a member's sign-off link.
@@ -2405,6 +2475,7 @@ export function createHub({
         if (!me || me.status !== 'active') throw new HttpError(401, 'Sign in again.');
         if (now() - s.last_seen > 3600_000) h.run('UPDATE sessions SET last_seen = ? WHERE token_hash = ?', now(), s.token_hash);
         ctx.me = me;
+        who = me.id;
         // The Hub owner's account has powers over everyone's: none of them work until its two-step sign-in is on. Only
         // what's needed to turn it on (and to read the account and terms) works before that.
         if (me.role === 'owner' && !me.totp_enabled && !r.basic) throw new HttpError(403, OWNER_TOTP_MESSAGE, { ownerTotpRequired: true });
@@ -2418,7 +2489,13 @@ export function createHub({
         let max = ctx.me ? MAX_BODY : PRE_AUTH_BODY;
         const relay = RELAY_RESULT.exec(url.pathname);
         if (relay && ctx.me && h.get("SELECT 1 FROM scan_jobs WHERE id = ? AND account_id = ? AND status = 'running'", decodeURIComponent(relay[1]), ctx.me.id)) max = RELAY_RESULT_BODY;
-        const raw = await readBody(req, max);
+        // A signed-in person's big bodies are held in memory until they're whole: only so many at once.
+        const size = Number(req.headers['content-length']);
+        const small = Number.isFinite(size) && size <= SMALL_BODY;
+        const release = ctx.me && !small ? takeSlots([[`body:${ctx.me.id}`, F.bodiesPerAccount], [`bodyip:${ctx.ipKey}`, F.bodiesPerClient * f], ['body:*', F.bodiesGlobal]]) : () => {};
+        if (!release) throw new HttpError(429, 'Too many requests being sent at once. Wait for one to finish.', { retryAfter: 5 });
+        let raw;
+        try { raw = await readBody(req, max, F.bodyIdleMs); } finally { release(); }
         let body = {};
         if (raw.trim()) { try { body = JSON.parse(raw); } catch { bad('Invalid JSON.'); } }
         ctx.body = V.obj(body);
@@ -2432,6 +2509,17 @@ export function createHub({
         try {
           res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': out.__raw.length, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...out.headers });
           await sendPaced(res, out.__raw, ctx.me?.id ?? null);
+        } finally { release(); }
+        hlog.request(req.method, url.pathname, 200, Date.now() - t0);
+        return;
+      }
+      // A long answer, written as it's made.
+      if (out && out.__stream) {
+        const release = takeSlots([[`heavy:${ctx.me.id}`, F.heavyPerAccount], ['heavy:*', F.heavyGlobal]]);
+        if (!release) throw new HttpError(429, 'Too many long lists at once. Try again in a few seconds.', { retryAfter: 5 });
+        try {
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'x-frame-options': 'DENY' });
+          await sendPaced(res, out.__stream, ctx.me.id);
         } finally { release(); }
         hlog.request(req.method, url.pathname, 200, Date.now() - t0);
         return;
@@ -2456,8 +2544,8 @@ export function createHub({
     const text = JSON.stringify(payload ?? {});
     if (text.length > SMALL) {
       res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'x-frame-options': 'DENY', ...(cookies.length ? { 'set-cookie': cookies } : {}) });
-      await sendPaced(res, Buffer.from(text), null);
-    } else send(res, status, payload, cookies);
+      await sendPaced(res, Buffer.from(text), who);
+    } else { await countSmall(who, text.length); send(res, status, payload, cookies); }
     hlog.request(req.method, url.pathname, status, Date.now() - t0);
   }
   /** Download slots: 2 at a time per account, 3 per address (more for the tunnel's shared address), 16 in all. */
@@ -2606,8 +2694,14 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
     checkRoom(mine, row?.size ?? 0);
     checkBudgets(me, mine);
     checkDisk(mine);
-    const release = takeSlots([[`up:${me.id}`, 2], ['up:*', 16]]);
-    if (!release) throw new HttpError(429, 'Too many uploads at once. Wait for one to finish.', { retryAfter: 5 });
+    // Only a real upload takes an upload slot: empty and small files can't keep other people's uploads out. (A body
+    // that doesn't say its size takes one once that much of it has come.)
+    let release = null;
+    const takeUpload = () => {
+      release = takeSlots([[`up:${me.id}`, 2], ['up:*', 16]]);
+      if (!release) throw new HttpError(429, 'Too many uploads at once. Wait for one to finish.', { retryAfter: 5 });
+    };
+    if (known && declared > F.uploadSlotMinBytes) takeUpload();
     reserved.set(me.id, (reserved.get(me.id) || 0) + mine);
     busy.uploads++;
     const dir = join(storageDir, me.id);
@@ -2622,11 +2716,26 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
         transform(chunk, _enc, cb) {
           size += chunk.length;
           if (size > maxFileBytes) return cb(new HttpError(413, tooBig));
+          if (!release && size > F.uploadSlotMinBytes) { try { takeUpload(); } catch (e) { return cb(e); } }
           hasher.update(chunk);
           cb(null, chunk);
         },
       });
-      await pipeline(req, meter, createWriteStream(tmp));
+      // An upload that stops, or only trickles, is dropped: it holds a slot and a file open.
+      let mark = 0, markAt = Date.now(), lastSize = 0, lastAt = markAt;
+      const watch = setInterval(() => {
+        const t = Date.now();
+        if (size !== lastSize) { lastSize = size; lastAt = t; }
+        let slow = t - lastAt >= F.bodyIdleMs;
+        if (t - markAt >= F.minRateWindowMs) {
+          const need = (F.minRateBytes * (t - markAt)) / 1000;
+          slow ||= size - mark < (known ? Math.min(need, declared - mark) : need);
+          mark = size; markAt = t;
+        }
+        if (slow) { busy.slowDropped++; req.destroy(); }
+      }, Math.max(50, Math.min(F.minRateWindowMs, F.bodyIdleMs) / 4));
+      watch.unref?.();
+      try { await pipeline(req, meter, createWriteStream(tmp)); } finally { clearInterval(watch); }
       checkRoom(size, row?.size ?? 0);
       checkBudgets(me, size);
       checkDisk(size);
@@ -2651,7 +2760,7 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
       await rmP(tmp, { force: true }).catch(() => {});
       throw e;
     } finally {
-      release();
+      release?.();
       busy.uploads--;
       const left = (reserved.get(me.id) || 0) - mine;
       if (left > 0) reserved.set(me.id, left); else reserved.delete(me.id);
@@ -2714,6 +2823,8 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
       perAddress.set(a, n);
     }
     busy.connections++;
+    // A connection that says nothing at all is closed soon (http's own timers only start with the first bytes).
+    sock.setTimeout(F.noBytesMs);
     sock.once('close', () => {
       busy.connections--;
       if (!isLoopback(a)) { const n = (perAddress.get(a) || 1) - 1; if (n) perAddress.set(a, n); else perAddress.delete(a); }
