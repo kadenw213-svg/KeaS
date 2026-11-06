@@ -19,7 +19,6 @@ const writeConfig = (c) => { fs.mkdirSync(path.dirname(configFile()), { recursiv
 let config = {};
 let win = null, tray = null;
 let hub = null, org = null;
-let payroll = null, payrollPort = null, payrollWin = null;
 const log = (...a) => { try { fs.appendFileSync(path.join(app.getPath('userData'), 'keas.log'), `${new Date().toISOString()} ${a.join(' ')}\n`); } catch {} };
 
 // Developer aids: KEAS_USERDATA runs a separate profile (and never touches Kea's settings or Windows startup);
@@ -51,38 +50,6 @@ async function startServices() {
 }
 const servicePort = () => (config.role === 'hub' ? HUB_PORT : ORG_PORT);
 
-// ---------- Payroll: the payroll vault, run on this PC only (127.0.0.1), opened in its own KeaS window ----------
-// Its data (SSNs, bank details, pay runs) stays on this computer, encrypted with the vault passphrase, and never goes
-// to the Hub. Payroll admins sign in with their Kea Hub account plus the passphrase (or a local account when the Hub
-// can't be reached).
-const payrollDir = () => config.payrollDir || path.join(app.getPath('userData'), 'Payroll');
-const payrollHubUrl = () => (config.role === 'hub' ? `http://127.0.0.1:${HUB_PORT}` : config.hubUrl || config.publicUrl || null);
-async function startPayroll() {
-  if (payroll) return payrollPort;
-  const { createApp } = await import(pathToFileURL(path.join(ROOT, 'server', 'index.mjs')).href);
-  fs.mkdirSync(payrollDir(), { recursive: true });
-  payroll = createApp({ dbFile: path.join(payrollDir(), 'payroll-vault.db'), vault: true, hubUrl: payrollHubUrl(), log: false });
-  payrollPort = await payroll.listen(0);
-  log('payroll vault started', payrollDir());
-  return payrollPort;
-}
-async function openPayroll() {
-  const port = await startPayroll();
-  if (payrollWin) { if (payrollWin.isMinimized()) payrollWin.restore(); payrollWin.show(); payrollWin.focus(); return true; }
-  const origin = `http://127.0.0.1:${port}`;
-  payrollWin = new BrowserWindow({
-    width: 1280, height: 860, minWidth: 420, minHeight: 560, title: 'KeaS Payroll', backgroundColor: nativeTheme.shouldUseDarkColors ? '#131314' : '#f6f7f9',
-    autoHideMenuBar: true,
-    webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false },
-  });
-  payrollWin.webContents.setWindowOpenHandler(({ url }) => { if (/^https?:/.test(url) && !url.startsWith(origin)) shell.openExternal(url); return { action: 'deny' }; });
-  payrollWin.webContents.on('will-navigate', (e, url) => { if (!url.startsWith(origin + '/')) e.preventDefault(); });
-  // Closing the window stops the vault server: the key leaves memory and the next open asks for the passphrase again.
-  payrollWin.on('closed', () => { payrollWin = null; const p = payroll; payroll = null; payrollPort = null; p?.close().catch(() => {}); });
-  await payrollWin.loadURL(`${origin}/payroll`);
-  return true;
-}
-
 // ---------- windows and tray ----------
 function showWindow() {
   if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); return; }
@@ -109,7 +76,7 @@ function showWindow() {
         try { win.show(); win.focus(); await new Promise((r) => setTimeout(r, 400)); fs.writeFileSync(process.env.KEAS_CAPTURE, (await win.webContents.capturePage()).toPNG()); break; } catch (e) { console.log('[capture error]', e.message); }
       }
       app.isQuitting = true;
-      try { await hub?.close(); await org?.close(); await payroll?.close(); } catch {}
+      try { await hub?.close(); await org?.close(); } catch {}
       app.exit(0);
     }, Number(process.env.KEAS_CAPTURE_DELAY || 1500)));
   }
@@ -121,12 +88,17 @@ function makeTray() {
   tray.setToolTip(config.role === 'hub' ? 'KeaS · Kea Hub running' : 'KeaS · server running');
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: 'Open KeaS', click: showWindow },
-    { label: 'Payroll', click: () => openPayroll().catch((e) => log('payroll', e.message)) },
+    { label: 'Payroll', click: () => openPayroll().catch(() => {}) },
     { type: 'separator' },
     { label: 'Quit KeaS (stops the server)', click: () => { app.isQuitting = true; app.quit(); } },
   ]));
   tray.on('click', showWindow);
 }
+
+// ---------- Payroll (the payroll vault, on this PC only; see payroll.cjs) ----------
+let payrollApi = null;
+const payroll = () => (payrollApi ||= require('./payroll.cjs').createPayroll({ getConfig: () => config, userData: app.getPath('userData'), root: ROOT, hubPort: HUB_PORT, log }));
+const openPayroll = () => payroll().open().catch((e) => { log('payroll', e.message); throw e; });
 
 // ---------- drives ----------
 function drives() {
@@ -251,4 +223,4 @@ app.whenReady().then(async () => {
   if (!process.argv.includes('--hidden') || !config.setupDone) showWindow();
 });
 app.on('window-all-closed', () => { if (!config.setupDone) app.quit(); });
-app.on('before-quit', async () => { app.isQuitting = true; try { await hub?.close(); await org?.close(); await payroll?.close(); } catch {} });
+app.on('before-quit', async () => { app.isQuitting = true; try { await hub?.close(); await org?.close(); await payrollApi?.stop(); } catch {} });

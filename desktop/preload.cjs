@@ -3,6 +3,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 const call = (name) => (arg) => ipcRenderer.invoke(name, arg);
 contextBridge.exposeInMainWorld('keas', {
+  openPayroll: call('payroll:open'),
   state: call('state'),
   drives: call('drives'),
   pickFolder: call('pickFolder'),
@@ -20,7 +21,6 @@ contextBridge.exposeInMainWorld('keas', {
   setTheme: call('setTheme'),
   openExternal: call('openExternal'),
   openFolder: call('openFolder'),
-  openPayroll: call('payroll:open'),
   onProgress: (cb) => {
     const fn = (_e, line) => cb(line);
     ipcRenderer.on('progress', fn);

@@ -45,6 +45,6 @@
   "suta": {
     "wageBase": 30600,
     "defaultRate": 0.0305,
-    "note": "Employer rate comes from the org setting (demo 3.05%)."
+    "note": "Employer rate comes from the org setting (the sample workplace uses 3.05%)."
   }
 }

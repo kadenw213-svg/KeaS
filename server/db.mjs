@@ -1,4 +1,4 @@
-// SQLite storage for the demo org server (node:sqlite, prepared statements only).
+// SQLite storage for the org server and the payroll vault (node:sqlite, prepared statements only).
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';

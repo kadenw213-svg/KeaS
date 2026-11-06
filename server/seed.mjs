@@ -9,7 +9,7 @@ import { abaCheckDigit } from './lib/nacha.mjs';
 import { makeVault, openDevVault } from './payroll/vaultstate.mjs';
 
 const TZ = 'America/Denver';
-const fakeRouting = (p8) => p8 + abaCheckDigit(p8);
+const routingFor = (p8) => p8 + abaCheckDigit(p8);
 
 export function seed(h, { now = Date.now(), vault } = {}) {
   const sealJson = (v) => (vault ? vault.sealJson(v) : JSON.stringify(v));
@@ -23,7 +23,7 @@ export function seed(h, { now = Date.now(), vault } = {}) {
   h.tx(() => {
     h.run(`INSERT INTO orgs (id,name,state,tz,late_threshold_min,workweek_start,pay_frequency,pay_period_anchor,futa_exempt,suta_rate,rule_overrides,bank)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, 'org-demo', 'Demo Aquatics', 'CO', TZ, 5, 0, 'biweekly', anchor, 1, 0.0305, '{}',
-      sealJson({ name: 'DEMO AQUATICS', companyId: '1999999999', originRouting: fakeRouting('99000001'), destinationRouting: fakeRouting('99000002'), destinationName: 'EXAMPLE BANK' }));
+      sealJson({ name: 'DEMO AQUATICS', companyId: '1999999999', originRouting: routingFor('99000001'), destinationRouting: routingFor('99000002'), destinationName: 'EXAMPLE BANK' }));
     const pos = [['pos-lg', 'Lifeguard', ['lifeguard']], ['pos-si', 'Swim Instructor', ['instructor']], ['pos-hg', 'Head Guard', ['lifeguard', 'lead']]];
     for (const [id, name, tags] of pos) h.run('INSERT INTO positions (id,org_id,name,tags) VALUES (?,?,?,?)', id, 'org-demo', name, JSON.stringify(tags));
     const ct = [
@@ -49,7 +49,7 @@ export function seed(h, { now = Date.now(), vault } = {}) {
       ['p12', 'Mia Chen', ['member'], ['pos-lg'], birth(14, 150), 1500, w4s.s, 0],
     ];
     people.forEach(([id, name, roles, positions, bd, rate, w4, ytd], i) => {
-      const deposit = { routing: fakeRouting('99' + String(100000 + i * 37).padStart(6, '0')), account: String(100200300 + i * 1111), accountType: i % 4 === 3 ? 'savings' : 'checking' };
+      const deposit = { routing: routingFor('99' + String(100000 + i * 37).padStart(6, '0')), account: String(100200300 + i * 1111), accountType: i % 4 === 3 ? 'savings' : 'checking' };
       h.run(`INSERT INTO people (id,org_id,name,email,roles,positions,status,birthdate,pay_rate_cents,w4,co_allowance,ytd_wages_cents,deposit)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, 'org-demo', name, name.toLowerCase().replace(/[^a-z]+/g, '.') + '@demo-aquatics.example',
         JSON.stringify(roles), JSON.stringify(positions), id === 'p12' ? 'applicant' : 'active', bd, rate, JSON.stringify(w4), null, ytd, sealJson(deposit));
@@ -165,7 +165,7 @@ export function resetDb(file = DEFAULT_DB) {
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   if (process.argv.includes('--reset')) {
     const r = resetDb(process.env.KEA_DB || DEFAULT_DB);
-    console.log(`Demo db reset and seeded (pay periods anchored on ${r.anchor}).`);
+    console.log(`Database reset and seeded (pay periods anchored on ${r.anchor}).`);
   } else {
     const h = openDb(process.env.KEA_DB || DEFAULT_DB);
     const vault = makeVault(h);
