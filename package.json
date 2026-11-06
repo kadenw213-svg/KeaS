@@ -14,6 +14,7 @@
     "test:server": "node --test \"test/server/*.test.mjs\"",
     "hub": "node hub/index.mjs",
     "test:hub": "node --test \"test/hub/*.test.mjs\"",
+    "test:desktop": "node --test \"test/desktop/*.test.mjs\"",
     "test": "node --test \"test/server/*.test.mjs\" \"test/hub/*.test.mjs\"",
     "desktop": "electron .",
     "desktop:build": "npm run web:build && electron-builder --win nsis"

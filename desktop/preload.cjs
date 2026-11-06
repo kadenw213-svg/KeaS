@@ -20,6 +20,14 @@ contextBridge.exposeInMainWorld('keas', {
   setTheme: call('setTheme'),
   openExternal: call('openExternal'),
   openFolder: call('openFolder'),
+  bootStatus: call('boot:status'),
+  bootApply: call('boot:apply'),
+  bootRemove: call('boot:remove'),
+  onNavigate: (cb) => {
+    const fn = (_e, view) => cb(view);
+    ipcRenderer.on('navigate', fn);
+    return () => ipcRenderer.removeListener('navigate', fn);
+  },
   onProgress: (cb) => {
     const fn = (_e, line) => cb(line);
     ipcRenderer.on('progress', fn);

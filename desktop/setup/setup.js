@@ -28,8 +28,8 @@ async function call(fn, arg) {
 }
 function fail(e) { S.error = String(e.message || e); S.busy = false; render(); }
 
-const STEPS = { hub: ['welcome', 'storage', 'reach', 'owner', 'done'], org: ['welcome', 'storage', 'reach', 'done'], join: ['welcome'] };
-const LABELS = { welcome: 'Start', storage: 'Where data goes', reach: 'Reachable from anywhere', owner: 'Your owner account', done: 'Done' };
+const STEPS = { hub: ['welcome', 'storage', 'reach', 'owner', 'boot', 'done'], org: ['welcome', 'storage', 'reach', 'done'], join: ['welcome'] };
+const LABELS = { welcome: 'Start', storage: 'Where data goes', reach: 'Reachable from anywhere', owner: 'Your owner account', boot: 'Start before sign-in', done: 'Done' };
 function go(step) { S.step = step; S.error = ''; render(); window.scrollTo(0, 0); }
 function next() { const list = STEPS[S.role || 'hub']; go(list[list.indexOf(S.step) + 1]); }
 function back() { const list = STEPS[S.role || 'hub']; go(list[Math.max(0, list.indexOf(S.step) - 1)]); }
@@ -37,7 +37,7 @@ function back() { const list = STEPS[S.role || 'hub']; go(list[Math.max(0, list.
 function renderProgress() {
   const el = document.getElementById('progress');
   el.replaceChildren();
-  if (S.step === 'status') return;
+  if (S.step === 'status' || S.step === 'settings') return;
   const list = STEPS[S.role || 'hub'];
   const at = list.indexOf(S.step);
   list.forEach((s, i) => el.append(h('li', { class: i === at ? 'on' : i < at ? 'done' : '' }, LABELS[s])));
@@ -194,6 +194,112 @@ function owner() {
   ];
 }
 
+// ---------- start before sign-in, and power (a setup step, and the settings page later) ----------
+const BOOT_ADV = [
+  ['neverSleepAC', 'Never sleep on AC power', 'Sleep stops the Hub. On battery, Windows still sleeps as usual.'],
+  ['neverHibernateAC', 'Never hibernate on AC power', ''],
+  ['wakeTimersAC', 'Allow wake timers on AC power', 'Lets Windows wake the PC for scheduled tasks and updates.'],
+  ['disksNeverOffAC', 'Keep drives from turning off on AC power', 'A drive that has spun down makes the first request after a quiet spell slow.'],
+  ['runOnBattery', 'Keep the Hub running on battery', 'For a laptop or a PC on a battery backup (UPS).'],
+  ['restartOnFailure', 'Restart the Hub if it stops with an error', ''],
+];
+const BOOT_NUM = [
+  ['delaySeconds', 'Wait after Windows starts (seconds)', 0, 3600, 'So the network and Tailscale are up first.'],
+  ['restartCount', 'Restart tries', 1, 999, ''],
+  ['restartMinutes', 'Minutes between restart tries', 1, 1440, ''],
+];
+const POWER_NAMES = { standby: 'Sleep after', hibernate: 'Hibernate after', wake: 'Wake timers', disk: 'Turn off drives after' };
+function powerValue(key, v) {
+  if (v == null) return 'unknown';
+  if (key === 'wake') return ['Off', 'On', 'Important ones only'][v] ?? String(v);
+  if (v === 0) return 'Never';
+  return v % 60 === 0 ? `${v / 60} min` : `${v} s`;
+}
+async function loadBoot() {
+  S.bs = await call(k.bootStatus);
+  if (!S.bo) S.bo = { ...S.bs.options };
+  render();
+}
+async function applyBoot({ dryRun = false, after } = {}) {
+  S.busy = true; S.error = ''; S.bootResult = null; render();
+  try {
+    const r = await call(k.bootApply, { options: S.bo, dryRun });
+    if (dryRun) S.bootScript = r.script;
+    else { S.bootResult = r; S.bs = r.status; S.bootScript = null; }
+    S.busy = false;
+    if (!dryRun && r.ok && after) after(); else render();
+  } catch (e) { fail(e); }
+}
+async function removeBoot({ dryRun = false } = {}) {
+  S.busy = true; S.error = ''; S.bootResult = null; render();
+  try {
+    const r = await call(k.bootRemove, { dryRun });
+    if (dryRun) S.bootScript = r.script;
+    else { S.bootResult = r; S.bs = r.status; S.bootScript = null; }
+    S.busy = false; render();
+  } catch (e) { fail(e); }
+}
+function bootForm() {
+  const o = S.bo;
+  const box = (key, label, hint, disabled) => h('label', { class: 'check' },
+    h('input', { type: 'checkbox', checked: o[key], disabled: disabled || S.busy, onchange: (e) => { o[key] = e.target.checked; render(); } }),
+    h('span', null, label, hint && h('span', { class: 'muted small' }, ` ${hint}`)));
+  const t = S.bs.task || {};
+  const p = S.bs.power?.values || {};
+  const prev = S.bs.saved?.powerApplied ? S.bs.saved.previous?.values : null;
+  return [
+    box('bootStart', 'Start the Kea Hub when Windows starts, before anyone signs in', 'Recommended for the PC the Hub lives on.'),
+    box('power', 'Keep this PC awake on AC power', 'So the Hub doesn’t go to sleep at night.'),
+    h('details', { open: !!S.bootAdv, ontoggle: (e) => (S.bootAdv = e.target.open) }, h('summary', null, 'Advanced'),
+      h('p', { class: 'muted small' }, `The Hub runs as a Scheduled Task (${S.bs.taskName}) under your Windows account, with highest privileges, whether or not you’re signed in. It doesn’t store your Windows password, so it can’t reach network drives: keep the Hub’s data on a drive inside this PC.`),
+      BOOT_ADV.map(([key, label, hint]) => box(key, label, hint, (key === 'runOnBattery' || key === 'restartOnFailure' ? !o.bootStart : !o.power))),
+      BOOT_NUM.map(([key, label, min, max, hint]) => h('label', { class: 'field' }, label,
+        h('input', { type: 'number', min: String(min), max: String(max), value: String(o[key]), disabled: !o.bootStart || S.busy, oninput: (e) => (o[key] = Number(e.target.value)) }),
+        hint && h('span', { class: 'muted small' }, hint))),
+      h('h3', null, 'Power settings now (on AC power)'),
+      h('ul', { class: 'small' }, Object.keys(POWER_NAMES).map((key) => h('li', null, `${POWER_NAMES[key]}: ${powerValue(key, p[key])}`,
+        prev && prev[key] != null && prev[key] !== p[key] ? h('span', { class: 'muted' }, ` (before KeaS: ${powerValue(key, prev[key])})`) : null))),
+      h('p', null, h('button', { class: 'btn', disabled: S.busy, onclick: () => applyBoot({ dryRun: true }) }, 'Show what it runs'),
+        ' ', (S.bs.saved?.installed || S.bs.saved?.powerApplied) && h('button', { class: 'btn', disabled: S.busy, onclick: () => removeBoot({ dryRun: true }) }, 'Show what turning it off runs')),
+      S.bootScript && h('div', { class: 'log' }, S.bootScript)),
+    h('div', { class: 'panel' },
+      h('p', null, h('b', null, 'After a power cut')),
+      h('p', { class: 'muted small' }, S.bs.note)),
+    h('p', { class: 'small' }, h('span', { class: `dot ${t.installed ? 'ok' : ''}`, style: 'display:inline-block;vertical-align:-4px;margin-right:8px' }),
+      t.installed ? `Starts before sign-in: on${t.state ? ` (task ${t.state.toLowerCase()}${t.lastResult ? `, last result ${t.lastResult}` : ''})` : ''}.` : 'Starts before sign-in: off.',
+      S.bs.external ? ' The Hub running now was started before sign-in.' : ''),
+    S.bootResult && h('ul', { class: 'small' }, S.bootResult.steps.map((s) => h('li', { class: s.ok ? 'ok' : 'err' }, `${s.step}: ${s.ok ? 'done' : s.error}`))),
+  ].filter(Boolean);
+}
+function boot() {
+  if (!S.bs) { loadBoot().catch(fail); return [h('p', { class: 'muted' }, 'Checking this PC’s settings…')]; }
+  const nothing = !S.bo.bootStart && !S.bo.power;
+  return [
+    h('h1', null, 'Start before sign-in'),
+    h('p', { class: 'muted' }, 'So the Hub is there for everyone even after Windows restarts for an update, without you signing in, and so the PC doesn’t fall asleep. Windows asks once for permission. You can turn this off any time from the tray icon or the settings page, and the power settings go back to how they were.'),
+    ...bootForm(),
+    S.error && h('div', { class: 'err' }, S.error),
+    h('div', { class: 'actions' },
+      h('button', { class: 'btn', disabled: S.busy, onclick: back }, 'Back'),
+      h('button', { class: 'btn', disabled: S.busy, onclick: next }, 'Skip'),
+      h('button', { class: 'btn primary', disabled: S.busy || nothing, onclick: () => applyBoot({ after: next }) }, S.busy ? 'Setting up…' : 'Set it up')),
+  ];
+}
+function settings() {
+  if (!S.bs) { loadBoot().catch(fail); return [h('p', { class: 'muted' }, 'Checking this PC’s settings…')]; }
+  const on = S.bs.saved?.installed || S.bs.saved?.powerApplied || S.bs.task?.installed;
+  return [
+    h('h1', null, 'Startup and power'),
+    h('p', { class: 'muted' }, 'Start the Kea Hub before anyone signs in, and keep this PC awake for it. Saving asks Windows for permission once.'),
+    ...bootForm(),
+    S.error && h('div', { class: 'err' }, S.error),
+    h('div', { class: 'actions' },
+      h('button', { class: 'btn', disabled: S.busy, onclick: () => load().catch(fail) }, 'Back'),
+      on && h('button', { class: 'btn', disabled: S.busy, onclick: () => removeBoot() }, 'Turn it all off'),
+      h('button', { class: 'btn primary', disabled: S.busy || (!S.bo.bootStart && !S.bo.power), onclick: () => applyBoot() }, S.busy ? 'Saving…' : 'Save')),
+  ];
+}
+
 function done() {
   const url = S.publicUrl || S.config.publicUrl || null;
   return [
@@ -220,12 +326,17 @@ function status() {
       c.publicUrl ? h('p', null, 'Public address: ', h('span', { class: 'url' }, c.publicUrl)) : h('p', { class: 'muted' }, 'Only reachable on this computer.'),
       h('p', null, 'Data: ', h('span', { class: 'url' }, c.dataDir), ' ', h('button', { class: 'btn', onclick: () => k.openFolder({ dir: c.dataDir }) }, 'Open folder')),
       c.role === 'hub' && h('p', { class: 'muted small' }, `Each account gets ${c.quotaGb || 25} GB of Kea storage. Owner: ${c.ownerEmail || 'not set'}.`)),
+    c.role === 'hub' && h('div', { class: 'panel' },
+      h('p', null, h('b', null, 'Startup and power')),
+      h('p', { class: 'muted small' }, c.boot?.installed ? 'The Hub starts when Windows starts, before anyone signs in.' : 'The Hub starts when you sign in to Windows.',
+        c.boot?.powerApplied ? ' This PC stays awake on AC power.' : '', S.hubExternal ? ' The Hub running now was started before sign-in.' : ''),
+      h('button', { class: 'btn', onclick: () => { S.bs = null; S.bo = null; S.bootScript = null; S.bootResult = null; go('settings'); } }, 'Change…')),
     c.role === 'hub' && c.publicUrl && h('p', null, h('button', { class: 'btn', onclick: () => k.openExternal({ url: `${c.publicUrl}/terms` }) }, 'Open the terms page')),
     h('p', { class: 'muted small' }, 'Closing this window keeps the server running in the tray. Quit from the tray icon to stop it.'),
   ];
 }
 
-const VIEWS = { welcome, storage, reach, owner, done, status };
+const VIEWS = { welcome, storage, reach, owner, boot, done, status, settings };
 function render() {
   renderProgress();
   app.replaceChildren(...VIEWS[S.step]());
@@ -235,6 +346,7 @@ async function load() {
   const st = await call(k.state);
   S.config = st.config; S.defaults = st.defaults;
   S.running = st.running.hub || st.running.org;
+  S.hubExternal = !!st.running.hubExternal;
   document.getElementById('theme').value = st.config.theme || 'system';
   applyTheme(st.config.theme || 'system');
   if (st.config.setupDone) { S.role = st.config.role; S.step = 'status'; }
@@ -247,4 +359,10 @@ function applyTheme(t) {
 }
 document.getElementById('theme').addEventListener('change', (e) => { applyTheme(e.target.value); k.setTheme({ theme: e.target.value }); });
 k.onProgress((line) => { S.log.push(line); if (S.step === 'reach') render(); });
+// The tray's "Power settings…" opens the settings page (once setup is done).
+k.onNavigate((view) => {
+  if (view !== 'settings' || !S.config.setupDone || S.busy) return;
+  S.bs = null; S.bo = null; S.bootScript = null; S.bootResult = null;
+  go('settings');
+});
 load().catch(fail);

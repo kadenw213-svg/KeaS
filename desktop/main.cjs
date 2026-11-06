@@ -9,6 +9,7 @@ const os = require('os');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const tailscale = require('./tailscale.cjs');
+const bootstart = require('./bootstart.cjs');
 
 const ROOT = path.join(__dirname, '..');
 const HUB_PORT = 4860;
@@ -19,6 +20,9 @@ const writeConfig = (c) => { fs.mkdirSync(path.dirname(configFile()), { recursiv
 let config = {};
 let win = null, tray = null;
 let hub = null, org = null;
+// The Hub started before sign-in by the Scheduled Task (bootstart.cjs) is a separate process: KeaS then uses it instead
+// of starting its own, and starts its own only if that one stops answering.
+let hubExternal = false, hubWatch = null, extDb = null;
 const log = (...a) => { try { fs.appendFileSync(path.join(app.getPath('userData'), 'keas.log'), `${new Date().toISOString()} ${a.join(' ')}\n`); } catch {} };
 
 // Developer aids: KEAS_USERDATA runs a separate profile (and never touches Kea's settings or Windows startup);
@@ -30,13 +34,20 @@ app.on('second-instance', () => showWindow());
 
 // ---------- the servers, run inside this app (Electron includes Node 24: SQLite and Argon2 built in) ----------
 async function startServices() {
-  if (config.role === 'hub' && !hub) {
+  if (config.role === 'hub' && !hub && await bootstart.hubAnswering(HUB_PORT)) {
+    if (!hubExternal) log('hub already running (started before sign-in); using it');
+    hubExternal = true;
+    watchExternalHub();
+  } else if (config.role === 'hub' && !hub) {
+    hubExternal = false;
     const { createHub } = await import(pathToFileURL(path.join(ROOT, 'hub', 'index.mjs')).href);
     hub = createHub({
       dataDir: config.dataDir, storageDir: config.storageDir, log: false,
       defaultQuotaBytes: (config.quotaGb || 25) * 1024 ** 3,
       ipHeader: config.tailscale ? 'x-forwarded-for' : null,
       googleClientIds: config.googleClientIds || [],
+      googleWebClientId: config.googleWebClientId || null,
+      publicUrl: config.publicUrl || null,
     });
     await hub.listen({ port: HUB_PORT, ownerPort: HUB_PORT + 1 });
     log('hub started', config.dataDir);
@@ -49,6 +60,74 @@ async function startServices() {
   }
 }
 const servicePort = () => (config.role === 'hub' ? HUB_PORT : ORG_PORT);
+function watchExternalHub() {
+  if (hubWatch) return;
+  hubWatch = setInterval(async () => {
+    if (!hubExternal || await bootstart.hubAnswering(HUB_PORT)) return;
+    log('the Hub started before sign-in stopped answering; starting it here');
+    hubExternal = false;
+    try { await startServices(); } catch (e) { log('start failed', e.message); }
+    refreshTray();
+  }, 60_000);
+}
+/** The Hub's database: from the Hub running in KeaS, or opened directly when the before-sign-in Hub is running. */
+async function hubDb() {
+  if (hub) return hub.h;
+  if (!hubExternal) throw new Error('Start the Hub first.');
+  if (!extDb) {
+    const { openDb } = await import(pathToFileURL(path.join(ROOT, 'hub', 'db.mjs')).href);
+    extDb = openDb(path.join(config.dataDir, 'hub.db'));
+  }
+  return extDb;
+}
+const hubRunning = () => !!hub || hubExternal;
+
+// ---------- start before sign-in, and power settings ----------
+const bootArgs = () => ({ config, exe: process.execPath, hubSource: path.join(ROOT, 'hub'), version: app.getVersion(), port: HUB_PORT });
+async function bootStatus() {
+  const task = await bootstart.taskStatus();
+  let power = null;
+  try { power = await bootstart.readPower(); } catch {}
+  return {
+    task, power, external: hubExternal, saved: config.boot || null, options: bootstart.options(config.boot?.options),
+    defaults: bootstart.DEFAULTS, note: bootstart.POWER_LOSS_NOTE, taskName: bootstart.TASK_NAME, testProfile: DEV,
+  };
+}
+const TEST_PROFILE = 'A test profile (KEAS_USERDATA) never changes Windows settings. Use "Show what it runs" instead.';
+async function bootApply(opts = {}, dryRun = false) {
+  if (config.role !== 'hub') throw new Error('Starting before sign-in is for the Kea Hub.');
+  if (DEV && !dryRun) throw new Error(TEST_PROFILE);
+  const o = bootstart.options(opts);
+  const was = config.boot || {};
+  const r = await bootstart.install({
+    ...bootArgs(), opts: o, dryRun,
+    // The values from before KeaS first changed anything, so turning it off always goes back to those.
+    previous: was.powerApplied ? was.previous : null, powerWasApplied: !!was.powerApplied,
+    wasInstalled: !!was.installed, stopHub: hubExternal,
+  });
+  if (dryRun) return r;
+  const ok = (name) => r.steps.some((s) => s.step === name && s.ok);
+  const installed = o.bootStart ? ok('task') : (!!was.installed && !ok('task:delete'));
+  const powerOn = Object.keys(bootstart.powerTargets(o)).length > 0;
+  const powerApplied = powerOn ? (ok('power:apply') || !!was.powerApplied) : (!!was.powerApplied && !ok('power:apply'));
+  config = writeConfig({ ...config, boot: { options: o, installed, powerApplied, previous: powerApplied ? r.previous : null, at: Date.now(), steps: r.steps } });
+  if (!o.bootStart && was.installed && hubExternal && !installed) { hubExternal = false; if (extDb) { try { extDb.close(); } catch {} extDb = null; } await startServices().catch((e) => log('start failed', e.message)); }
+  refreshTray();
+  return { ok: r.ok, steps: r.steps, status: await bootStatus() };
+}
+async function bootRemove(dryRun = false) {
+  if (DEV && !dryRun) throw new Error(TEST_PROFILE);
+  const r = await bootstart.uninstall({ config, previous: config.boot?.powerApplied ? config.boot.previous : null, stopHub: hubExternal, dryRun });
+  if (dryRun) return r;
+  if (r.ok) {
+    config = writeConfig({ ...config, boot: { options: bootstart.options(config.boot?.options), installed: false, powerApplied: false, previous: null, at: Date.now(), steps: r.steps } });
+    hubExternal = false;
+    if (extDb) { try { extDb.close(); } catch {} extDb = null; }
+    await startServices().catch((e) => log('start failed', e.message));
+  }
+  refreshTray();
+  return { ok: r.ok, steps: r.steps, status: await bootStatus() };
+}
 
 // ---------- windows and tray ----------
 function showWindow() {
@@ -86,12 +165,32 @@ function makeTray() {
   const icon = nativeImage.createFromPath(path.join(__dirname, 'icon.png'));
   tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon.resize({ width: 16, height: 16 }));
   tray.setToolTip(config.role === 'hub' ? 'KeaS · Kea Hub running' : 'KeaS · server running');
+  tray.on('click', showWindow);
+  refreshTray();
+}
+function refreshTray() {
+  if (!tray) return;
+  const isHub = config.role === 'hub';
+  const installed = !!config.boot?.installed;
+  tray.setToolTip(isHub ? (hubExternal ? 'KeaS · Kea Hub running (started before sign-in)' : 'KeaS · Kea Hub running') : 'KeaS · server running');
+  const toggle = async () => {
+    try {
+      // (Only the task: the power settings stay as they are. "Power settings…" changes or undoes those.)
+      const r = await bootApply({ ...(config.boot?.options || { power: false }), bootStart: !installed });
+      if (!r.ok) dialog.showMessageBox({ type: 'warning', title: 'KeaS', message: 'Part of it didn’t work.', detail: r.steps.filter((s) => !s.ok).map((s) => `${s.step}: ${s.error}`).join('\n') });
+    } catch (e) { dialog.showMessageBox({ type: 'warning', title: 'KeaS', message: e.message }); }
+    refreshTray();
+  };
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: 'Open KeaS', click: showWindow },
+    ...(isHub ? [
+      { type: 'separator' },
+      { label: 'Start the Hub before sign-in', type: 'checkbox', checked: installed, click: toggle },
+      { label: 'Power settings…', click: () => { showWindow(); setTimeout(() => send('navigate', 'settings'), win?.webContents.isLoading() ? 800 : 0); } },
+    ] : []),
     { type: 'separator' },
-    { label: 'Quit KeaS (stops the server)', click: () => { app.isQuitting = true; app.quit(); } },
+    { label: hubExternal ? 'Quit KeaS (the Hub keeps running)' : 'Quit KeaS (stops the server)', click: () => { app.isQuitting = true; app.quit(); } },
   ]));
-  tray.on('click', showWindow);
 }
 
 // ---------- drives ----------
@@ -124,7 +223,7 @@ const handle = (name, fn) => ipcMain.handle(name, async (_e, arg) => {
 
 let ownerToken = null;
 function registerIpc() {
-  handle('state', async () => ({ config: { ...config, googleClientSecret: undefined }, running: { hub: !!hub, org: !!org }, port: servicePort(), defaults: { hubData: defaultFolder('Kea Hub'), orgData: defaultFolder('KeaS Server') }, version: app.getVersion() }));
+  handle('state', async () => ({ config: { ...config, googleClientSecret: undefined }, running: { hub: hubRunning(), org: !!org, hubExternal }, port: servicePort(), defaults: { hubData: defaultFolder('Kea Hub'), orgData: defaultFolder('KeaS Server') }, version: app.getVersion() }));
   handle('drives', () => drives());
   handle('pickFolder', async ({ start }) => {
     const r = await dialog.showOpenDialog(win, { title: 'Where should KeaS keep its data?', defaultPath: start, properties: ['openDirectory', 'createDirectory'] });
@@ -136,9 +235,14 @@ function registerIpc() {
     checkFolder(dataDir);
     if (storageDir) checkFolder(storageDir);
     config = writeConfig({ ...config, role, dataDir, storageDir: storageDir || path.join(dataDir, 'storage'), quotaGb: Number(quotaGb) || 25, tailscale: reach === 'tailscale' });
+    // The before-sign-in launcher reads these settings at each start: keep it in step (no permission needed).
+    if (config.boot?.installed && !DEV) { try { bootstart.prepareFiles({ ...bootArgs(), opts: config.boot.options }); } catch (e) { log('boot files', e.message); } }
     return config;
   });
-  handle('start', async () => { await startServices(); return { hub: !!hub, org: !!org, port: servicePort() }; });
+  handle('start', async () => { await startServices(); return { hub: hubRunning(), org: !!org, port: servicePort() }; });
+  handle('boot:status', () => bootStatus());
+  handle('boot:apply', ({ options, dryRun }) => bootApply(options, !!dryRun));
+  handle('boot:remove', ({ dryRun }) => bootRemove(!!dryRun));
 
   handle('ts:status', () => tailscale.status(servicePort()));
   handle('ts:install', () => tailscale.install((l) => send('progress', l)));
@@ -155,14 +259,14 @@ function registerIpc() {
   const local = (p, init = {}, token) => fetch(`http://127.0.0.1:${HUB_PORT}${p}`, { ...init, headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) } }).then(async (r) => { const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || `Hub said ${r.status}`); return j; });
   handle('terms', () => local('/v1/terms'));
   handle('owner:create', async ({ name, email, password, termsVersion, termsSections }) => {
-    if (!hub) throw new Error('Start the Hub first.');
+    const db = await hubDb();
     let token;
-    const existing = hub.h.get('SELECT id FROM accounts WHERE email = ?', String(email).trim().toLowerCase());
+    const existing = db.get('SELECT id FROM accounts WHERE email = ?', String(email).trim().toLowerCase());
     if (existing) token = (await local('/v1/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) })).token;
     else token = (await local('/v1/auth/register', { method: 'POST', body: JSON.stringify({ email, password, displayName: name, age13: true, termsVersion, termsSections }) })).token;
-    const a = hub.h.get('SELECT * FROM accounts WHERE email = ?', String(email).trim().toLowerCase());
-    hub.h.run("UPDATE accounts SET role = 'owner', can_host = 1, email_verified = 1, verified_by = 'owner', identity_verified = 1, updated_at = ? WHERE id = ?", Date.now(), a.id);
-    hub.h.run('INSERT INTO audit (at,actor,action,target,ip) VALUES (?,?,?,?,?)', Date.now(), 'keas-setup', 'owner.make_owner', a.id, 'local');
+    const a = db.get('SELECT * FROM accounts WHERE email = ?', String(email).trim().toLowerCase());
+    db.run("UPDATE accounts SET role = 'owner', can_host = 1, email_verified = 1, verified_by = 'owner', identity_verified = 1, updated_at = ? WHERE id = ?", Date.now(), a.id);
+    db.run('INSERT INTO audit (at,actor,action,target,ip) VALUES (?,?,?,?,?)', Date.now(), 'keas-setup', 'owner.make_owner', a.id, 'local');
     config = writeConfig({ ...config, ownerEmail: a.email });
     ownerToken = token;
     // The owner must use two-step sign-in. (Already on: nothing to set up.)
@@ -211,9 +315,11 @@ app.whenReady().then(async () => {
   registerIpc();
   if (config.setupDone) {
     try { await startServices(); } catch (e) { log('start failed', e.message); }
+    // KeaS was updated: the before-sign-in Hub uses the new Hub files from its next start.
+    if (config.role === 'hub' && config.boot?.installed && !DEV) bootstart.refreshIfOutdated({ ...bootArgs(), opts: config.boot.options });
     makeTray();
   }
   if (!process.argv.includes('--hidden') || !config.setupDone) showWindow();
 });
 app.on('window-all-closed', () => { if (!config.setupDone) app.quit(); });
-app.on('before-quit', async () => { app.isQuitting = true; try { await hub?.close(); await org?.close(); } catch {} });
+app.on('before-quit', async () => { app.isQuitting = true; clearInterval(hubWatch); try { await hub?.close(); await org?.close(); extDb?.close(); } catch {} });
