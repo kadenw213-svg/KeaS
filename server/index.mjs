@@ -80,7 +80,7 @@ function sameOrigin(req, origins) {
  */
 export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = process.env.KEAS_WEB_DIR || DEFAULT_WEB_DIR, log = true, now = () => Date.now(),
   vault: vaultMode = process.env.KEAS_VAULT === '1', hubUrl = process.env.KEAS_HUB_URL || null, sharedDir = SHARED, passphrase = process.env.KEAS_VAULT_PASSPHRASE || null, fetchImpl = globalThis.fetch,
-  localSignIn = false, devKeyFile = dbFile === DEFAULT_DB || dbFile === ':memory:' || process.env.KEAS_DEV_KEYFILE === '1',
+  localSignIn = false, hubTrustKeys = null, devKeyFile = dbFile === DEFAULT_DB || dbFile === ':memory:' || process.env.KEAS_DEV_KEYFILE === '1',
   demo = process.env.KEAS_DEV_DEMO === '1', publicHosts = [] } = {}) {
   const demoOn = !!demo && !vaultMode;
   const extraHosts = (Array.isArray(publicHosts) ? publicHosts : [publicHosts]).filter(Boolean).map((x) => String(x).toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, ''));
@@ -499,6 +499,8 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     mode: vaultMode ? 'vault' : 'org', h, route, V, HttpError, bad, need, has, privileged, audit, now, iso, vault, approvals, onClose: [],
     hub: makeHubClient({ fetchImpl, now }), defaultHubUrl: fixedHubUrl,
     localSignIn: typeof localSignIn === 'function' ? localSignIn : () => !!localSignIn,
+    // This PC's own Hub's public key (from the KeaS app, when this PC is the Hub): the Hub must prove it holds it.
+    hubTrustKeys: typeof hubTrustKeys === 'function' ? hubTrustKeys : () => hubTrustKeys,
     uid: (p) => `${p}-${randomUUID()}`, today: (org) => localDate(now(), org.tz),
     getPerson, getShift, loadOrg, rulesFor, tablesFor, computeTimecard, positionsOf,
     periodOf, currentPeriod, lastCompleted, parsePeriod, newSession, sessionCookie,

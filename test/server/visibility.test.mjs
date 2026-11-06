@@ -17,7 +17,7 @@ const login = async (personId) => (await call('POST', '/v1/auth/demo-login', nul
 
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), 'keas-visibility-test-'));
-  app = createApp({ dbFile: join(dir, 'org.db'), log: false, devKeyFile: true });
+  app = createApp({ dbFile: join(dir, 'org.db'), log: false, devKeyFile: true, demo: true });
   base = `http://127.0.0.1:${await app.listen(0)}`;
 });
 after(async () => { await app?.close(); rmSync(dir, { recursive: true, force: true }); });

@@ -21,7 +21,7 @@ const audits = (action) => app.h.all('SELECT * FROM audit_log WHERE action = ? O
 
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), 'keas-approvals-test-'));
-  const probe = createApp({ dbFile: join(dir, 'probe.db'), log: false, devKeyFile: true });
+  const probe = createApp({ dbFile: join(dir, 'probe.db'), log: false, devKeyFile: true, demo: true });
   base = `http://127.0.0.1:${await probe.listen(0)}`;
   const year = (await call('GET', '/v1/payrun/preview', await login('p03'))).body.year;
   await probe.close();
@@ -34,7 +34,7 @@ before(async () => {
     const l = JSON.parse(readFileSync(join(d, 'labor', `${code}.json`), 'utf8'));
     writeFileSync(join(d, 'labor', `${code}.json`), JSON.stringify({ ...l, verifiedFor: year }));
   }
-  app = createApp({ dbFile: join(dir, 'org.db'), log: false, sharedDir: d, devKeyFile: true });
+  app = createApp({ dbFile: join(dir, 'org.db'), log: false, sharedDir: d, devKeyFile: true, demo: true });
   base = `http://127.0.0.1:${await app.listen(0)}`;
 });
 after(async () => { await app?.close(); rmSync(dir, { recursive: true, force: true }); });

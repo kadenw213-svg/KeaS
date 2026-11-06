@@ -17,6 +17,7 @@ const path = require('path');
 const { pathToFileURL } = require('url');
 const { BrowserWindow, shell, nativeTheme, session } = require('electron');
 const bootstart = require('./bootstart.cjs');
+const { hubPublicKey } = require('./hubid.cjs');
 
 // The payroll window's own browser session, kept in memory only (nothing of it is saved when KeaS quits).
 const PARTITION = 'keas-payroll';
@@ -43,7 +44,15 @@ function createPayroll({ getConfig, setConfig, userData, root, hubPort, log = ()
     // Only this Windows account (and SYSTEM and Administrators) can open the vault file and the exports.
     try { await bootstart.secureDataFolder(dir()); folderProblem = null; } catch (e) { folderProblem = e.message; log('payroll folder permissions', e.message); }
     fs.mkdirSync(dir(), { recursive: true });
-    server = createApp({ dbFile: path.join(dir(), 'payroll-vault.db'), vault: true, hubUrl: hubUrl(), localSignIn, log: false });
+    // When this PC is the Hub, payroll checks whatever answers on the Hub's port against the key in the Hub's data
+    // folder (desktop/hubid.cjs) before sending it a password: it must sign a fresh nonce with that key.
+    const hubTrustKeys = () => {
+      const c = getConfig();
+      if (c.role !== 'hub' || !c.dataDir) return null;
+      const pub = hubPublicKey(c.dataDir);
+      return pub ? [{ kty: 'OKP', crv: 'Ed25519', x: pub.export({ format: 'jwk' }).x }] : null;
+    };
+    server = createApp({ dbFile: path.join(dir(), 'payroll-vault.db'), vault: true, hubUrl: hubUrl(), localSignIn, hubTrustKeys, log: false });
     port = await server.listen(0);
     log('payroll vault started', dir());
     return port;

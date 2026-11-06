@@ -16,7 +16,7 @@ async function call(method, path, token, body) {
   return { status: r.status, body: await r.json().catch(() => null) };
 }
 const login = async (personId) => (await call('POST', '/v1/auth/demo-login', null, { personId })).body.token;
-const start = async () => { app = createApp({ dbFile: file(), log: false, devKeyFile: true }); base = `http://127.0.0.1:${await app.listen(0)}`; };
+const start = async () => { app = createApp({ dbFile: file(), log: false, devKeyFile: true, demo: true }); base = `http://127.0.0.1:${await app.listen(0)}`; };
 /** The database file and its write-ahead log as bytes. */
 const fileBytes = () => Buffer.concat([file(), file() + '-wal'].filter(existsSync).map((f) => readFileSync(f)));
 

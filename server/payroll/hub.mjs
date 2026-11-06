@@ -7,7 +7,7 @@
 //     or logged here.
 //   - The Hub's signing key (and issuer) is pinned when the vault is set up. Later tokens must be signed by that key:
 //     a different key is refused until the owner accepts it in the KeaS app (repinHub), after seeing its fingerprint.
-import { createPublicKey, createHash } from 'node:crypto';
+import { createPublicKey, createHash, randomBytes, verify as edVerify } from 'node:crypto';
 import { verifyToken } from '../../hub/lib/tokens.mjs';
 
 export const AUDIENCE = 'keas-payroll';
@@ -33,6 +33,7 @@ export const KEY_CHANGE_REASONS = [
 ];
 export const KEY_CHANGE_WARNING = 'If none of these happened, don’t accept the new key: someone may be pretending to be your Kea Hub to get into payroll.';
 
+export const NOT_OUR_HUB = 'Whatever is answering at the Kea Hub’s address couldn’t prove it’s your Kea Hub (it doesn’t hold the signing key payroll trusts), so your password and code weren’t sent to it. If the Hub was moved or reinstalled, the owner can check and accept its new key in the KeaS app on this computer (Payroll, Advanced).';
 export const KEY_CHANGED = 'The Kea Hub’s signing key isn’t the one this vault trusts. If the Hub was moved or reinstalled, the owner can accept its new key in the KeaS app on this computer (Payroll, Advanced). Until then, Kea Hub sign-in is refused.';
 
 /** A Hub address the vault will send a password to: https anywhere, or plain http only to this computer. */
@@ -97,17 +98,38 @@ export function makeHubClient({ fetchImpl = fetch, timeoutMs = 8000, now = () =>
   }
 
   /**
-   * Email + password (+ two-step code) at the Hub -> verified identity { sub, email, name, emailVerified, keys }.
-   * pin: { url, iss, keys } pinned at setup; without one (setup), the Hub's current keys are used and returned so the
-   * caller can pin them.
+   * Proves the Hub at `base` holds one of `keys` before anything secret is sent to it: it signs a fresh random nonce
+   * (GET /v1/identity) and the signature is checked here. Anything else on that address (another program on the Hub's
+   * port while the Hub is down, or a look-alike) fails, and nothing is sent.
    */
-  async function signIn(base, { email, password, code }, { pin = null } = {}) {
+  async function proveIdentity(base, keys) {
+    const nonce = randomBytes(16).toString('hex');
+    let j;
+    try { j = await call(base, `/v1/identity?nonce=${nonce}`); } catch (e) { if (e instanceof HubUnreachable) throw e; throw new HubRefused(NOT_OUR_HUB, 401, { hubKeyChanged: true, notOurHub: true }); }
+    const sig = typeof j?.sig === 'string' && j.sig.length <= 200 ? Buffer.from(j.sig, 'base64url') : null;
+    const msg = Buffer.from(`kea-hub-identity:v1:${nonce}`);
+    for (const jwk of keys || []) {
+      if (!sig || !okp(jwk)) continue;
+      try { if (edVerify(null, msg, createPublicKey({ key: { kty: 'OKP', crv: 'Ed25519', x: jwk.x }, format: 'jwk' }), sig)) return true; } catch {}
+    }
+    throw new HubRefused(NOT_OUR_HUB, 401, { hubKeyChanged: true, notOurHub: true });
+  }
+
+  /**
+   * Email + password (+ two-step code) at the Hub -> verified identity { sub, email, name, emailVerified, keys }.
+   * pin: { url, iss, keys } pinned at setup. trust: keys known some other way (this PC's own Hub key file, from the
+   * KeaS app). The Hub must first prove it holds the pinned (or trusted) key; without either (setting up with a Hub on
+   * another PC), it must at least hold the key it offers, which is then returned so the caller can pin it.
+   */
+  async function signIn(base, { email, password, code }, { pin = null, trust = null } = {}) {
     if (!base) throw new HubUnreachable('No Kea Hub is set for this vault.');
     if (pin && pin.url !== base) throw new HubRefused(KEY_CHANGED, 401, { hubKeyChanged: true });
+    const idKeys = pin?.keys || (trust?.length ? trust : await fetchKeys(base));
+    await proveIdentity(base, idKeys);
     const login = await call(base, '/v1/auth/login', { method: 'POST', body: { email, password, ...(code ? { code } : {}) } });
     try {
       const t = await call(base, '/v1/auth/token', { method: 'POST', body: { aud: AUDIENCE }, token: login.token });
-      const keys = pin ? pin.keys : await fetchKeys(base);
+      const keys = pin ? pin.keys : idKeys;
       const p = verifyWith(keys, t.token, { iss: pin?.iss || ISSUER });
       return { sub: p.sub, email: String(p.email || '').toLowerCase(), name: p.name || null, emailVerified: p.ev === true, keys };
     } finally {
@@ -121,5 +143,5 @@ export function makeHubClient({ fetchImpl = fetch, timeoutMs = 8000, now = () =>
     try { await call(base, '/v1/health'); return true; } catch (e) { return !(e instanceof HubUnreachable); }
   }
 
-  return { signIn, verifyWith, fetchKeys, reachable };
+  return { signIn, verifyWith, fetchKeys, reachable, proveIdentity };
 }

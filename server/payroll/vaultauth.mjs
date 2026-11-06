@@ -123,7 +123,7 @@ export function registerVaultAuth(c) {
   /** Checks the person at the Hub; returns the vault user row, or null when it isn't them. */
   async function identifyAtHub(user, { email, password, code }) {
     let who;
-    try { who = await hub.signIn(hubUrl(), { email, password, code }, { pin: pin() }); }
+    try { who = await hub.signIn(hubUrl(), { email, password, code }, { pin: pin(), trust: c.hubTrustKeys?.() }); }
     catch (e) { if (e instanceof HubRefused && (e.status === 401 || e.status === 403) && !e.extra?.hubKeyChanged) return null; throw hubError(e, user); }
     if (!user || who.email !== user.email || (user.hub_sub && user.hub_sub !== who.sub)) return null;
     if (!user.hub_sub) {
@@ -151,7 +151,7 @@ export function registerVaultAuth(c) {
     let hubSub = null, localPw = null, keys = null;
     if (mode === 'hub') {
       let who;
-      try { who = await hub.signIn(hubUrl(), { email, password: String(s.password ?? ''), code: s.code ? String(s.code) : undefined }); }
+      try { who = await hub.signIn(hubUrl(), { email, password: String(s.password ?? ''), code: s.code ? String(s.code) : undefined }, { trust: c.hubTrustKeys?.() }); }
       catch (e) { if (e instanceof HubRefused && (e.status === 401 || e.status === 403)) throw new HttpError(401, e.message); throw hubError(e, null); }
       if (who.email !== email) bad('That Kea Hub account has a different email.');
       if (!who.emailVerified) throw new HttpError(403, 'Verify your email address in your Kea Hub account first, then set up payroll.');

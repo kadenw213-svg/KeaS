@@ -4,6 +4,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { sign as edSign } from 'node:crypto';
 import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -26,9 +27,12 @@ const ACCOUNT = { email: 'pat@example.org', password: 'correct horse battery', s
 const PASS = 'summer camp payroll vault';
 const LOCAL_PW = 'river lantern copper meadow';
 let hubCalls = [];
+// A look-alike on the Hub's address: it serves the real Hub's public key and accepts any password, but can't sign
+// with the real key (set to another key to play it).
+let lookalikeKey = null;
 
 /** A stand-in Kea Hub with the same token format and endpoints; `signer` and `claims` let a test change what it issues. */
-function fakeHub({ accept = (b) => b.email === ACCOUNT.email && b.password === ACCOUNT.password, signer = () => hubKey, claims = () => ({}), log = hubCalls, up = () => hubUp } = {}) {
+function fakeHub({ accept = (b) => b.email === ACCOUNT.email && b.password === ACCOUNT.password, signer = () => hubKey, identitySigner = () => lookalikeKey || signer(), claims = () => ({}), log = hubCalls, up = () => hubUp } = {}) {
   return http.createServer((req, res) => {
     let body = '';
     req.on('data', (c) => (body += c));
@@ -39,6 +43,10 @@ function fakeHub({ accept = (b) => b.email === ACCOUNT.email && b.password === A
       log.push({ url: req.url, body: b });
       if (req.url === '/v1/health') return send(200, { ok: true, service: 'kea-hub' });
       if (req.url === '/v1/keys') return send(200, { keys: [signer().jwk] });
+      if (req.url.startsWith('/v1/identity?')) {
+        const n = new URL(req.url, 'http://x').searchParams.get('nonce');
+        return send(200, { kid: identitySigner().kid, sig: edSign(null, Buffer.from(`kea-hub-identity:v1:${n}`), identitySigner().privateKey).toString('base64url') });
+      }
       if (req.url === '/v1/auth/login') return accept(b) ? send(200, { token: 'hub-session' }) : send(401, { error: 'Wrong email or password.' });
       if (req.url === '/v1/auth/token') {
         if (req.headers.authorization !== 'Bearer hub-session') return send(401, { error: 'no' });
@@ -495,4 +503,39 @@ test('L: wrong-passphrase counts survive a restart of the vault', async () => {
     ({ a, b } = await open());
     assert.equal((await c2('POST', '/v1/vault/signin', { email: ACCOUNT.email, password: ACCOUNT.password, passphrase: PASS })).status, 429, 'still waiting after a restart');
   } finally { await a.close(); rmSync(d, { recursive: true, force: true }); }
+});
+
+test('HIGH: before any password or code goes to the Hub, it must sign a fresh nonce with the pinned key; a look-alike gets nothing', async () => {
+  await call('POST', '/v1/vault/lock', token);
+  lookalikeKey = otherKey;
+  try {
+    const before = hubCalls.filter((c) => c.url === '/v1/auth/login').length;
+    const r = await signin();
+    assert.equal(r.status, 401);
+    assert.equal(r.body.notOurHub, true);
+    assert.match(r.body.error, /couldn’t prove it’s your Kea Hub/);
+    assert.equal(hubCalls.filter((c) => c.url === '/v1/auth/login').length, before, 'no password or code was sent to it');
+    assert.equal((await call('GET', '/v1/vault/status')).body.locked, true);
+  } finally { lookalikeKey = null; }
+  app.h.run('DELETE FROM vault_limits'); // (the earlier M2 test left this admin waiting)
+  const ok = await signin();
+  assert.equal(ok.status, 200, 'the real Hub proves itself and sign-in works');
+  token = ok.body.token;
+});
+
+test('HIGH: setting up payroll on the Hub’s own PC: whatever answers on the Hub’s port must hold the key in the Hub’s data folder', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'keas-vault-lookalike-'));
+  const captured = [];
+  // Another program on the Hub's address: real-looking keys and tokens of its own, any password accepted.
+  const fake = fakeHub({ accept: () => true, signer: () => otherKey, log: captured, up: () => true });
+  const fakeBase = await listen(fake);
+  const a2 = createApp({ dbFile: join(d, 'v.db'), log: false, vault: true, hubUrl: fakeBase, hubTrustKeys: () => [{ kty: 'OKP', crv: 'Ed25519', x: key.jwk.x }] });
+  const b2 = `http://127.0.0.1:${await a2.listen(0)}`;
+  try {
+    const r = await fetch(b2 + '/v1/vault/setup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ passphrase: PASS, org: { name: 'Camp', state: 'TX' }, admin: { name: 'Pat Lee', email: ACCOUNT.email }, signIn: { password: ACCOUNT.password, code: '123456' } }) });
+    assert.equal(r.status, 401);
+    assert.match((await r.json()).error, /couldn’t prove/);
+    assert.deepEqual(captured.filter((c) => c.url === '/v1/auth/login'), [], 'the password never reached it');
+    assert.equal(a2.vault.initialized(), false);
+  } finally { await a2.close(); fake.close(); rmSync(d, { recursive: true, force: true }); }
 });
