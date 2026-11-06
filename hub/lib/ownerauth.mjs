@@ -10,7 +10,7 @@
 //   3. the Hub's answer carries  X-Kea-Owner-Reply: HMAC-SHA256(key, "kea-owner-reply-v1\n<nonce>\n<client challenge>\n
 //      <status>\n<METHOD>\n<path and query>\n<sha256 of the answer>"), so a program squatting on the port can't feed the
 //      client made-up answers (fake jobs, say). The client's own random challenge goes in X-Kea-Owner-Challenge, so an
-//      old answer can't be replayed either. A sign-in that failed gets no such header: nothing vouches for its text.
+//      old answer can't be replayed either. A refused sign-in gets no such header: nothing vouches for its text.
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
 export const OWNER_AUTH_HEADER = 'x-kea-owner-auth';
@@ -79,7 +79,7 @@ export function ownerNonces(nowFn = () => Date.now()) {
 
 /**
  * A client call to the owner console: gets a nonce, sends the signed request, and checks the answer really came from
- * the Hub (throws OwnerReplyError if not). A failed sign-in (401) comes back unproved, as a failure to act on and
+ * the Hub (throws OwnerReplyError if not). A refused sign-in (401, 403) comes back unproved, as a failure to act on and
  * nothing more. `body` may be an object (sent as JSON), a string or a Buffer. Returns a Response.
  */
 export async function ownerFetch(base, key, method, path, body, opts = {}) {
@@ -103,7 +103,7 @@ async function ownerCall(base, key, method, path, body, { fetchFn = fetch, heade
     body: data,
   });
   const proof = r.headers.get(OWNER_REPLY_HEADER);
-  if (r.status === 401 && !proof) return r;
+  if ((r.status === 401 || r.status === 403) && !proof) return r;
   const answer = Buffer.from(await r.arrayBuffer());
   const want = Buffer.from(ownerReplyMac(key, nonce, challenge, r.status, method, u.pathname + u.search, answer), 'hex');
   const got = Buffer.from(/^[0-9a-f]{64}$/.test(String(proof)) ? proof : '', 'hex');
