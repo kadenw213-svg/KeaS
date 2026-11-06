@@ -99,6 +99,7 @@ function makeTray() {
 let payrollApi = null;
 const payroll = () => (payrollApi ||= require('./payroll.cjs').createPayroll({ getConfig: () => config, userData: app.getPath('userData'), root: ROOT, hubPort: HUB_PORT, log }));
 const openPayroll = () => payroll().open().catch((e) => { log('payroll', e.message); throw e; });
+app.on('before-quit', () => { payrollApi?.stop(); });
 
 // ---------- drives ----------
 function drives() {
@@ -223,4 +224,4 @@ app.whenReady().then(async () => {
   if (!process.argv.includes('--hidden') || !config.setupDone) showWindow();
 });
 app.on('window-all-closed', () => { if (!config.setupDone) app.quit(); });
-app.on('before-quit', async () => { app.isQuitting = true; try { await hub?.close(); await org?.close(); await payrollApi?.stop(); } catch {} });
+app.on('before-quit', async () => { app.isQuitting = true; try { await hub?.close(); await org?.close(); } catch {} });
