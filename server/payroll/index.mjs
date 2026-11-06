@@ -22,6 +22,8 @@ export function registerPayroll(c) {
     if (!me.roles.includes('owner')) throw new c.HttpError(403, `You can’t change ${what}. Ask the owner (or another payroll admin) to do it.`);
     return true;
   };
+  /** Pay amounts are for payroll and the owner; managers see them only when the owner turns that on. */
+  c.seesPay = (me, org) => c.has(me, 'payroll') || !!org.settings?.managersSeePay;
   registerVaultAuth(c);
   registerApprovals(c);
   registerOrgStructure(c);

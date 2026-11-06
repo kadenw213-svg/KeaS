@@ -8,27 +8,47 @@
 //   really can't be reached, and is rate-limited per account.
 // - Wrong tries are counted per account and per address, never for everyone at once: someone else's wrong guesses
 //   can't lock out a payroll admin who signs in at the Hub (password and two-step code) with the right passphrase.
+//   The counts are kept in the vault's database, so restarting the vault doesn't reset them.
+// - The vault locks itself (key wiped from memory, everyone signed out) after a quiet spell (15 minutes unless the
+//   settings say otherwise), and a sign-in lasts 2 hours at most.
 import { hashLocalPassword, checkLocalPassword } from '../lib/vault.mjs';
 import { HubUnreachable, HubRefused, ISSUER } from './hub.mjs';
 import { addDays, weekStartOf } from '../lib/time.mjs';
 
-/** Wrong-try counting by key ('acct:<email>', 'ip:<address>', 'user:<id>'): 5 free, then a doubling wait up to 15 minutes. */
-export function makeLimiter({ now, free = 5, baseMs = 30_000, capMs = 15 * 60_000, maxKeys = 10_000 }) {
+/** Where wrong-try counts live: in memory (tests), or a table (the vault: survives restarts). */
+export function memoryLimitStore() {
   const m = new Map();
+  return { get: (k) => m.get(k), set: (k, e) => m.set(k, { ...e }), del: (k) => m.delete(k), size: () => m.size, prune(before) { for (const [k, e] of m) if (e.until <= before && e.at < before) m.delete(k); } };
+}
+export function dbLimitStore(h) {
   return {
-    /** Milliseconds to wait before this key may try again (0: go ahead). */
-    wait(key) { const e = key && m.get(key); return e && e.until > now() ? e.until - now() : 0; },
-    fail(key) {
-      if (!key) return;
-      if (m.size >= maxKeys) for (const [k, e] of m) { if (e.until <= now() && now() - e.at > capMs) m.delete(k); if (m.size < maxKeys / 2) break; }
-      const e = m.get(key) || { n: 0, until: 0, at: 0 };
-      e.n++; e.at = now();
-      if (e.n >= free) e.until = now() + Math.min(capMs, baseMs * 2 ** (e.n - free));
-      m.set(key, e);
-    },
-    clear(key) { if (key) m.delete(key); },
+    get: (k) => h.get('SELECT n, until, at FROM vault_limits WHERE k = ?', k) ?? undefined,
+    set: (k, e) => h.run('INSERT INTO vault_limits (k, n, until, at) VALUES (?,?,?,?) ON CONFLICT(k) DO UPDATE SET n = excluded.n, until = excluded.until, at = excluded.at', k, e.n, e.until, e.at),
+    del: (k) => h.run('DELETE FROM vault_limits WHERE k = ?', k),
+    size: () => h.get('SELECT COUNT(*) AS n FROM vault_limits').n,
+    prune: (before) => h.run('DELETE FROM vault_limits WHERE until <= ? AND at < ?', before, before),
   };
 }
+
+/** Wrong-try counting by key ('acct:<email>', 'ip:<address>', 'user:<id>'): 5 free, then a doubling wait up to 15 minutes. */
+export function makeLimiter({ now, free = 5, baseMs = 30_000, capMs = 15 * 60_000, maxKeys = 10_000, store = memoryLimitStore() }) {
+  return {
+    /** Milliseconds to wait before this key may try again (0: go ahead). */
+    wait(key) { const e = key && store.get(key); return e && e.until > now() ? e.until - now() : 0; },
+    fail(key) {
+      if (!key) return;
+      if (store.size() >= maxKeys) store.prune(now() - capMs);
+      const e = store.get(key) || { n: 0, until: 0, at: 0 };
+      const next = { n: e.n + 1, until: e.until, at: now() };
+      if (next.n >= free) next.until = now() + Math.min(capMs, baseMs * 2 ** (next.n - free));
+      store.set(key, next);
+    },
+    clear(key) { if (key) store.del(key); },
+  };
+}
+
+export const IDLE_LOCK_DEFAULT_MIN = 15;
+export const IDLE_LOCK_MAX_MIN = 120;
 
 /** A local password strong enough to stand in for a Hub sign-in with two-step codes: a passphrase, not a word. */
 export function checkLocalStrength(pw, { email, passphrase } = {}) {
@@ -51,7 +71,30 @@ export function registerVaultAuth(c) {
   const hubUrl = () => c.defaultHubUrl || null;
   const localOn = () => !!c.localSignIn();
   const pin = () => vault.setting('hubPin', null);
-  const limiter = makeLimiter({ now });
+  const limiter = makeLimiter({ now, store: c.mode === 'vault' ? dbLimitStore(h) : memoryLimitStore() });
+
+  // Locks the vault when nobody has used it for a while: the key is wiped from memory and every sign-in ends.
+  // (Requests a page makes by itself, marked X-KeaS-Background, don't count as use.)
+  let lastUse = now();
+  const idleMinutes = () => Math.min(IDLE_LOCK_MAX_MIN, Math.max(1, Number(vault.setting('idleLockMinutes', IDLE_LOCK_DEFAULT_MIN)) || IDLE_LOCK_DEFAULT_MIN));
+  c.touchVault = () => { lastUse = now(); };
+  c.lockVault = (why) => {
+    if (!vault.unlocked()) return false;
+    const orgId = h.get('SELECT id FROM orgs LIMIT 1')?.id ?? null;
+    audit(orgId, 'keas', 'vault_lock', null, { why });
+    h.run('DELETE FROM sessions');
+    vault.lock();
+    return true;
+  };
+  c.checkIdle = () => {
+    if (c.mode !== 'vault' || !vault.unlocked()) return false;
+    return now() - lastUse >= idleMinutes() * 60_000 ? c.lockVault('idle') : false;
+  };
+  if (c.mode === 'vault') {
+    const t = setInterval(() => { try { c.checkIdle(); } catch {} }, 15_000);
+    t.unref?.();
+    c.onClose.push(() => clearInterval(t));
+  }
   const guard = (...keys) => {
     const ms = Math.max(0, ...keys.map((k) => limiter.wait(k)));
     if (ms) throw new HttpError(429, `Too many wrong tries. Wait ${Math.ceil(ms / 1000)} seconds.`);
@@ -166,6 +209,7 @@ export function registerVaultAuth(c) {
       limiter.clear(mine);
     }
     limiter.clear(where);
+    lastUse = now();
     h.run('UPDATE vault_users SET last_login = ? WHERE id = ?', iso(now()), who.id);
     const p = h.get('SELECT org_id FROM people WHERE id = ?', who.person_id);
     audit(p.org_id, who.person_id, 'vault_signin', who.id, { mode });
@@ -228,7 +272,7 @@ export function registerVaultAuth(c) {
   route('POST', '/v1/vault/hub-url', () => { throw new HttpError(410, 'The Kea Hub for payroll is set in the KeaS app on this computer.'); });
 
   // Org-wide payroll settings (each key validated).
-  route('GET', '/v1/org/settings', ({ me, org }) => { need(me, 'manager', 'payroll'); return { settings: org.settings, org: { name: org.name, state: org.state, tz: org.tz, payFrequency: org.payFrequency, payPeriodAnchor: org.payPeriodAnchor, futaExempt: org.futaExempt, sutaRate: org.sutaRate } }; });
+  route('GET', '/v1/org/settings', ({ me, org }) => { need(me, 'manager', 'payroll'); return { settings: org.settings, org: { name: org.name, state: org.state, tz: org.tz, payFrequency: org.payFrequency, payPeriodAnchor: org.payPeriodAnchor, futaExempt: org.futaExempt, sutaRate: org.sutaRate }, vault: c.mode === 'vault' ? { idleLockMinutes: idleMinutes() } : null }; });
   route('POST', '/v1/org/settings', ({ me, org, body }) => {
     need(me, 'owner', 'payroll');
     const s = {};
@@ -240,7 +284,16 @@ export function registerVaultAuth(c) {
     if (body.fmla !== undefined) s.fmla = { worksiteEmployees: body.fmla?.worksiteEmployees == null || body.fmla.worksiteEmployees === '' ? null : Math.round(num(body.fmla.worksiteEmployees, 'worksiteEmployees', 1e6)) };
     if (body.aca !== undefined) s.aca = { ale: !!body.aca?.ale };
     if (body.offerTemplate !== undefined) s.offerTemplate = body.offerTemplate ? V.str(body.offerTemplate, 'offerTemplate', { max: 20000 }) : null;
-    c.saveOrgSettings(org, s);
+    // Pay amounts in managers' reports: off unless the owner turns it on.
+    if (body.managersSeePay !== undefined) { need(me, 'owner'); s.managersSeePay = !!body.managersSeePay; }
+    if (body.idleLockMinutes !== undefined && c.mode === 'vault') {
+      const m = Math.round(num(body.idleLockMinutes, 'idleLockMinutes', IDLE_LOCK_MAX_MIN));
+      if (m < 1) bad('idleLockMinutes must be 1 or more');
+      vault.setSetting('idleLockMinutes', m);
+      s.idleLockMinutes = m;
+    }
+    const { idleLockMinutes: _idle, ...orgSettings } = s;
+    c.saveOrgSettings(org, orgSettings);
     const cols = {};
     if (body.sutaRate !== undefined) cols.suta_rate = num(body.sutaRate, 'sutaRate', 0.2);
     if (body.futaExempt !== undefined) cols.futa_exempt = body.futaExempt ? 1 : 0;

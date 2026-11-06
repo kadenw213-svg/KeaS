@@ -425,3 +425,64 @@ test('the vault works with real data: an employee’s SSN and bank are sealed; c
     assert.equal(run.lines.find((l) => l.personId === pid).gross, Math.round(18.5 * 1600));
   } finally { await a2.close(); rmSync(d, { recursive: true, force: true }); }
 });
+
+test('L: vault sessions last 2 hours at most; a quiet vault locks itself (15 minutes by default, a setting) and wipes its key', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'keas-vault-idle-'));
+  let clock = Date.now();
+  const a2 = createApp({ dbFile: join(d, 'v.db'), log: false, vault: true, hubUrl: hubBase, now: () => clock });
+  const b2 = `http://127.0.0.1:${await a2.listen(0)}`;
+  const c2 = async (method, path, t, body, headers = {}) => { const r = await fetch(b2 + path, { method, headers: { 'content-type': 'application/json', ...(t ? { authorization: `Bearer ${t}` } : {}), ...headers }, body: body === undefined ? undefined : JSON.stringify(body) }); return { status: r.status, body: await r.json() }; };
+  try {
+    const s = await c2('POST', '/v1/vault/setup', null, { passphrase: PASS, org: { name: 'Camp', state: 'TX' }, admin: { name: 'Pat Lee', email: ACCOUNT.email }, signIn: { password: ACCOUNT.password } });
+    assert.equal(s.status, 200, JSON.stringify(s.body));
+    assert.ok(Math.abs(Date.parse(s.body.expiresAt) - clock - 2 * 3600_000) < 5000, 'a 2-hour session');
+    let t = s.body.token;
+    assert.equal((await c2('GET', '/v1/org/settings', t)).body.vault.idleLockMinutes, 15);
+    clock += 10 * 60_000;
+    assert.equal((await c2('GET', '/v1/me', t)).status, 200, 'used within 15 minutes');
+    clock += 14 * 60_000;
+    // The page's own background refreshes don't count as use.
+    assert.equal((await c2('GET', '/v1/me', t, undefined, { 'x-keas-background': '1' })).status, 200);
+    clock += 2 * 60_000;
+    const quiet = await c2('GET', '/v1/me', t, undefined, { 'x-keas-background': '1' });
+    assert.equal(quiet.status, 423, 'locked after 16 quiet minutes');
+    assert.equal(a2.vault.unlocked(), false, 'the key is gone from memory');
+    assert.equal(a2.h.get('SELECT COUNT(*) AS n FROM sessions').n, 0, 'everyone is signed out');
+    // (Hub tokens are checked against the clock, so sign in at the real time again.)
+    clock = Date.now();
+    const again = await c2('POST', '/v1/vault/signin', null, { email: ACCOUNT.email, password: ACCOUNT.password, passphrase: PASS });
+    assert.equal(again.status, 200, JSON.stringify(again.body));
+    t = again.body.token;
+    assert.equal((await c2('POST', '/v1/org/settings', t, { idleLockMinutes: 30 })).status, 200);
+    clock += 20 * 60_000;
+    assert.equal((await c2('GET', '/v1/me', t)).status, 200, 'the setting: 30 minutes');
+    clock += 31 * 60_000;
+    assert.equal(a2.h.get('SELECT COUNT(*) AS n FROM sessions').n, 1);
+    assert.equal((await c2('GET', '/v1/me', t)).status, 423);
+    assert.equal((await c2('GET', '/v1/vault/status')).body.locked, true);
+    // A session can't outlive 2 hours even while it's being used.
+    clock = Date.now();
+    const third = (await c2('POST', '/v1/vault/signin', null, { email: ACCOUNT.email, password: ACCOUNT.password, passphrase: PASS })).body.token;
+    for (let i = 0; i < 9; i++) { clock += 14 * 60_000; await c2('GET', '/v1/me', third); }
+    assert.equal((await c2('GET', '/v1/me', third)).status, 401, 'past 2 hours');
+    assert.equal((await c2('POST', '/v1/org/settings', null, { idleLockMinutes: 999 })).status, 401);
+  } finally { await a2.close(); rmSync(d, { recursive: true, force: true }); }
+});
+
+test('L: wrong-passphrase counts survive a restart of the vault', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'keas-vault-limits-'));
+  const file = join(d, 'v.db');
+  const open = async () => { const a = createApp({ dbFile: file, log: false, vault: true, hubUrl: hubBase }); return { a, b: `http://127.0.0.1:${await a.listen(0)}` }; };
+  let { a, b } = await open();
+  const c2 = async (method, path, body) => { const r = await fetch(b + path, { method, headers: { 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) }); return { status: r.status, body: await r.json() }; };
+  try {
+    assert.equal((await c2('POST', '/v1/vault/setup', { passphrase: PASS, org: { name: 'Camp', state: 'TX' }, admin: { name: 'Pat Lee', email: ACCOUNT.email }, signIn: { password: ACCOUNT.password } })).status, 200);
+    await a.close();
+    ({ a, b } = await open());
+    for (let i = 0; i < 5; i++) assert.equal((await c2('POST', '/v1/vault/signin', { email: ACCOUNT.email, password: ACCOUNT.password, passphrase: `not it ${i}` })).status, 401);
+    assert.equal((await c2('POST', '/v1/vault/signin', { email: ACCOUNT.email, password: ACCOUNT.password, passphrase: PASS })).status, 429);
+    await a.close();
+    ({ a, b } = await open());
+    assert.equal((await c2('POST', '/v1/vault/signin', { email: ACCOUNT.email, password: ACCOUNT.password, passphrase: PASS })).status, 429, 'still waiting after a restart');
+  } finally { await a.close(); rmSync(d, { recursive: true, force: true }); }
+});

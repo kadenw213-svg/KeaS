@@ -34,15 +34,16 @@ export function Today() {
 
   useEffect(() => {
     let stop = false;
-    const load = async () => {
+    const load = async (background = false) => {
+      const opts = { background };
       const from = new Date();
       from.setHours(0, 0, 0, 0);
       const to = new Date(from);
       to.setDate(to.getDate() + 8);
       const [st, sh, al] = await Promise.all([
-        api('GET', '/v1/status/today').catch(() => []),
-        api('GET', `/v1/shifts?from=${from.toISOString()}&to=${to.toISOString()}`).catch(() => []),
-        manager ? api('GET', '/v1/alerts').catch(() => []) : Promise.resolve([])
+        api('GET', '/v1/status/today', undefined, opts).catch(() => []),
+        api('GET', `/v1/shifts?from=${from.toISOString()}&to=${to.toISOString()}`, undefined, opts).catch(() => []),
+        manager ? api('GET', '/v1/alerts', undefined, opts).catch(() => []) : Promise.resolve([])
       ]);
       if (stop) return;
       setRows(listOf(st, 'shifts'));
@@ -50,7 +51,7 @@ export function Today() {
       setAlerts(listOf<any>(al, 'alerts').filter((a) => !a.resolved));
     };
     load();
-    const t = setInterval(load, REFRESH_SEC * 1000);
+    const t = setInterval(() => load(true), REFRESH_SEC * 1000);
     // Phones suspend timers: refresh as soon as the app comes back.
     const vis = () => document.visibilityState === 'visible' && load();
     document.addEventListener('visibilitychange', vis);

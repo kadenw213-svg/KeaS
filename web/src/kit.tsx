@@ -52,6 +52,9 @@ export async function download(path: string, body?: unknown) {
       throw new Error(j?.error || `The server said no (${r.status}).`);
     }
     const name = /filename="([^"]+)"/.exec(r.headers.get('content-disposition') || '')?.[1] || 'download';
+    // A file with something to be careful about (full SSNs): say so.
+    const warning = r.headers.get('x-keas-warning');
+    if (warning) toast(decodeURIComponent(warning));
     const url = URL.createObjectURL(await r.blob());
     const a = document.createElement('a');
     a.href = url;

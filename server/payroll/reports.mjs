@@ -140,9 +140,16 @@ export function registerReports(c) {
     },
   };
   const OPS = ['eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'contains', 'in'];
-  function runSpec(org, spec) {
-    const ds = DATASETS[spec.dataset];
-    if (!ds) bad(`dataset must be one of ${Object.keys(DATASETS).join(', ')}`);
+  // Pay amounts in reports: payroll and the owner, or managers when the owner has turned that on (org setting).
+  const PAY_DATASETS = ['pay', 'time'], PAY_FIELDS = { people: ['rate', 'rateKind'] };
+  /** The datasets and fields this person may report on. */
+  function visible(me, org) {
+    const pay = c.seesPay(me, org);
+    return Object.fromEntries(Object.entries(DATASETS).filter(([k]) => pay || !PAY_DATASETS.includes(k)).map(([k, d]) => [k, { ...d, fields: Object.fromEntries(Object.entries(d.fields).filter(([f]) => pay || !(PAY_FIELDS[k] || []).includes(f))) }]));
+  }
+  function runSpec(org, spec, me) {
+    const ds = visible(me, org)[spec.dataset];
+    if (!ds) { if (DATASETS[spec.dataset]) throw new HttpError(403, 'Pay amounts in reports are for payroll (or managers the owner allows).'); bad(`dataset must be one of ${Object.keys(DATASETS).join(', ')}`); }
     const fields = Array.isArray(spec.fields) && spec.fields.length ? spec.fields : Object.keys(ds.fields);
     for (const f of fields) if (!ds.fields[f]) bad(`unknown field ${f}`);
     const filters = Array.isArray(spec.filters) ? spec.filters : [];
@@ -151,7 +158,7 @@ export function registerReports(c) {
     for (const g of groupBy) if (!ds.fields[g]) bad(`unknown group-by field ${g}`);
     const num = (t) => t === 'money' || t === 'number';
     const cmpVal = (field, v) => (ds.fields[field] === 'money' ? Math.round(Number(v) * 100) : num(ds.fields[field]) ? Number(v) : String(v ?? '').toLowerCase());
-    let rows = ds.rows(org, spec).filter((r) => filters.every((f) => {
+    let rows = DATASETS[spec.dataset].rows(org, spec).filter((r) => filters.every((f) => {
       const a = num(ds.fields[f.field]) ? Number(r[f.field] ?? 0) : String(r[f.field] ?? '').toLowerCase();
       if (f.op === 'in') return String(f.value).split(',').map((x) => cmpVal(f.field, x.trim())).includes(a);
       const b = cmpVal(f.field, f.value);
@@ -173,11 +180,10 @@ export function registerReports(c) {
     const types = Object.fromEntries(cols.map((k) => [k, k === 'count' ? 'number' : ds.fields[k]]));
     return { columns: cols, types, rows: rows.slice(0, 20000), truncated: rows.length > 20000 };
   }
-  route('GET', '/v1/reports/fields', ({ me }) => { need(me, 'manager', 'payroll'); return { datasets: Object.fromEntries(Object.entries(DATASETS).map(([k, d]) => [k, { label: d.label, fields: d.fields }])), ops: OPS }; });
+  route('GET', '/v1/reports/fields', ({ me, org }) => { need(me, 'manager', 'payroll'); return { datasets: Object.fromEntries(Object.entries(visible(me, org)).map(([k, d]) => [k, { label: d.label, fields: d.fields }])), ops: OPS }; });
   route('POST', '/v1/reports/run', ({ me, org, body }) => {
     need(me, 'manager', 'payroll');
-    if (['pay', 'time'].includes(body.dataset)) need(me, 'payroll');
-    const r = runSpec(org, body);
+    const r = runSpec(org, body, me);
     if (body.format === 'csv') return csvOut(String(body.name || 'report').replace(/[^\w-]+/g, '-').slice(0, 60) || 'report', r.columns, r.rows.map((row) => Object.fromEntries(r.columns.map((k) => [k, r.types[k] === 'money' && row[k] != null ? dollars(row[k]) : row[k]]))));
     return r;
   });
@@ -185,7 +191,7 @@ export function registerReports(c) {
   route('POST', '/v1/reports/saved', ({ me, org, body }) => {
     need(me, 'manager', 'payroll');
     const name = V.str(body.name, 'name', { min: 1, max: 80 });
-    runSpec(org, { ...body.spec, from: '9999-01-01', to: '9999-01-01' }); // validates the spec cheaply
+    runSpec(org, { ...body.spec, from: '9999-01-01', to: '9999-01-01' }, me); // validates the spec cheaply
     const id = body.id ? V.id(body.id, 'id') : uid('rp');
     h.run('INSERT INTO saved_reports (id,org_id,name,spec,created_by,created_at) VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, spec = excluded.spec', id, org.id, name, JSON.stringify(body.spec), me.id, iso(now()));
     audit(org.id, me.id, 'report_save', id, { name });

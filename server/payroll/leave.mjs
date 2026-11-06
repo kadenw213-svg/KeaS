@@ -9,6 +9,8 @@ export const rowToPolicy = (r) => ({
   allowNegative: !!r.allow_negative, payoutOnTerm: r.payout_on_term, protected: !!r.protected, paid: !!r.paid, autoEnroll: !!r.auto_enroll, active: !!r.active,
 });
 const rowToRequest = (r) => ({ id: r.id, personId: r.person_id, policyId: r.policy_id, startDate: r.start_date, endDate: r.end_date, hours: r.hours, note: r.note, status: r.status, approvalId: r.approval_id, leaveCaseId: r.leave_case_id, createdAt: r.created_at });
+// A leave case's reason and notes are often medical: payroll and the owner see them; managers see dates and status.
+const caseFor = (me, has) => (r) => (has(me, 'payroll') ? r : { ...r, reason: null, notes: null, restricted: true });
 const rowToCase = (r) => ({ id: r.id, personId: r.person_id, law: r.law, reason: r.reason, startDate: r.start_date, endDate: r.end_date, intermittent: !!r.intermittent, entitlementHours: r.entitlement_hours, status: r.status, notes: r.notes, eligibility: r.eligibility ? JSON.parse(r.eligibility) : null, createdAt: r.created_at });
 const r2 = (x) => Math.round(x * 100) / 100;
 export const METHODS = ['per_hour_worked', 'per_period', 'annual_grant', 'none'];
@@ -305,7 +307,7 @@ export function registerLeave(c) {
   route('GET', '/v1/leave-cases', ({ me, org, query }) => {
     need(me, 'manager', 'payroll');
     const nm = names(org.id);
-    let rows = h.all('SELECT * FROM leave_cases WHERE org_id = ? ORDER BY start_date DESC', org.id).map(rowToCase);
+    let rows = h.all('SELECT * FROM leave_cases WHERE org_id = ? ORDER BY start_date DESC', org.id).map(rowToCase).map(caseFor(me, c.has));
     if (query.personId) rows = rows.filter((r) => r.personId === query.personId);
     return { cases: rows.map((r) => { const used = r2(h.get('SELECT COALESCE(SUM(hours),0) AS s FROM leave_usage WHERE case_id = ?', r.id).s); return { ...r, personName: nm.get(r.personId), usedHours: used, remainingHours: r2(r.entitlementHours - used) }; }) };
   });
@@ -330,7 +332,7 @@ export function registerLeave(c) {
       id, org.id, p.id, law, V.str(body.reason, 'reason', { min: 1, max: 200 }), startDate, V.date(body.endDate, 'endDate', { optional: true }), body.intermittent ? 1 : 0, entitlement,
       V.str(body.notes, 'notes', { optional: true, max: 2000 }), JSON.stringify(eligibility(org, p, law, startDate)), me.id, iso(now()));
     audit(org.id, me.id, 'leave_case_open', id, { personId: p.id, law });
-    return { status: 201, body: { case: rowToCase(h.get('SELECT * FROM leave_cases WHERE id = ?', id)) } };
+    return { status: 201, body: { case: caseFor(me, c.has)(rowToCase(h.get('SELECT * FROM leave_cases WHERE id = ?', id))) } };
   });
   route('POST', '/v1/leave-cases/:id/usage', ({ me, org, params, body }) => {
     need(me, 'manager', 'payroll');

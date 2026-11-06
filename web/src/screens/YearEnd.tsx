@@ -28,17 +28,33 @@ export function YearEnd() {
   );
 }
 
+/** Full SSNs in an export only when asked for, after a warning; otherwise the last 4. */
+function FullSsn({ on, set, what }: { on: boolean; set: (v: boolean) => void; what: string }) {
+  return (
+    <label className="muted small">
+      <input
+        type="checkbox"
+        checked={on}
+        onChange={(e) => set(e.target.checked && window.confirm(`Include full ${what} in the CSV? Only do this for filing software that needs them. The file will have every full number in it: keep it in the KeaS payroll folder, never email it, and delete it once it’s filed.`))}
+      />{' '}
+      Include full {what} (otherwise only the last 4)
+    </label>
+  );
+}
+
 function W2({ year }: { year: string }) {
   const { data, error } = useLoad<any>(`/v1/yearend/w2?year=${year}`, [year]);
+  const [full, setFull] = useState(false);
   if (!data) return <Loading error={error} />;
   return (
     <>
       {!data.tablesVerified && <div className="work-banner warn">The {year} tax tables aren’t verified, so these amounts come only from runs finalized on verified tables and imported amounts.</div>}
       <p className="muted small">{data.note}</p>
       <div className="pr-row">
-        <button className="btn" onClick={() => download(`/v1/yearend/w2?year=${year}&format=csv`)}>
+        <button className="btn" onClick={() => download(`/v1/yearend/w2?year=${year}&format=csv${full ? '&fullSsn=1' : ''}`)}>
           <Download size={15} /> Data for filing (CSV)
         </button>
+        <FullSsn on={full} set={setFull} what="SSNs" />
         <button className="btn" onClick={() => download(`/v1/yearend/w2?year=${year}&format=pdf`)}>
           <Download size={15} /> Employee summaries (PDF)
         </button>
@@ -66,6 +82,7 @@ function Ten99({ year }: { year: string }) {
   const { data, error, reload } = useLoad<any>(`/v1/yearend/1099?year=${year}`, [year]);
   const pays = useLoad<any>(`/v1/contractor-payments?year=${year}`, [year]);
   const [adding, setAdding] = useState(false);
+  const [full, setFull] = useState(false);
   if (!data) return <Loading error={error} />;
   const contractors = people;
   return (
@@ -76,9 +93,10 @@ function Ten99({ year }: { year: string }) {
         <button className="btn primary" onClick={() => setAdding(true)}>
           <Plus size={15} /> Record a contractor payment
         </button>
-        <button className="btn" onClick={() => download(`/v1/yearend/1099?year=${year}&format=csv`)}>
+        <button className="btn" onClick={() => download(`/v1/yearend/1099?year=${year}&format=csv${full ? '&fullSsn=1' : ''}`)}>
           <Download size={15} /> CSV
         </button>
+        <FullSsn on={full} set={setFull} what="TINs" />
         <button className="btn" onClick={() => download(`/v1/yearend/1099?year=${year}&format=pdf`)}>
           <Download size={15} /> PDF
         </button>

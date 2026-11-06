@@ -26,8 +26,10 @@ export function onSessionEvents(h: { signedOut: () => void; offline: () => void 
   onOffline = h.offline;
 }
 
-export async function api<T = any>(method: 'GET' | 'POST', path: string, body?: unknown, opts: { quiet401?: boolean } = {}): Promise<T> {
+/** background: a refresh the page makes by itself (it doesn't keep a quiet payroll vault from locking). */
+export async function api<T = any>(method: 'GET' | 'POST', path: string, body?: unknown, opts: { quiet401?: boolean; background?: boolean } = {}): Promise<T> {
   const headers: Record<string, string> = { 'X-KeaS': '1', accept: 'application/json' };
+  if (opts.background) headers['X-KeaS-Background'] = '1';
   if (body !== undefined) headers['content-type'] = 'application/json';
   let r: Response;
   try {

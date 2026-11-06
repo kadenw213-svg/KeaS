@@ -255,11 +255,13 @@ export function registerPayStructure(c) {
     need(me, 'manager', 'payroll');
     const grades = h.all('SELECT * FROM pay_grades WHERE org_id = ? ORDER BY code', org.id).map(rowToGrade);
     const people = h.all(`SELECT * FROM people WHERE org_id = ? AND grade_id IS NOT NULL AND status != 'terminated'`, org.id).map((r) => c.getPerson(r.id, org.id));
+    const seesPay = c.seesPay(me, org);
     return {
       grades: grades.map((g) => ({
         ...g, people: people.filter((p) => p.gradeId === g.id).map((p) => {
           const r = rateFor(h, p, null, today(org));
           const mid = g.midCents ?? Math.round((g.minCents + g.maxCents) / 2);
+          if (!seesPay) return { id: p.id, name: p.name, rateCents: null, compaRatio: null, position: null };
           return { id: p.id, name: p.name, rateCents: r?.cents ?? null, compaRatio: r ? +(r.cents / mid).toFixed(3) : null, position: r ? (r.cents < g.minCents ? 'below' : r.cents > g.maxCents ? 'above' : 'within') : null };
         }),
       })),
@@ -282,8 +284,10 @@ export function registerPayStructure(c) {
   // ---------- raises ----------
   route('GET', '/v1/raises', ({ me, org }) => {
     need(me, 'manager', 'payroll');
-    const names = new Map(h.all('SELECT id, name FROM people WHERE org_id = ?', org.id).map((r) => [r.id, r.name]));
-    return { raises: h.all('SELECT * FROM raises WHERE org_id = ? ORDER BY created_at DESC', org.id).map(rowToRaise).map((r) => ({ ...r, personName: names.get(r.personId) })) };
+    const people = new Map(h.all('SELECT id, name, manager_id FROM people WHERE org_id = ?', org.id).map((r) => [r.id, r]));
+    // Managers see the raises they asked for and those of the people they manage (unless the owner lets them see pay).
+    const mine = (r) => c.seesPay(me, org) || r.requestedBy === me.id || people.get(r.personId)?.manager_id === me.id;
+    return { raises: h.all('SELECT * FROM raises WHERE org_id = ? ORDER BY created_at DESC', org.id).map(rowToRaise).filter(mine).map((r) => ({ ...r, personName: people.get(r.personId)?.name })) };
   });
   route('POST', '/v1/raises', ({ me, org, body }) => {
     need(me, 'manager', 'payroll');

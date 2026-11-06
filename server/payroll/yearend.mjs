@@ -7,6 +7,9 @@ import { localDate } from '../lib/time.mjs';
 
 const J = (s, d) => { try { return s == null ? d : JSON.parse(s); } catch { return d; } };
 const dollars = (c) => (c / 100).toFixed(2);
+/** SSN/TIN for an export: the last 4 only, unless full numbers were asked for explicitly (fullSsn=1). */
+const ssnFor = (ssn, full) => (!ssn ? '' : full ? ssn : `***-**-${String(ssn).slice(-4)}`);
+const FULL_SSN_WARNING = 'This file has full Social Security numbers. Keep it in the KeaS payroll folder or your filing software, never email it, and delete it once it’s filed.';
 const m$ = (c) => '$' + (c / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 export function registerYearEnd(c) {
@@ -57,9 +60,11 @@ export function registerYearEnd(c) {
     const d = w2Data(org, year, query.entityId || null);
     const rows = query.personId ? d.rows.filter((r) => r.personId === query.personId) : d.rows;
     if (query.format === 'csv') {
-      audit(org.id, me.id, 'w2_export', String(year), { rows: rows.length });
+      // Full SSNs only when asked for explicitly (filing software needs them); otherwise the last 4.
+      const full = query.fullSsn === '1';
+      audit(org.id, me.id, 'w2_export', String(year), { rows: rows.length, fullSsn: full });
       const headers = ['employerEin', 'employerName', 'employeeSsn', 'employeeName', 'address1', 'city', 'state', 'zip', 'box1Wages', 'box2FederalTax', 'box3SsWages', 'box4SsTax', 'box5MedicareWages', 'box6MedicareTax', 'box14', 'box15State', 'box15StateId', 'box16StateWages', 'box17StateTax'];
-      return { raw: { type: 'text/csv; charset=utf-8', filename: `w2-${year}.csv`, body: toCsv(headers, rows.map((r) => ({ employerEin: r.employer.ein || '', employerName: r.employer.name, employeeSsn: r.ssn || '', employeeName: r.name, address1: r.address?.line1 || '', city: r.address?.city || '', state: r.address?.state || '', zip: r.address?.zip || '', box1Wages: dollars(r.box1), box2FederalTax: dollars(r.box2), box3SsWages: dollars(r.box3), box4SsTax: dollars(r.box4), box5MedicareWages: dollars(r.box5), box6MedicareTax: dollars(r.box6), box14: r.box14.map((x) => `${x.label} ${dollars(x.cents)}`).join('; '), box15State: r.state, box15StateId: r.employer.stateId || '', box16StateWages: dollars(r.box16), box17StateTax: dollars(r.box17) }))) } };
+      return { raw: { type: 'text/csv; charset=utf-8', filename: `w2-${year}${full ? '-FULL-SSN' : ''}.csv`, warning: full ? FULL_SSN_WARNING : null, body: toCsv(headers, rows.map((r) => ({ employerEin: r.employer.ein || '', employerName: r.employer.name, employeeSsn: ssnFor(r.ssn, full), employeeName: r.name, address1: r.address?.line1 || '', city: r.address?.city || '', state: r.address?.state || '', zip: r.address?.zip || '', box1Wages: dollars(r.box1), box2FederalTax: dollars(r.box2), box3SsWages: dollars(r.box3), box4SsTax: dollars(r.box4), box5MedicareWages: dollars(r.box5), box6MedicareTax: dollars(r.box6), box14: r.box14.map((x) => `${x.label} ${dollars(x.cents)}`).join('; '), box15State: r.state, box15StateId: r.employer.stateId || '', box16StateWages: dollars(r.box16), box17StateTax: dollars(r.box17) }))) } };
     }
     if (query.format === 'pdf') {
       const L = [];
@@ -112,8 +117,9 @@ export function registerYearEnd(c) {
       return { personId: p.id, name: p.legalName || p.name, tin: pii.ssn || null, address: pii.address || null, box1: r.total, payments: r.n, meetsThreshold: threshold == null ? null : r.total >= threshold };
     });
     if (query.format === 'csv') {
-      audit(org.id, me.id, '1099_export', String(year), { rows: rows.length });
-      return { raw: { type: 'text/csv; charset=utf-8', filename: `1099-nec-${year}.csv`, body: toCsv(['payerTin', 'payerName', 'recipientTin', 'recipientName', 'address1', 'city', 'state', 'zip', 'box1NonemployeeComp', 'meetsThreshold'], rows.map((r) => ({ payerTin: defEnt?.ein || '', payerName: defEnt?.name || org.name, recipientTin: r.tin || '', recipientName: r.name, address1: r.address?.line1 || '', city: r.address?.city || '', state: r.address?.state || '', zip: r.address?.zip || '', box1NonemployeeComp: dollars(r.box1), meetsThreshold: r.meetsThreshold == null ? '' : r.meetsThreshold ? 'yes' : 'no' }))) } };
+      const full = query.fullSsn === '1';
+      audit(org.id, me.id, '1099_export', String(year), { rows: rows.length, fullSsn: full });
+      return { raw: { type: 'text/csv; charset=utf-8', filename: `1099-nec-${year}${full ? '-FULL-TIN' : ''}.csv`, warning: full ? FULL_SSN_WARNING : null, body: toCsv(['payerTin', 'payerName', 'recipientTin', 'recipientName', 'address1', 'city', 'state', 'zip', 'box1NonemployeeComp', 'meetsThreshold'], rows.map((r) => ({ payerTin: defEnt?.ein || '', payerName: defEnt?.name || org.name, recipientTin: ssnFor(r.tin, full), recipientName: r.name, address1: r.address?.line1 || '', city: r.address?.city || '', state: r.address?.state || '', zip: r.address?.zip || '', box1NonemployeeComp: dollars(r.box1), meetsThreshold: r.meetsThreshold == null ? '' : r.meetsThreshold ? 'yes' : 'no' }))) } };
     }
     if (query.format === 'pdf') {
       const L = [];

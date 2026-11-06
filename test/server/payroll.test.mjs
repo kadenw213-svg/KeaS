@@ -303,8 +303,16 @@ test('import: Gusto-style employees, then YTD and time-off balances mid-year', a
   assert.equal(row.box1, 1200000);
   assert.equal(row.box17, 48000);
   assert.equal(row.ssn, '***-**-6780');
+  // L: the filing CSV masks SSNs (last 4) unless full numbers are asked for, with a warning, and that's audited.
   const w2csv = await call('GET', '/v1/yearend/w2?year=2030&format=csv', pay);
-  assert.match(w2csv.body.toString(), /123456780/);
+  assert.doesNotMatch(w2csv.body.toString(), /123456780/);
+  assert.match(w2csv.body.toString(), /\*\*\*-\*\*-6780/);
+  assert.equal(w2csv.headers.get('x-keas-warning'), null);
+  const full = await call('GET', '/v1/yearend/w2?year=2030&format=csv&fullSsn=1', pay);
+  assert.match(full.body.toString(), /123456780/);
+  assert.match(decodeURIComponent(full.headers.get('x-keas-warning')), /full Social Security numbers/);
+  assert.match(full.headers.get('content-disposition'), /FULL-SSN/);
+  assert.equal(JSON.parse(app.h.get(`SELECT detail FROM audit_log WHERE action = 'w2_export' ORDER BY id DESC`).detail).fullSsn, true);
   const w2pdf = await call('GET', '/v1/yearend/w2?year=2030&format=pdf', pay);
   assert.equal(w2pdf.body.subarray(0, 5).toString(), '%PDF-');
 });

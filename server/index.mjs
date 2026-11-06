@@ -19,6 +19,8 @@ export const VERSION = '0.3.0';
 const HOST = '127.0.0.1';
 const MAX_BODY = 1024 * 1024;
 const SESSION_HOURS = 12;
+// A payroll vault sign-in lasts 2 hours at most (and the vault locks itself sooner when nobody uses it).
+const VAULT_SESSION_HOURS = 2;
 export const COOKIE = 'keas_session';
 const SHARED = join(dirname(fileURLToPath(import.meta.url)), '..', 'shared');
 const readJson = (p) => JSON.parse(readFileSync(p, 'utf8'));
@@ -166,10 +168,11 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
 
   const newSession = (personId, secure) => {
     const token = randomBytes(32).toString('hex');
-    const expiresAt = iso(now() + SESSION_HOURS * 3600000);
+    const hours = vaultMode ? VAULT_SESSION_HOURS : SESSION_HOURS;
+    const expiresAt = iso(now() + hours * 3600000);
     h.run('INSERT INTO sessions (token_hash,person_id,created_at,expires_at) VALUES (?,?,?,?)', createHash('sha256').update(token).digest('hex'), personId, iso(now()), expiresAt);
     const p = rowToPerson(h.get('SELECT * FROM people WHERE id = ?', personId));
-    return { token, expiresAt, person: publicPerson(p, p, loadOrg(p.orgId)), cookies: [sessionCookie(token, SESSION_HOURS * 3600, secure)] };
+    return { token, expiresAt, person: publicPerson(p, p, loadOrg(p.orgId)), cookies: [sessionCookie(token, hours * 3600, secure)] };
   };
 
   // Development sign-in (pick a person). Not available in the payroll vault.
@@ -478,7 +481,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     approved(a, actor) { const [pid, ps] = a.targetId.split(':'); h.run('INSERT OR IGNORE INTO timecard_approvals (person_id,period_start,approved_by,at) VALUES (?,?,?,?)', pid, ps, actor, iso(now())); },
   });
   const ctx = {
-    mode: vaultMode ? 'vault' : 'org', h, route, V, HttpError, bad, need, has, privileged, audit, now, iso, vault, approvals,
+    mode: vaultMode ? 'vault' : 'org', h, route, V, HttpError, bad, need, has, privileged, audit, now, iso, vault, approvals, onClose: [],
     hub: makeHubClient({ fetchImpl, now }), defaultHubUrl: fixedHubUrl,
     localSignIn: typeof localSignIn === 'function' ? localSignIn : () => !!localSignIn,
     uid: (p) => `${p}-${randomUUID()}`, today: (org) => localDate(now(), org.tz),
@@ -487,6 +490,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     saveOrgSettings(org, patch) { org.settings = { ...org.settings, ...patch }; h.run('UPDATE orgs SET settings = ? WHERE id = ?', JSON.stringify(org.settings), org.id); },
   };
   registerPayroll(ctx);
+  const payrollCtx = ctx;
 
   // ---------- dispatcher ----------
   async function readBody(req, max = MAX_BODY) {
@@ -544,6 +548,9 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
           if (viaCookie) cookies = [sessionCookie('', 0, secure)];
           throw new HttpError(401, 'session expired or invalid');
         }
+        // A quiet vault locks itself; using it (not a page's own background refresh) keeps it open.
+        if (vaultMode && payrollCtx.checkIdle?.()) throw new HttpError(423, 'The payroll vault locked itself after a quiet spell. Sign in again.', { locked: true });
+        if (vaultMode && req.headers['x-keas-background'] !== '1') payrollCtx.touchVault?.();
         ctx.me = rowToPerson(h.get('SELECT * FROM people WHERE id = ?', sess.person_id));
         ctx.org = loadOrg(ctx.me.orgId);
       }
@@ -552,7 +559,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
         // A file download (CSV, PDF, NACHA, a stored document).
         const body = Buffer.isBuffer(out.raw.body) ? out.raw.body : Buffer.from(String(out.raw.body), 'utf8');
         const name = String(out.raw.filename || 'download').replace(/[^A-Za-z0-9_.-]+/g, '_');
-        res.writeHead(200, { ...securityHeaders(), 'content-type': out.raw.type, 'content-length': body.length, 'content-disposition': `attachment; filename="${name}"`, 'cache-control': 'no-store' });
+        res.writeHead(200, { ...securityHeaders(), 'content-type': out.raw.type, 'content-length': body.length, 'content-disposition': `attachment; filename="${name}"`, 'cache-control': 'no-store', ...(out.raw.warning ? { 'x-keas-warning': encodeURIComponent(out.raw.warning) } : {}) });
         res.end(body);
         if (log) console.log(`${new Date().toISOString()} ${req.method} ${url.pathname} 200 ${Date.now() - t0}ms`);
         return;
@@ -593,7 +600,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
       return keys.map((k) => k.kid);
     },
     listen(port = Number(process.env.KEA_PORT) || 4850) { return new Promise((resolve) => server.listen(port, HOST, () => resolve(server.address().port))); },
-    close() { return new Promise((resolve) => server.close(() => { h.close(); resolve(); })); },
+    close() { for (const f of payrollCtx.onClose) { try { f(); } catch {} } return new Promise((resolve) => server.close(() => { h.close(); resolve(); })); },
   };
 }
 

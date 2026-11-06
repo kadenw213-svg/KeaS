@@ -71,7 +71,9 @@ export function VaultSettings() {
               worksiteEmployees: settings.data.settings.fmla?.worksiteEmployees,
               ale: settings.data.settings.aca?.ale,
               expenseCategories: (settings.data.settings.expenseCategories || []).join(', '),
-              offerTemplate: settings.data.settings.offerTemplate
+              offerTemplate: settings.data.settings.offerTemplate,
+              managersSeePay: !!settings.data.settings.managersSeePay,
+              idleLockMinutes: settings.data.vault?.idleLockMinutes ?? 15
             }}
             fields={[
               { name: 'name', label: 'Organization name', required: true },
@@ -85,7 +87,9 @@ export function VaultSettings() {
               { name: 'expenseCategories', label: 'Expense categories (comma-separated)', advanced: true },
               { name: 'stateContinuation', label: 'A state continuation law applies to us', type: 'checkbox', advanced: true },
               { name: 'worksiteEmployees', label: 'Employees within 75 miles (FMLA; empty = everyone here)', type: 'number', advanced: true },
-              { name: 'offerTemplate', label: 'Offer letter template', type: 'textarea', advanced: true }
+              { name: 'offerTemplate', label: 'Offer letter template', type: 'textarea', advanced: true },
+              ...(owner ? [{ name: 'managersSeePay', label: 'Managers can see pay amounts in reports and pay grades', type: 'checkbox' as const, advanced: true, help: 'Off: managers see hours, dates and names only. Payroll and the owner always see pay.' }] : []),
+              ...(mode === 'vault' ? [{ name: 'idleLockMinutes', label: 'Lock the vault after this many quiet minutes (1 to 120)', type: 'number' as const, advanced: true, help: 'The key is wiped from memory and everyone signs in again. A sign-in lasts 2 hours at most either way.' }] : [])
             ]}
             onSubmit={async (v) => {
               await act(
@@ -100,7 +104,9 @@ export function VaultSettings() {
                   cobra: { groupHealthPlan: v.groupHealthPlan, stateContinuation: v.stateContinuation },
                   fmla: { worksiteEmployees: v.worksiteEmployees },
                   aca: { ale: v.ale },
-                  offerTemplate: v.offerTemplate
+                  offerTemplate: v.offerTemplate,
+                  ...(owner ? { managersSeePay: !!v.managersSeePay } : {}),
+                  ...(mode === 'vault' && v.idleLockMinutes ? { idleLockMinutes: Number(v.idleLockMinutes) } : {})
                 }),
                 'Settings saved.'
               );
