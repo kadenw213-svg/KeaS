@@ -233,7 +233,7 @@ function status() {
 const VIEWS = { welcome, storage, reach, owner, done, status };
 function render() {
   renderProgress();
-  app.replaceChildren(...VIEWS[S.step]());
+  app.replaceChildren(...VIEWS[S.step]().filter((x) => x != null && x !== false && x !== ''));
 }
 
 async function load() {
