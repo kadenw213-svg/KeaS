@@ -22,6 +22,12 @@ Needs Node 24.
   - `node hub/owner.mjs make-owner <email>`;
   - `node hub/owner.mjs publish-terms` publishes `hub/terms/terms.json`. Keep each section's id when you only reword it; new sections get new ids. Everyone agrees again and sees only what changed.
   - `node hub/owner.mjs console owner/stats`.
+- **One account** (`console GET owner/accounts/<email>` shows everything below). Each change is audited and sends the person a notification; add `"note"` for a line of your own.
+  - Storage: `console POST owner/accounts/<email>/quota '{"gb":5000}'`; `{"gb":null}` goes back to the standard size.
+  - Shared Claude: `console POST owner/accounts/<email>/claude '{"limits":{"perAccountWeekly":20}}'`. Any limit in `ACCOUNT_LIMITS` (`hub/lib/budget.mjs`) can be set; `null` goes back to the Hub-wide number. `{"trusted":true}` lifts their own caps, `{"blocked":true,"reason":"…"}` turns it off for them, and `{"reset":true}` clears everything.
+  - Supporter: `console POST owner/accounts/<email>/supporter '{"months":1}'` (renewing adds to the end), `{"until":"2027-06-01"}`, or `{"end":true}`. It gives supporter storage and a badge only; it never changes shared-Claude limits.
+  - A notice: `console POST owner/accounts/<email>/notify '{"title":"…","body":"…"}'`.
+- **Storage sizes:** `console POST owner/settings '{"storage":{"defaultGb":5,"supporterGb":25}}'`. The standard size is 5 GB and a supporter's 25 GB unless set here. A smaller size never deletes anything: people over it can't add files until they're under it again.
 - **Backups:** `node hub/backup.mjs create <folder>`, with `KEA_BACKUP_PASSPHRASE` set (sealed with AES-256-GCM).
 - **Never tunnel port 4861.** The owner console must only ever be reachable on the Hub's own computer.
 

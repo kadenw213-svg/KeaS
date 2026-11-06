@@ -158,6 +158,14 @@ CREATE TABLE IF NOT EXISTS flags (
   reason TEXT NOT NULL, detail TEXT, auto_suspended INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','resolved')), at INTEGER NOT NULL, resolved_at INTEGER, note TEXT
 );
+-- Notices for one person: what the owner changed on their account, an org approved, a parent's sign-off, a finished
+-- scan, course material that arrived. The apps poll GET /v1/me/notifications.
+CREATE TABLE IF NOT EXISTS notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', note TEXT, data TEXT,
+  created_at INTEGER NOT NULL, read_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS notifications_account ON notifications(account_id, id);
 `;
 
 // Columns added after the first release, applied to existing databases.
@@ -178,6 +186,15 @@ const COLUMNS = [
   // How the person shows on leaderboards unless a class says otherwise: 'name', 'nickname' or 'hidden'.
   ['accounts', 'board_default', "TEXT NOT NULL DEFAULT 'name'"],
   ['accounts', 'nickname', 'TEXT'],
+  // The owner's per-account shared-Claude settings (JSON): limits that replace the Hub-wide ones, trusted, blocked.
+  ['accounts', 'claude_override', 'TEXT'],
+  // Supporter (set by the owner by hand, a thank-you): until this time. Storage and a badge only.
+  ['accounts', 'supporter_until', 'INTEGER'],
+  ['accounts', 'supporter_since', 'INTEGER'],
+  ['accounts', 'supporter_lapse_noted', 'INTEGER NOT NULL DEFAULT 0'],
+  // Optional phone number, and who may see it: 'nobody', 'classes', 'orgs' or 'both'.
+  ['accounts', 'phone', 'TEXT'],
+  ['accounts', 'phone_visibility', "TEXT NOT NULL DEFAULT 'nobody'"],
 ];
 
 export function openDb(file) {

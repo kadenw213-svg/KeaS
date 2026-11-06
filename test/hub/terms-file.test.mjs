@@ -10,7 +10,8 @@ const shipped = JSON.parse(readFileSync(new URL('../../hub/terms/terms.json', im
 test('the terms file: published once, again when an update changes it, and owner-published terms stay until then', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'kea-terms-file-'));
   const termsFile = join(dir, 'terms.json');
-  const before = { ...shipped, sections: shipped.sections.filter((s) => s.id !== 'parent-sign-off') };
+  const NEW = ['phone-number', 'notifications', 'supporters'];
+  const before = { ...shipped, sections: shipped.sections.filter((s) => !NEW.includes(s.id)) };
   writeFileSync(termsFile, JSON.stringify(before));
   const open = () => createHub({ dataDir: dir, termsFile, log: false });
   const versions = (hub) => hub.h.all('SELECT n, sections FROM terms_versions ORDER BY n');
@@ -28,13 +29,16 @@ test('the terms file: published once, again when an update changes it, and owner
     assert.equal(versions(hub).length, 2);
     await hub.close();
 
-    // An update ships the parent sign-off section: published, and it's the only new section.
+    // An update ships the phone number, notifications and supporter sections: published, and they're the only new ones
+    // (so people agree again to only those).
     writeFileSync(termsFile, JSON.stringify(shipped));
     hub = open();
     const all = versions(hub);
     assert.equal(all.length, 3);
     const ids = (v) => JSON.parse(v.sections).map((s) => s.id);
-    assert.deepEqual(ids(all[2]).filter((id) => !ids(all[0]).includes(id)), ['parent-sign-off']);
+    assert.deepEqual(ids(all[2]).filter((id) => !ids(all[0]).includes(id)), NEW);
+    const changed = JSON.parse(all[2].sections).filter((s) => { const o = JSON.parse(all[0].sections).find((x) => x.id === s.id); return o && (o.body !== s.body || o.title !== s.title); });
+    assert.deepEqual(changed.map((s) => s.id), [], 'no existing section changed');
     await hub.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });

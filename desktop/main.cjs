@@ -43,7 +43,7 @@ async function startServices() {
     const { createHub } = await import(pathToFileURL(path.join(ROOT, 'hub', 'index.mjs')).href);
     hub = createHub({
       dataDir: config.dataDir, storageDir: config.storageDir, log: false,
-      defaultQuotaBytes: (config.quotaGb || 25) * 1024 ** 3,
+      defaultQuotaBytes: (config.quotaGb || 5) * 1024 ** 3,
       ipHeader: config.tailscale ? 'x-forwarded-for' : null,
       googleClientIds: config.googleClientIds || [],
       googleWebClientId: config.googleWebClientId || null,
@@ -241,7 +241,7 @@ function registerIpc() {
     if (!['hub', 'org'].includes(role)) throw new Error('Pick what this PC is for.');
     checkFolder(dataDir);
     if (storageDir) checkFolder(storageDir);
-    config = writeConfig({ ...config, role, dataDir, storageDir: storageDir || path.join(dataDir, 'storage'), quotaGb: Number(quotaGb) || 25, tailscale: reach === 'tailscale' });
+    config = writeConfig({ ...config, role, dataDir, storageDir: storageDir || path.join(dataDir, 'storage'), quotaGb: Number(quotaGb) || 5, tailscale: reach === 'tailscale' });
     // The before-sign-in launcher reads these settings at each start: keep it in step (no permission needed).
     if (config.boot?.installed && !DEV) { try { bootstart.prepareFiles({ ...bootArgs(), opts: config.boot.options }); } catch (e) { log('boot files', e.message); } }
     return config;
@@ -319,6 +319,9 @@ function pointKeaHere() {
 
 app.whenReady().then(async () => {
   config = readConfig();
+  // The standard Kea storage per account went from 25 GB to 5 GB (supporters get 25 GB). A Hub set up with the old
+  // standard moves to the new one once; any other size chosen at setup stays. The Hub tells each person it changes for.
+  if (config.role === 'hub' && config.quotaGb === 25 && !config.quotaStandard5) config = writeConfig({ ...config, quotaGb: 5, quotaStandard5: true });
   nativeTheme.themeSource = config.theme === 'light' || config.theme === 'dark' ? config.theme : 'system';
   registerIpc();
   if (config.setupDone) {

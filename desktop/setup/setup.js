@@ -2,7 +2,7 @@
 'use strict';
 const k = window.keas;
 const app = document.getElementById('app');
-const S = { step: 'welcome', role: 'hub', dataDir: '', storageDir: '', quotaGb: 25, reach: 'tailscale', drives: [], defaults: {}, config: {}, ts: {}, log: [], busy: false, error: '', owner: null, totp: null, terms: null, agreed: new Set(), totpDone: false };
+const S = { step: 'welcome', role: 'hub', dataDir: '', storageDir: '', quotaGb: 5, reach: 'tailscale', drives: [], defaults: {}, config: {}, ts: {}, log: [], busy: false, error: '', owner: null, totp: null, terms: null, agreed: new Set(), totpDone: false };
 
 function h(tag, props, ...kids) {
   const el = document.createElement(tag);
@@ -74,8 +74,8 @@ function storage() {
       h('input', { type: 'text', value: S.dataDir, oninput: (e) => (S.dataDir = e.target.value) }),
       h('button', { class: 'btn', onclick: async () => { const p = await call(k.pickFolder, { start: S.dataDir }).catch(fail); if (p) { S.dataDir = p; render(); } } }, 'Choose…'))),
     S.role === 'hub' && h('details', null, h('summary', null, 'Advanced'),
-      h('label', { class: 'field' }, 'Kea storage for each account (GB)', h('input', { type: 'number', min: '1', max: '100000', value: String(S.quotaGb), oninput: (e) => (S.quotaGb = Number(e.target.value) || 25) })),
-      h('p', { class: 'muted small' }, 'You can give any account more later. A limit keeps one person from filling the whole drive.'),
+      h('label', { class: 'field' }, 'Standard Kea storage for each account (GB)', h('input', { type: 'number', min: '1', max: '100000', value: String(S.quotaGb), oninput: (e) => (S.quotaGb = Number(e.target.value) || 5) })),
+      h('p', { class: 'muted small' }, 'Supporters get 25 GB, and you can give any account more later from the owner console. A limit keeps one person from filling the whole drive.'),
       h('label', { class: 'field' }, 'Keep account files in a different folder (optional)', h('div', { class: 'row' },
         h('input', { type: 'text', value: S.storageDir, placeholder: `${S.dataDir}\\storage`, oninput: (e) => (S.storageDir = e.target.value) }),
         h('button', { class: 'btn', onclick: async () => { const p = await call(k.pickFolder, { start: S.storageDir || S.dataDir }).catch(fail); if (p) { S.storageDir = p; render(); } } }, 'Choose…')))),
@@ -325,7 +325,7 @@ function status() {
       h('p', null, h('span', { class: `dot ${S.running ? 'ok' : 'bad'}`, style: 'display:inline-block;vertical-align:-4px;margin-right:8px' }), S.running ? 'Running' : 'Not running'),
       c.publicUrl ? h('p', null, 'Public address: ', h('span', { class: 'url' }, c.publicUrl)) : h('p', { class: 'muted' }, 'Only reachable on this computer.'),
       h('p', null, 'Data: ', h('span', { class: 'url' }, c.dataDir), ' ', h('button', { class: 'btn', onclick: () => k.openFolder({ dir: c.dataDir }) }, 'Open folder')),
-      c.role === 'hub' && h('p', { class: 'muted small' }, `Each account gets ${c.quotaGb || 25} GB of Kea storage. Owner: ${c.ownerEmail || 'not set'}.`)),
+      c.role === 'hub' && h('p', { class: 'muted small' }, `Each account gets ${c.quotaGb || 5} GB of Kea storage. Owner: ${c.ownerEmail || 'not set'}.`)),
     c.role === 'hub' && h('div', { class: 'panel' },
       h('p', null, h('b', null, 'Startup and power')),
       h('p', { class: 'muted small' }, c.boot?.installed ? 'The Hub starts when Windows starts, before anyone signs in.' : 'The Hub starts when you sign in to Windows.',

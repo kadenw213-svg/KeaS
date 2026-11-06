@@ -39,7 +39,7 @@ export const ORG_DEFAULTS = {
 const PAYROLL_WORDS = /\b(ssns?|itin|iban|swift|paychecks?|social security( numbers?)?|tax ids?|routing( numbers?)?|bank (accounts?|details|numbers?|info)|account numbers?|acct (no|num|numbers?)|w ?4s?|direct deposits?|pay runs?|payruns?)\b/;
 const keyWords = (k) => String(k).replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).join(' ');
 
-export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, bad, forbidden, notFound, rawOut }) {
+export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, bad, forbidden, notFound, rawOut, notify = () => {}, extrasFor = () => ({}) }) {
   h.db.exec(ORG_SCHEMA);
   const id = () => randomUUID();
   const J = (s, d) => { try { return s == null ? d : JSON.parse(s); } catch { return d; } };
@@ -95,18 +95,21 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     ...(m && RANK[m.role] >= RANK.admin ? { settings: orgSettings(o) } : {}),
   });
   const positionsOf = (oid, aid) => h.all('SELECT position_id FROM org_member_positions WHERE org_id = ? AND account_id = ?', oid, aid).map((r) => r.position_id);
+  // The supporter badge for everyone; a phone number only between active coworkers, and only if its owner shares it
+  // with organizations (accounts.phone_visibility).
   const memberOut = (r, viewer) => {
     const mgr = RANK[viewer.role] >= RANK.manager, admin = RANK[viewer.role] >= RANK.admin, self = r.account_id === viewer.account_id;
     return {
       id: r.account_id, name: r.display_name, role: r.role, status: r.status, departmentId: r.department_id, title: r.title,
       positionIds: positionsOf(r.org_id, r.account_id), joinedAt: r.joined_at, you: self,
+      ...extrasFor(r, 'orgs', { phone: r.status === 'active' && viewer.status === 'active' }),
       ...(mgr || self ? { email: r.email, desiredMin: r.desired_min, desiredMax: r.desired_max, prefs: J(r.prefs, []), minor: r.birthdate ? ageOn(r.birthdate, localDate(now(), 'UTC')) < 18 : null } : {}),
       ...(admin || self ? { birthdate: r.birthdate } : {}),
       ...(admin ? { costRate: r.cost_rate == null ? null : r.cost_rate / 100 } : {}),
     };
   };
   const membersOf = (oid, { status = 'active' } = {}) =>
-    h.all(`SELECT m.*, a.display_name, a.email FROM org_members m JOIN accounts a ON a.id = m.account_id WHERE m.org_id = ?${status ? ' AND m.status = ?' : ''} ORDER BY a.display_name`, ...(status ? [oid, status] : [oid]));
+    h.all(`SELECT m.*, a.display_name, a.email, a.phone, a.phone_visibility, a.supporter_until FROM org_members m JOIN accounts a ON a.id = m.account_id WHERE m.org_id = ?${status ? ' AND m.status = ?' : ''} ORDER BY a.display_name`, ...(status ? [oid, status] : [oid]));
 
   const getSetting = (k, d) => { const r = h.get('SELECT value FROM settings WHERE key = ?', k); return r ? JSON.parse(r.value) : d; };
   const setSetting = (k, v) => h.run('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', k, JSON.stringify(v));
@@ -155,7 +158,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   }));
   OR('GET', '/v1/orgs/:id', ({ me, params }) => {
     const { o, m } = asOrg(params.id, me, 'member', { pendingOk: true, suspendedOk: true });
-    return { org: orgOut(o, m), me: memberOut({ ...m, display_name: me.display_name, email: me.email }, m) };
+    return { org: orgOut(o, m), me: memberOut({ ...m, display_name: me.display_name, email: me.email, phone: me.phone, phone_visibility: me.phone_visibility, supporter_until: me.supporter_until }, m) };
   });
   OR('POST', '/v1/orgs/:id', ({ me, params, body, ip }) => {
     const { o, s } = asOrg(params.id, me, 'admin');
@@ -242,6 +245,8 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     if (body.approve === false) h.run('DELETE FROM org_members WHERE org_id = ? AND account_id = ?', o.id, t.account_id);
     else h.run("UPDATE org_members SET status = 'active' WHERE org_id = ? AND account_id = ?", o.id, t.account_id);
     audit(me.id, body.approve === false ? 'org.join_deny' : 'org.join_approve', o.id, { account: t.account_id }, ip);
+    if (body.approve === false) notify(t.account_id, 'org', `${o.name} didn’t approve your request to join`, 'Ask someone there for a new join code if you think this was a mistake.', { data: { orgId: o.id, approved: false } });
+    else notify(t.account_id, 'org', `You’re in: ${o.name}`, 'Your request to join was approved. It’s in Work mode now.', { data: { orgId: o.id, approved: true } });
     return { ok: true };
   });
   OR('POST', '/v1/orgs/:id/members/:aid', ({ me, params, body, ip }) => {
@@ -283,7 +288,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
       }
     });
     if (!self) audit(me.id, 'org.member_update', o.id, { account: t.account_id, ...Object.fromEntries(cols.filter((c) => c !== 'cost_rate' && c !== 'birthdate').map((c) => [c, set[c]])) }, ip);
-    const r = h.get('SELECT m.*, a.display_name, a.email FROM org_members m JOIN accounts a ON a.id = m.account_id WHERE m.org_id = ? AND m.account_id = ?', o.id, t.account_id);
+    const r = h.get('SELECT m.*, a.display_name, a.email, a.phone, a.phone_visibility, a.supporter_until FROM org_members m JOIN accounts a ON a.id = m.account_id WHERE m.org_id = ? AND m.account_id = ?', o.id, t.account_id);
     return { member: { ...memberOut(r, m), ...(self ? { usualWeek: J(r.usual_week, {}) } : {}) } };
   });
   OR('POST', '/v1/orgs/:id/members/:aid/remove', ({ me, params, ip }) => {
@@ -1594,6 +1599,9 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     const approve = V.bool(body.approve, 'approve');
     h.run('UPDATE orgs SET status = ?, decided_at = ?, note = ? WHERE id = ?', approve ? 'active' : 'suspended', now(), V.str(body.note, 'note', { optional: true, max: 2000 }), o.id);
     audit('owner', approve ? 'owner.org_approve' : 'owner.org_deny', o.id, null, 'local');
+    const why = V.str(body.note, 'note', { optional: true, max: 2000 });
+    if (approve) notify(o.created_by, 'org', `${o.name} is approved on the Kea Hub`, 'Your organization is ready. Make join codes for your people in Work mode.', { note: why, data: { orgId: o.id, approved: true } });
+    else notify(o.created_by, 'org', `${o.name} wasn’t approved on the Kea Hub`, 'Organizations can also run their own KeaS server.', { note: why, data: { orgId: o.id, approved: false } });
     return { ok: true };
   });
   O('POST', '/owner/orgs/:id/status', ({ params, body }) => {

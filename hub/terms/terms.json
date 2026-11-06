@@ -1,7 +1,7 @@
 {
   "title": "Kea Terms of Use",
-  "label": "2026-11-05.2",
-  "summary": "New section: a parent or guardian signs off before a member under 18 uses Kea’s shared Claude.",
+  "label": "2026-11-05.3",
+  "summary": "Three new sections: your optional phone number and who sees it, notifications, and supporters.",
   "sections": [
     {
       "id": "about",
@@ -27,6 +27,16 @@
       "id": "data",
       "title": "5. What the Hub stores, and why",
       "body": "The Hub stores:\n- your account: email, display name, the scrambled password, two-step sign-in settings, verification status, and which version of these terms you agreed to and when;\n- the classes you make or join, your role in them, and your leaderboard name choice;\n- your study answers and scores (to grade questions, schedule reviews and run leaderboards);\n- files you choose to save to your Kea storage;\n- security records: sign-ins, failed sign-ins and the network address they came from, kept to stop break-in attempts.\nThe Hub does not store payroll data such as Social Security numbers, bank account numbers or tax forms. Those stay encrypted on the payroll admin's own computer.\nYour data is never sold, never used for ads, and never shared except as these terms describe (for example, with the classes and organizations you join) or when the law requires it.\nBackups of the Hub are encrypted before they leave the Hub's computer."
+    },
+    {
+      "id": "phone-number",
+      "title": "5b. Your phone number (optional)",
+      "body": "- You can add a phone number to your Kea account. You don't have to.\n- You choose who sees it: nobody (the default), classmates in the Kea classes you're in, coworkers in the organizations you belong to, or both. You can change that or remove the number at any time.\n- It is never shown on leaderboards, never shown to the public, and never shown to anyone your choice doesn't include. The developer can see it when running the Hub, as with the rest of your account.\n- The Hub keeps it with your account, includes it when you download your data, and deletes it when you remove it or close your account. It is never sold or used for ads, and Kea doesn't call or text it.\n- Only add a number that's yours. People who can see it may contact you there, so share it only where you're comfortable with that."
+    },
+    {
+      "id": "notifications",
+      "title": "5c. Notifications",
+      "body": "- The Hub keeps a list of notices for your account, and the Kea apps show them: for example when the developer changes your storage or your limits on Kea's shared Claude, when an organization or a request to join one is decided, when a parent or guardian signs off, when a shared-Claude request finishes, or when course material arrives in your Kea storage.\n- Kea on your computer can also show them as system notifications. You can turn that off in Kea's settings; the list stays in your account.\n- Notices are kept with your account. Read ones are deleted after about six months, and you can delete them sooner. They are included when you download your data.\n- Notices are only about your Kea account. They are never ads."
     },
     {
       "id": "storage",
@@ -87,6 +97,11 @@
       "id": "donations",
       "title": "14b. Donations",
       "body": "- Kea is free. You can chip in through the \"Support Kea\" link if you want to, and Kea never asks you again or locks anything behind it.\n- Donations are gifts that help pay for running Kea. They don't buy extra shared-Claude use, priority, features or any promise of service, and they aren't refundable unless the law requires it."
+    },
+    {
+      "id": "supporters",
+      "title": "14c. Supporters",
+      "body": "- The developer can mark an account as a supporter, by hand, as a thank-you (for example after a donation). It lasts for the time the developer sets, usually a month, and can be renewed.\n- While it lasts, a supporter gets more Kea storage (25 GB unless the developer sets another size) and a small supporter badge next to their name in class leaderboards, class member lists and organization member lists. That's all it does.\n- It is a thank-you, not a purchase. It doesn't buy a service, extra shared-Claude use, priority, features or any promise, and nothing is owed if it ends or changes. The developer can change what supporters get, or end it, at any time.\n- When it ends, the badge goes away and your storage goes back to the standard size. Nothing is deleted: if you're over the standard size, your files stay, and new files wait until you're under it again."
     },
     {
       "id": "warranty",

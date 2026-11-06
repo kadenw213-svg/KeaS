@@ -11,7 +11,8 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync,
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkTerms, diffTerms, sameSections, termsPage } from './lib/terms.mjs';
-import { DEFAULTS as BUDGET, courseKey, decide, isMinor, pickNext } from './lib/budget.mjs';
+import { DEFAULTS as BUDGET, ACCOUNT_LIMITS, courseKey, decide, isMinor, pickNext, cleanOverride, describeOverride, limitsFor } from './lib/budget.mjs';
+import { PHONE_VISIBILITY, normalizePhone, phoneShownIn, fmtBytes, fmtDate, supporterUntil } from './lib/account.mjs';
 import { googleKeys, verifyGoogleIdToken } from './lib/google.mjs';
 import { consentPage, consentCsp } from './lib/consentPage.mjs';
 import { openDb, DATA_DIR } from './db.mjs';
@@ -129,9 +130,11 @@ export function createHub({
   ipHeader = process.env.KEA_HUB_IP_HEADER || null, // e.g. 'cf-connecting-ip' behind Cloudflare, 'x-forwarded-for' behind Funnel
   limits = {},
   log = true,
-  // Kea storage: where account files live (point this at the big drive), and each account's default limit.
+  // Kea storage: where account files live (point this at the big drive), and each account's default limit and a
+  // supporter's. Both are owner settings too (POST /owner/settings { storage }), which win over these.
   storageDir = process.env.KEA_HUB_STORAGE || join(dataDir, 'storage'),
-  defaultQuotaBytes = (Number(process.env.KEA_HUB_QUOTA_GB) || 25) * 1024 ** 3,
+  defaultQuotaBytes = (Number(process.env.KEA_HUB_QUOTA_GB) || 5) * 1024 ** 3,
+  supporterQuotaBytes = (Number(process.env.KEA_HUB_SUPPORTER_QUOTA_GB) || 25) * 1024 ** 3,
   minFreeBytes = 5 * 1024 ** 3,
   maxFileBytes = 64 * 1024 ** 2,
   // Verify with Google: the Kea OAuth client IDs whose tokens are accepted, and how to get Google's keys.
@@ -157,7 +160,8 @@ export function createHub({
   const ownerKey = Buffer.from(readFileSync(ownerKeyFile, 'utf8').trim());
   const windows = new Windows();
   const fails = failures(h, now);
-  const L = { login: [30, 10 * 60_000], register: [5, 60 * 60_000], join: [20, 10 * 60_000], answer: [240, 60_000], ...limits };
+  // phone: changes to the phone number, per account per day.
+  const L = { login: [30, 10 * 60_000], register: [5, 60 * 60_000], join: [20, 10 * 60_000], answer: [240, 60_000], phone: [5, 86400_000], ...limits };
   const limit = (kind, who) => {
     const [n, ms] = L[kind];
     const wait = windows.hit(`${kind}:${who}`, n, ms, now());
@@ -165,6 +169,20 @@ export function createHub({
   };
   const audit = (actor, action, target, detail, ip) =>
     h.run('INSERT INTO audit (at,actor,action,target,detail,ip) VALUES (?,?,?,?,?,?)', now(), actor ?? null, action, target ?? null, detail == null ? null : JSON.stringify(detail), ip ?? null);
+  const getSetting = (k, fallback) => { const r = h.get('SELECT value FROM settings WHERE key = ?', k); return r ? JSON.parse(r.value) : fallback; };
+  const setSetting = (k, v) => h.run('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', k, JSON.stringify(v));
+
+  // ---------- notifications ----------
+  // One person's notices. Kept to the newest 500 each; read ones go after 180 days (sweep below).
+  const NOTE_KEEP = 500;
+  const notify = (accountId, kind, title, body = '', { note = null, data = null } = {}) => {
+    if (!accountId) return null;
+    const r = h.run('INSERT INTO notifications (account_id,kind,title,body,note,data,created_at) VALUES (?,?,?,?,?,?,?)', accountId, kind, String(title).slice(0, 200), String(body ?? '').slice(0, 4000), note ? String(note).slice(0, 2000) : null, data == null ? null : JSON.stringify(data), now());
+    h.run('DELETE FROM notifications WHERE account_id = ? AND id <= (SELECT id FROM notifications WHERE account_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?)', accountId, accountId, NOTE_KEEP);
+    return Number(r.lastInsertRowid);
+  };
+  const noteOut = (n) => ({ id: n.id, kind: n.kind, title: n.title, body: n.body, note: n.note, data: n.data ? JSON.parse(n.data) : null, createdAt: n.created_at, readAt: n.read_at });
+  const unreadCount = (accountId) => h.get('SELECT COUNT(*) AS n FROM notifications WHERE account_id = ? AND read_at IS NULL', accountId).n;
 
   // ---------- terms ----------
   const termsRow = (n) => h.get('SELECT * FROM terms_versions WHERE n = ?', n);
@@ -230,8 +248,36 @@ export function createHub({
   };
 
   // ---------- storage ----------
-  const quotaOf = (a) => (a.quota_bytes == null ? defaultQuotaBytes : a.quota_bytes);
+  // Everyone gets the default; a supporter gets at least the supporter size; the owner can set any size for one
+  // person (accounts.quota_bytes), and a supporter keeps the bigger of that and the supporter size. Nothing is ever
+  // deleted when a limit drops below what someone uses: they just can't add more until they're under it again.
+  const storageSettings = () => {
+    const s = getSetting('storage', {});
+    const ok = (v) => Number.isFinite(v) && v >= 0;
+    return { defaultQuotaBytes: ok(s.defaultQuotaBytes) ? s.defaultQuotaBytes : defaultQuotaBytes, supporterQuotaBytes: ok(s.supporterQuotaBytes) ? s.supporterQuotaBytes : supporterQuotaBytes };
+  };
+  const supporterActive = (a) => a.supporter_until != null && a.supporter_until > now();
+  const quotaOf = (a, S = storageSettings()) => {
+    const base = a.quota_bytes == null ? S.defaultQuotaBytes : a.quota_bytes;
+    return supporterActive(a) ? Math.max(base, S.supporterQuotaBytes) : base;
+  };
   const usedBy = (accountId) => h.get('SELECT COALESCE(SUM(size),0) AS s FROM files WHERE account_id = ?', accountId).s;
+  const storageOut = (a) => {
+    const used = usedBy(a.id), quota = quotaOf(a), S = storageSettings();
+    return { used, quota, over: used > quota, custom: a.quota_bytes != null, supporter: supporterActive(a), standard: S.defaultQuotaBytes, supporterQuota: S.supporterQuotaBytes };
+  };
+  /** Says plainly what a smaller limit means for someone already over it. */
+  /** After the standard or supporter size changed: a notice to everyone whose storage changed because of it. */
+  function noticeStorageChange(before, after) {
+    for (const a of h.all('SELECT * FROM accounts')) {
+      const was = quotaOf(a, before), is = quotaOf(a, after);
+      if (was === is) continue;
+      const used = usedBy(a.id);
+      const body = is < was && used > is ? overText(used, is) : is < was ? `You’re using ${fmtBytes(used)}, so nothing changes for what you have now.` : '';
+      notify(a.id, 'storage', `Your Kea storage is now ${fmtBytes(is)}`, body, { data: { quota: is, previous: was } });
+    }
+  }
+  const overText = (used, quota) => `You’re using ${fmtBytes(used)}, which is more than that. Nothing has been deleted: your files stay, and you can still open, change and delete them. New files wait until you’re under ${fmtBytes(quota)} again.`;
   const blobPath = (accountId, blob) => join(storageDir, accountId, blob);
   // A storage "space": one person's files, or a course section's shared folder. Same rules for both: files on disk
   // under random names, versions in the database, atomic writes.
@@ -288,6 +334,15 @@ export function createHub({
     canHost: !!a.can_host || a.role === 'owner', totpEnabled: !!a.totp_enabled, owner: a.role === 'owner', createdAt: a.created_at,
     birthYear: a.birth_year ?? null, ...consentOf(a),
     leaderboard: { show: a.board_default || 'name', nickname: a.nickname ?? null },
+    supporter: { active: supporterActive(a), until: a.supporter_until ?? null, since: a.supporter_since ?? null },
+    phone: { number: a.phone ?? null, visibility: a.phone_visibility || 'nobody' },
+  });
+  // (publicAccount is the person's own view, and the owner console's. Other people only see what member lists pick
+  // out with extrasFor: the supporter badge, and the phone number where its owner allowed it.)
+  /** Besides a name, what a member list ('classes' or 'orgs') may show about someone. */
+  const extrasFor = (row, where, { phone = true } = {}) => ({
+    supporter: row.supporter_until != null && row.supporter_until > now(),
+    ...(phone && row.phone && phoneShownIn(row.phone_visibility, where) ? { phone: row.phone } : {}),
   });
   // ---------- parent or guardian sign-off (members under 18, before the shared Claude) ----------
   const thisYear = () => new Date(now()).getUTCFullYear();
@@ -313,6 +368,7 @@ export function createHub({
       h.run("UPDATE parent_consents SET status = 'revoked', decided_at = ? WHERE account_id = ? AND status = 'pending' AND id != ?", now(), c.account_id, c.id);
     });
     audit(c.account_id, 'consent.approve', c.id, { method, parent: c.parent_email }, ip);
+    notify(c.account_id, 'parent_signoff', 'Your parent or guardian signed off', 'Kea’s shared Claude works for you now.', { data: { status: 'approved' } });
   }
   const newSession = (accountId, client) => {
     const token = randomBytes(32).toString('hex');
@@ -357,6 +413,48 @@ export function createHub({
   });
   const boardName = (row) => (row.board === 'nickname' && row.nickname ? row.nickname : row.board === 'hidden' ? null : row.display_name);
   const sessionOut = (s) => ({ id: s.id, classId: s.class_id, title: s.title, start: new Date(s.start_at).toISOString(), end: new Date(s.end_at).toISOString(), location: s.location, meetingUrl: s.meeting_url, notes: s.notes });
+
+  // ---------- supporters, and the owner's view of an account ----------
+  function supporterEnded(a, note = null) {
+    const used = usedBy(a.id), quota = quotaOf(a);
+    notify(a.id, 'supporter', 'Your supporter time has ended. Thank you!',
+      `The supporter badge is gone and your Kea storage is ${fmtBytes(quota)} again.${used > quota ? ` ${overText(used, quota)}` : ''}`,
+      { note, data: { until: a.supporter_until } });
+  }
+  /** Everything the owner sees and can set for one account. */
+  const ownerView = (a) => {
+    const o = overrideOf(a), L = limitsOf(a);
+    const shown = (v) => (Number.isFinite(v) ? v : null);
+    return {
+      ...publicAccount(a),
+      storage: storageOut(a), quotaOverride: a.quota_bytes ?? null,
+      sharedClaude: { ...o, limits: o.limits, applies: Object.fromEntries(ACCOUNT_LIMITS.map((k) => [k, shown(L[k])])) },
+      unreadNotifications: unreadCount(a.id),
+    };
+  };
+  // Supporter time that ran out gets a notice (once), and old read notices go. Runs hourly, and when someone looks.
+  let sweptAt = 0;
+  function sweep(force = false) {
+    if (!force && now() - sweptAt < 60_000) return;
+    sweptAt = now();
+    for (const a of h.all('SELECT * FROM accounts WHERE supporter_until IS NOT NULL AND supporter_until <= ? AND supporter_lapse_noted = 0', now())) {
+      h.run('UPDATE accounts SET supporter_lapse_noted = 1 WHERE id = ?', a.id);
+      supporterEnded(a);
+    }
+    h.run('DELETE FROM notifications WHERE read_at IS NOT NULL AND read_at < ?', now() - 180 * DAY_MS);
+  }
+  const sweepTimer = setInterval(() => { try { sweep(true); } catch (e) { console.error(e); } }, 3600_000);
+  sweepTimer.unref?.();
+  // The standard storage size changed since the Hub last ran (an update, or KeaS's setting): a notice to everyone it
+  // changes for. Before this was recorded, the standard size was 25 GB.
+  {
+    const seen = getSetting('storageSeen', null);
+    const cur = storageSettings();
+    const hadAccounts = !!h.get('SELECT 1 FROM accounts LIMIT 1');
+    const was = seen ?? (hadAccounts ? { defaultQuotaBytes: 25 * 1024 ** 3, supporterQuotaBytes: cur.supporterQuotaBytes } : cur);
+    if (was.defaultQuotaBytes !== cur.defaultQuotaBytes || was.supporterQuotaBytes !== cur.supporterQuotaBytes) noticeStorageChange(was, cur);
+    setSetting('storageSeen', cur);
+  }
 
   // ================= public API =================
   const api = makeRouter();
@@ -506,6 +604,9 @@ export function createHub({
     points: h.all('SELECT class_id, question_id, points, at FROM xp_events WHERE account_id = ? ORDER BY at', me.id),
     files: h.all('SELECT path, size, version, updated_at FROM files WHERE account_id = ? ORDER BY path', me.id),
     signIns: h.all("SELECT action, at, ip FROM audit WHERE actor = ? AND action LIKE 'auth.%' ORDER BY id DESC LIMIT 500", me.id),
+    storage: storageOut(me),
+    sharedClaude: cleanOverride(me.claude_override ? JSON.parse(me.claude_override) : null),
+    notifications: h.all('SELECT * FROM notifications WHERE account_id = ? ORDER BY id', me.id).map(noteOut),
   }), { terms: false });
 
   R('POST', '/v1/auth/logout', ({ token }) => {
@@ -525,10 +626,52 @@ export function createHub({
   });
 
   // ---------- me ----------
-  R('GET', '/v1/me', ({ me }) => ({
-    account: publicAccount(me), progress: progressOf(me.id), terms: termsStatus(me.id),
-    storage: { used: usedBy(me.id), quota: quotaOf(me) },
-  }), { terms: false });
+  R('GET', '/v1/me', ({ me }) => {
+    sweep();
+    return {
+      account: publicAccount(me), progress: progressOf(me.id), terms: termsStatus(me.id),
+      storage: storageOut(me), notifications: { unread: unreadCount(me.id), latest: h.get('SELECT MAX(id) AS n FROM notifications WHERE account_id = ?', me.id).n ?? 0 },
+    };
+  }, { terms: false });
+  // Notifications: newest first (or only those after an id, for polling), and marking them read. Readable before
+  // agreeing to new terms, like the account itself.
+  R('GET', '/v1/me/notifications', ({ me, query }) => {
+    sweep();
+    const after = Math.max(0, Number(query.after) || 0);
+    const limit = Math.min(200, Math.max(1, Number(query.limit) || 50));
+    const unreadOnly = query.unread === '1' || query.unread === 'true';
+    return {
+      notifications: h.all(`SELECT * FROM notifications WHERE account_id = ? AND id > ?${unreadOnly ? ' AND read_at IS NULL' : ''} ORDER BY id DESC LIMIT ?`, me.id, after, limit).map(noteOut),
+      unread: unreadCount(me.id),
+    };
+  }, { terms: false });
+  R('POST', '/v1/me/notifications/read', ({ me, body }) => {
+    if (body.all === true) h.run('UPDATE notifications SET read_at = ? WHERE account_id = ? AND read_at IS NULL', now(), me.id);
+    else {
+      if (!Array.isArray(body.ids) || body.ids.length > 500) bad('Say which notifications: ids (a list), or all: true.');
+      for (const id of body.ids) h.run('UPDATE notifications SET read_at = ? WHERE id = ? AND account_id = ? AND read_at IS NULL', now(), V.int(id, 'id', { min: 1 }), me.id);
+    }
+    return { unread: unreadCount(me.id) };
+  }, { terms: false });
+  R('POST', '/v1/me/notifications/delete', ({ me, body }) => {
+    if (body.all === true) h.run('DELETE FROM notifications WHERE account_id = ? AND read_at IS NOT NULL', me.id);
+    else {
+      if (!Array.isArray(body.ids) || body.ids.length > 500) bad('Say which notifications: ids (a list), or all: true for every read one.');
+      for (const id of body.ids) h.run('DELETE FROM notifications WHERE id = ? AND account_id = ?', V.int(id, 'id', { min: 1 }), me.id);
+    }
+    return { unread: unreadCount(me.id) };
+  }, { terms: false });
+  // An optional phone number, and who sees it: classmates in my classes, coworkers in my organizations, both, or
+  // nobody (the default). Never on leaderboards, never public. Changing the number is limited to a few times a day.
+  R('POST', '/v1/me/phone', ({ me, body, ip }) => {
+    let number = me.phone ?? null;
+    if ('phone' in body) { try { number = body.phone == null || body.phone === '' ? null : normalizePhone(body.phone); } catch (e) { bad(e.message, { field: 'phone' }); } }
+    const visibility = body.visibility == null ? (number ? me.phone_visibility || 'nobody' : 'nobody') : V.enum(body.visibility, 'Who sees it', PHONE_VISIBILITY);
+    if (number !== (me.phone ?? null)) limit('phone', me.id);
+    h.run('UPDATE accounts SET phone = ?, phone_visibility = ?, updated_at = ? WHERE id = ?', number, visibility, now(), me.id);
+    if (number !== (me.phone ?? null) || visibility !== me.phone_visibility) audit(me.id, number ? 'account.phone' : 'account.phone_clear', me.id, { visibility }, ip);
+    return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', me.id)) };
+  });
   R('POST', '/v1/me', ({ me, body }) => {
     const name = V.str(body.displayName, 'Name', { min: 1, max: 60 });
     h.run('UPDATE accounts SET display_name = ?, updated_at = ? WHERE id = ?', name, now(), me.id);
@@ -595,6 +738,7 @@ export function createHub({
     else {
       h.run("UPDATE parent_consents SET status = 'declined', method = 'google-link', parent_google_sub = ?, decided_at = ? WHERE id = ?", g.sub, now(), c.id);
       audit(c.account_id, 'consent.decline', c.id, { parent: c.parent_email }, ip);
+      notify(c.account_id, 'parent_signoff', 'Your parent or guardian didn’t sign off', 'Kea’s shared Claude stays off for you. Everything else in Kea works as before. You can ask again under Your account.', { data: { status: 'declined' } });
     }
     return { status: approve ? 'approved' : 'declined' };
   }, { auth: false });
@@ -772,11 +916,13 @@ export function createHub({
   R('GET', '/v1/classes/:id/members', ({ me, params }) => {
     const { m } = asMember(params.id, me);
     const teacher = ['instructor', 'ta'].includes(m.role);
-    const rows = h.all('SELECT m.*, a.display_name FROM class_members m JOIN accounts a ON a.id = m.account_id WHERE m.class_id = ? ORDER BY m.role, a.display_name', params.id);
+    const rows = h.all('SELECT m.*, a.display_name, a.phone, a.phone_visibility, a.supporter_until FROM class_members m JOIN accounts a ON a.id = m.account_id WHERE m.class_id = ? ORDER BY m.role, a.display_name', params.id);
+    // Phone numbers only between real members of the class (not the Hub owner looking in from outside).
+    const classmate = !m.owner;
     return {
       members: rows
         .filter((r) => teacher || r.role !== 'student' || r.board !== 'hidden' || r.account_id === me.id)
-        .map((r) => ({ id: teacher ? r.account_id : undefined, name: teacher || r.role !== 'student' ? r.display_name : boardName(r), role: r.role, joinedAt: r.joined_at, you: r.account_id === me.id })),
+        .map((r) => ({ id: teacher ? r.account_id : undefined, name: teacher || r.role !== 'student' ? r.display_name : boardName(r), role: r.role, joinedAt: r.joined_at, you: r.account_id === me.id, ...extrasFor(r, 'classes', { phone: classmate }) })),
     };
   });
   R('POST', '/v1/classes/:id/members/:accountId/remove', ({ me, params, ip }) => {
@@ -922,7 +1068,7 @@ export function createHub({
     asMember(params.id, me);
     const period = V.enum(query.period ?? 'week', 'Period', ['week', 'all']);
     const since = period === 'week' ? weekStart(now()) : 0;
-    const rows = h.all(`SELECT m.account_id, m.board, m.nickname, a.display_name, COALESCE(SUM(x.points),0) AS points
+    const rows = h.all(`SELECT m.account_id, m.board, m.nickname, a.display_name, a.supporter_until, COALESCE(SUM(x.points),0) AS points
       FROM class_members m JOIN accounts a ON a.id = m.account_id
       LEFT JOIN xp_events x ON x.account_id = m.account_id AND x.class_id = m.class_id AND x.at >= ?
       WHERE m.class_id = ? GROUP BY m.account_id ORDER BY points DESC, a.display_name`, since, params.id);
@@ -930,7 +1076,8 @@ export function createHub({
     const out = []; let mine = null;
     rows.forEach((r, i) => {
       if (r.points !== last) { rank = i + 1; last = r.points; }
-      const entry = { rank, name: boardName(r) ?? 'Hidden', points: r.points, you: r.account_id === me.id };
+      // (The supporter badge, and never a phone number.)
+      const entry = { rank, name: boardName(r) ?? 'Hidden', points: r.points, you: r.account_id === me.id, supporter: r.board !== 'hidden' && r.supporter_until != null && r.supporter_until > now() };
       if (entry.you) mine = entry;
       if ((r.board !== 'hidden' || entry.you) && r.points > 0 && shown < 100) { out.push(entry); shown++; }
     });
@@ -938,9 +1085,10 @@ export function createHub({
   });
 
   // ================= the shared Claude (owner's plan): queue + limits =================
-  const getSetting = (k, fallback) => { const r = h.get('SELECT value FROM settings WHERE key = ?', k); return r ? JSON.parse(r.value) : fallback; };
-  const setSetting = (k, v) => h.run('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', k, JSON.stringify(v));
   const limitsNow = () => ({ ...BUDGET, ...getSetting('limits', {}) });
+  // One person's shared-Claude settings from the owner (limits, trusted, blocked), and the limits that apply to them.
+  const overrideOf = (a) => cleanOverride(a?.claude_override ? JSON.parse(a.claude_override) : null);
+  const limitsOf = (a) => limitsFor(getSetting('limits', {}), overrideOf(a));
   const ownerIds = () => new Set(h.all("SELECT id FROM accounts WHERE role = 'owner'").map((r) => r.id));
   const DAY_MS = 86400_000;
   const dayStart = () => Date.parse(`${dayKey(now())}T00:00:00Z`);
@@ -963,17 +1111,20 @@ export function createHub({
     };
   };
   const allowance = (me) => {
-    const L = limitsNow();
+    const L = limitsOf(me);
+    const o = overrideOf(me);
     const today = h.get(`SELECT COUNT(*) AS n FROM scan_jobs WHERE account_id = ? AND created_at >= ? AND status != 'cancelled'`, me.id, dayStart()).n;
     const week = h.get(`SELECT COUNT(*) AS n FROM scan_jobs WHERE account_id = ? AND created_at >= ? AND status != 'cancelled'`, me.id, now() - 7 * DAY_MS).n;
-    return me.role === 'owner' ? { unlimited: true } : { today, perDay: L.perAccountDaily, week, perWeek: L.perAccountWeekly, batchSize: L.questionBatchSize };
+    if (me.role === 'owner') return { unlimited: true };
+    const cap = (v) => (Number.isFinite(v) ? v : null); // (null: no limit for this person)
+    return { today, perDay: cap(L.perAccountDaily), week, perWeek: cap(L.perAccountWeekly), batchSize: L.questionBatchSize, trusted: o.trusted, blocked: o.blocked };
   };
   /** Counts every request; flags someone refused a lot, and suspends an account sending requests like a script. */
   const watchRequests = (me, kind, outcome, ip) => {
     const day = dayKey(now());
     h.run('INSERT INTO scan_requests (account_id,kind,outcome,at,day) VALUES (?,?,?,?,?)', me.id, kind, outcome, now(), day);
     if (me.role === 'owner') return;
-    const L = limitsNow();
+    const L = limitsOf(me);
     const all = h.get('SELECT COUNT(*) AS n FROM scan_requests WHERE account_id = ? AND day = ?', me.id, day).n;
     const refused = h.get("SELECT COUNT(*) AS n FROM scan_requests WHERE account_id = ? AND day = ? AND outcome LIKE 'refuse%'", me.id, day).n;
     const openToday = (reason) => h.get("SELECT 1 FROM flags WHERE account_id = ? AND reason = ? AND status = 'open' AND at >= ?", me.id, reason, dayStart());
@@ -1023,7 +1174,11 @@ export function createHub({
         try { dest = checkPath(`${target}Shared/${f.path.slice('material/'.length)}`); } catch { continue; }
         const mine = spaceRow(user, dest);
         if (mine?.sha256 === f.sha256) continue; // already there
-        if (f.size - (mine?.size ?? 0) > room) { audit('system', 'material.storage_full', p.id, { course: key, path: f.path }, 'local'); break; }
+        if (f.size - (mine?.size ?? 0) > room) {
+          audit('system', 'material.storage_full', p.id, { course: key, path: f.path }, 'local');
+          notify(p.id, 'storage', 'Your Kea storage is full', `New course material couldn’t be copied into your Kea storage (${fmtBytes(quotaOf(a))}). Nothing was deleted. Make some room and it comes with the next update.`, { data: { course: key } });
+          break;
+        }
         const row = spaceRow(sp, f.path);
         if (!row) continue;
         spaceWrite(user, dest, spaceRead(sp, row));
@@ -1035,6 +1190,13 @@ export function createHub({
   }
   // When a job finishes: what it added to the section's material, to everyone in it. A scan's requester already has
   // theirs (the worker wrote their whole folder as their primary device); a question batch goes to everyone.
+  /** "BIO 1010, Chapter 4" style words for a job, from what the person's Kea said when it asked. */
+  function jobLabel(j) {
+    let d = null;
+    try { d = j.detail ? JSON.parse(j.detail) : null; } catch {}
+    const course = d?.courseCode || (j.kind === 'initial_scan' ? 'your classes' : String(j.course_key).split('|')[1] || 'your course');
+    return j.chapter ? `${course}, ${j.chapter}` : course;
+  }
   function deliverJob(j) {
     if (j.delivered) return 0;
     const files = spaceList(spaces.course(j.course_key), 'material/').filter((f) => f.updatedAt >= (j.started_at ?? 0));
@@ -1042,8 +1204,16 @@ export function createHub({
       ...(j.kind === 'more_questions' ? [{ id: j.account_id, target: j.target }] : []),
       ...h.all('SELECT account_id AS id, target FROM scan_job_members WHERE job_id = ?', j.id),
     ];
-    const n = files.length ? deliver(j.course_key, files, people) : 0;
+    const got = new Map(people.map((p) => [p.id, files.length ? deliver(j.course_key, files, [p]) : 0]));
+    const n = [...got.values()].reduce((a, b) => a + b, 0);
     h.run('UPDATE scan_jobs SET delivered = 1 WHERE id = ?', j.id);
+    // Course material that arrived for someone who only joined (or asked for questions): a notice.
+    const what = jobLabel(j);
+    for (const [id, count] of got) {
+      if (!count || id === j.account_id) continue; // (the person who asked hears it from the finish notice)
+      if (j.kind === 'more_questions') notify(id, 'material', `New practice questions: ${what}`, 'They’re in your Kea storage and show up in My resources after Kea’s next sync.', { data: { jobId: j.id, files: count } });
+      else notify(id, 'material', `Course material arrived: ${what}`, `${count} file${count === 1 ? '' : 's'} from a classmate’s scan are in your Kea storage. Kea takes them in with its next sync.`, { data: { jobId: j.id, files: count } });
+    }
     // Classmates who joined a first scan now share the section's material from here on.
     if (j.kind === 'initial_scan') for (const p of people) h.run('INSERT OR IGNORE INTO course_members (course_key,account_id,joined_at,target) VALUES (?,?,?,?)', j.course_key, p.id, now(), p.target);
     return n;
@@ -1062,6 +1232,7 @@ export function createHub({
     const target = body.target == null ? null : targetOf(body.target);
     const facts = {
       verified: !!me.email_verified, owner: me.role === 'owner', chapter,
+      blocked: overrideOf(me).blocked, blockedReason: overrideOf(me).reason,
       birthYear: me.birth_year ?? null, year: thisYear(), parentApproved: parentApproved(me.id),
       alreadyScannedByMe: !!(key && h.get('SELECT 1 FROM course_members WHERE course_key = ? AND account_id = ?', key, me.id)),
       courseHasMaterials: !!mats, hoursSinceCourseUpdate: mats ? (t - mats.updated_at) / 3600_000 : null,
@@ -1072,7 +1243,7 @@ export function createHub({
       myBatchesThisChapter: kind === 'more_questions' ? h.get(`SELECT COUNT(*) AS n FROM scan_jobs j WHERE ${MINE} AND kind = 'more_questions' AND course_key = ? AND chapter = ? AND status NOT IN ('cancelled','failed')`, me.id, me.id, key, chapter).n : 0,
       myBatchesToday: kind === 'more_questions' ? h.get(`SELECT COUNT(*) AS n FROM scan_jobs j WHERE ${MINE} AND kind = 'more_questions' AND created_at >= ? AND status NOT IN ('cancelled','failed')`, me.id, me.id, dayStart()).n : 0,
     };
-    const d = decide(kind, getSetting('limits', {}), facts);
+    const d = decide(kind, limitsOf(me), facts);
     watchRequests(me, kind, d.action === 'refuse' ? `refuse:${d.code}` : d.action, ip);
     if (d.action === 'refuse') throw new HttpError(429, d.reason, { code: d.code, allowance: allowance(me) });
     if (kind === 'initial_scan') {
@@ -1214,6 +1385,12 @@ export function createHub({
       spaceDeletePrefix(spaces.user(j.account_id), `scan-inbox/${j.id}/`);
     });
     dropRelay(j.id, 'The job has finished.');
+    // The person who asked hears that it finished (or didn't); people who joined hear when material arrives.
+    const note = V.str(body.note, 'note', { optional: true, max: 2000 });
+    const what = jobLabel(j);
+    if (ok && j.kind === 'more_questions') notify(j.account_id, 'scan_done', `Your new practice questions are ready: ${what}`, 'They show up in My resources after Kea’s next sync.', { data: { jobId: j.id, ok } });
+    else if (ok) notify(j.account_id, 'scan_done', 'Kea’s shared Claude finished setting up your classes', 'Your classes come into Kea with its next sync.', { data: { jobId: j.id, ok } });
+    else notify(j.account_id, 'scan_done', j.kind === 'more_questions' ? `Your new practice questions didn’t finish: ${what}` : 'Your class scan didn’t finish', `${note ? `${note} ` : ''}You can ask again.`, { data: { jobId: j.id, ok } });
     const delivered = ok ? deliverJob(h.get('SELECT * FROM scan_jobs WHERE id = ?', j.id)) : 0;
     return { ok: true, delivered };
   });
@@ -1300,8 +1477,27 @@ export function createHub({
     const emails = new Map(h.all('SELECT id, email FROM accounts').map((a) => [a.id, a.email]));
     return { paused: (getSetting('pausedUntil', 0) || 0) > now(), avgMinutes: Math.round(avgMinutes()), jobs: order.map((j) => ({ ...jobOut(j, order), email: emails.get(j.account_id), joined: h.get('SELECT COUNT(*) AS n FROM scan_job_members WHERE job_id = ?', j.id).n })) };
   });
-  O('GET', '/owner/settings', () => ({ limits: limitsNow(), donate: getSetting('donate', { url: null, message: null }) }));
+  const settingsOut = () => ({ limits: limitsNow(), donate: getSetting('donate', { url: null, message: null }), storage: storageSettings() });
+  O('GET', '/owner/settings', () => settingsOut());
   O('POST', '/owner/settings', ({ body }) => {
+    // Storage sizes, in bytes or GB: the standard size for everyone, and a supporter's.
+    if (body.storage) {
+      const st = V.obj(body.storage);
+      const size = (bytesKey, gbKey) => {
+        if (st[bytesKey] != null) return V.int(st[bytesKey], bytesKey, { min: 0, max: 1024 ** 5 });
+        if (st[gbKey] != null) { const g = st[gbKey]; if (typeof g !== 'number' || !Number.isFinite(g) || g < 0 || g > 1_000_000) bad(`${gbKey} must be a number of GB from 0 to 1,000,000.`); return Math.round(g * 1024 ** 3); }
+        return undefined;
+      };
+      const before = storageSettings();
+      const next = { ...getSetting('storage', {}) };
+      const d = size('defaultQuotaBytes', 'defaultGb'), sp = size('supporterQuotaBytes', 'supporterGb');
+      if (d !== undefined) next.defaultQuotaBytes = d;
+      if (sp !== undefined) next.supporterQuotaBytes = sp;
+      setSetting('storage', next);
+      setSetting('storageSeen', storageSettings());
+      audit('owner', 'owner.storage_settings', null, next, 'local');
+      noticeStorageChange(before, storageSettings());
+    }
     if (body.limits) {
       const next = { ...getSetting('limits', {}) };
       for (const [k, v] of Object.entries(V.obj(body.limits))) {
@@ -1315,7 +1511,7 @@ export function createHub({
       const d = V.obj(body.donate);
       setSetting('donate', { url: V.url(d.url, 'Donation link'), message: V.str(d.message, 'Message', { optional: true, max: 200 }) });
     }
-    return { limits: limitsNow(), donate: getSetting('donate', { url: null, message: null }) };
+    return settingsOut();
   });
   O('GET', '/owner/flags', ({ query }) => ({
     flags: h.all('SELECT f.*, a.email, a.status AS account_status FROM flags f JOIN accounts a ON a.id = f.account_id WHERE f.status = ? ORDER BY f.at DESC LIMIT 200', query.status ?? 'open')
@@ -1341,7 +1537,89 @@ export function createHub({
   }));
   O('GET', '/owner/accounts', ({ query }) => {
     const q = `%${String(query.q ?? '').toLowerCase()}%`;
-    return { accounts: h.all('SELECT * FROM accounts WHERE lower(email) LIKE ? OR lower(display_name) LIKE ? ORDER BY created_at DESC LIMIT 200', q, q).map(publicAccount) };
+    return { accounts: h.all('SELECT * FROM accounts WHERE lower(email) LIKE ? OR lower(display_name) LIKE ? ORDER BY created_at DESC LIMIT 200', q, q).map(ownerView) };
+  });
+  // One account, with everything the owner can set for it: storage, shared Claude, supporter.
+  O('GET', '/owner/accounts/:id', ({ params }) => {
+    const a = getAccount(params.id);
+    return { account: ownerView(a), notifications: h.all('SELECT * FROM notifications WHERE account_id = ? ORDER BY id DESC LIMIT 20', a.id).map(noteOut) };
+  });
+  // Any storage size for one person (for example 5000 GB), or null for the standard size again.
+  O('POST', '/owner/accounts/:id/quota', ({ params, body }) => {
+    const a = getAccount(params.id);
+    let bytes;
+    if (body.bytes !== undefined) bytes = body.bytes === null ? null : V.int(body.bytes, 'bytes', { min: 0, max: 1024 ** 5 });
+    else if (body.gb === null) bytes = null;
+    else {
+      if (typeof body.gb !== 'number' || !Number.isFinite(body.gb) || body.gb < 0 || body.gb > 1_000_000) bad('gb must be a number from 0 to 1,000,000, or null for the standard size.');
+      bytes = Math.round(body.gb * 1024 ** 3);
+    }
+    const note = V.str(body.note, 'note', { optional: true, max: 2000 });
+    h.run('UPDATE accounts SET quota_bytes = ?, updated_at = ? WHERE id = ?', bytes, now(), a.id);
+    const after = h.get('SELECT * FROM accounts WHERE id = ?', a.id);
+    const quota = quotaOf(after), used = usedBy(a.id);
+    audit('owner', 'owner.quota', a.id, { bytes, note }, 'local');
+    notify(a.id, 'storage', `Your Kea storage is now ${fmtBytes(quota)}`, [bytes == null ? 'That’s the standard size.' : '', used > quota ? overText(used, quota) : ''].filter(Boolean).join(' '), { note, data: { quota } });
+    return { used, quota, account: ownerView(after) };
+  });
+  // Kea's shared Claude for one person: any per-account limit from hub/lib/budget.mjs (null = the Hub-wide number),
+  // trusted (lifts their own caps), or blocked (with a reason they see). reset: true clears all of it.
+  O('POST', '/owner/accounts/:id/claude', ({ params, body }) => {
+    const a = getAccount(params.id);
+    const before = overrideOf(a);
+    const next = body.reset === true ? cleanOverride(null) : { ...before, limits: { ...before.limits } };
+    if (body.limits != null) {
+      for (const [k, v] of Object.entries(V.obj(body.limits))) {
+        if (!ACCOUNT_LIMITS.includes(k)) bad(`Not a per-account limit: ${k}. Use one of: ${ACCOUNT_LIMITS.join(', ')}.`);
+        if (v === null) delete next.limits[k];
+        else next.limits[k] = V.int(v, k, { min: 0, max: 100_000 });
+      }
+    }
+    if (body.trusted != null) next.trusted = V.bool(body.trusted, 'trusted');
+    if (body.blocked != null) next.blocked = V.bool(body.blocked, 'blocked');
+    if ('reason' in body) next.reason = V.str(body.reason, 'reason', { optional: true, max: 500 });
+    if (!next.blocked) next.reason = null;
+    const clean = cleanOverride(next);
+    const empty = !Object.keys(clean.limits).length && !clean.trusted && !clean.blocked;
+    h.run('UPDATE accounts SET claude_override = ?, updated_at = ? WHERE id = ?', empty ? null : JSON.stringify(clean), now(), a.id);
+    const note = V.str(body.note, 'note', { optional: true, max: 2000 });
+    audit('owner', 'owner.claude', a.id, { before, after: clean, note }, 'local');
+    const lines = describeOverride(before, clean, getSetting('limits', {}));
+    if (lines.length) notify(a.id, 'claude', lines.length === 1 ? lines[0] : 'Changes to Kea’s shared Claude for you', lines.length === 1 ? '' : lines.join('\n'), { note, data: { override: clean } });
+    return { account: ownerView(h.get('SELECT * FROM accounts WHERE id = ?', a.id)), notified: lines.length > 0 };
+  });
+  // Supporter, by hand: a month (or `months`) from now, or added to the end of the current time; or `until` a date;
+  // or end: true to stop it now. Storage and a badge only: their shared-Claude limits don't change.
+  O('POST', '/owner/accounts/:id/supporter', ({ params, body }) => {
+    const a = getAccount(params.id);
+    const note = V.str(body.note, 'note', { optional: true, max: 2000 });
+    const wasActive = supporterActive(a);
+    if (body.end === true) {
+      h.run('UPDATE accounts SET supporter_until = ?, supporter_lapse_noted = 1, updated_at = ? WHERE id = ?', wasActive ? now() : a.supporter_until, now(), a.id);
+      audit('owner', 'owner.supporter_end', a.id, { note }, 'local');
+      if (wasActive) supporterEnded(h.get('SELECT * FROM accounts WHERE id = ?', a.id), note);
+      return { account: ownerView(h.get('SELECT * FROM accounts WHERE id = ?', a.id)) };
+    }
+    const until = body.until != null ? V.time(body.until, 'until') : null;
+    if (until != null && until <= now()) bad('Pick a date in the future.');
+    const months = body.months == null ? null : V.int(body.months, 'months', { min: 1, max: 120 });
+    const end = supporterUntil(a.supporter_until, now(), { months, until });
+    h.run('UPDATE accounts SET supporter_until = ?, supporter_since = ?, supporter_lapse_noted = 0, updated_at = ? WHERE id = ?', end, wasActive ? a.supporter_since ?? now() : now(), now(), a.id);
+    const after = h.get('SELECT * FROM accounts WHERE id = ?', a.id);
+    audit('owner', wasActive ? 'owner.supporter_extend' : 'owner.supporter_start', a.id, { until: end, months, note }, 'local');
+    notify(a.id, 'supporter', wasActive ? `Your supporter time now runs until ${fmtDate(end)}` : 'Thank you for supporting Kea!',
+      `Until ${fmtDate(end)}, your Kea storage is ${fmtBytes(quotaOf(after))} and a supporter badge shows next to your name in your classes and organizations. It’s a thank-you: everything else in Kea stays the same.`,
+      { note, data: { until: end } });
+    return { account: ownerView(after) };
+  });
+  // A plain notice to one person (for example after they emailed).
+  O('POST', '/owner/accounts/:id/notify', ({ params, body }) => {
+    const a = getAccount(params.id);
+    const title = V.str(body.title, 'title', { min: 1, max: 200 });
+    const text = V.str(body.body, 'body', { optional: true, max: 4000 }) ?? '';
+    const id = notify(a.id, 'notice', title, text);
+    audit('owner', 'owner.notify', a.id, { title }, 'local');
+    return { id };
   });
   O('POST', '/owner/accounts/:id', ({ params, body }) => {
     const a = getAccount(params.id);
@@ -1355,6 +1633,11 @@ export function createHub({
       if (body.status === 'suspended') h.run('DELETE FROM sessions WHERE account_id = ?', a.id);
     }
     audit('owner', 'owner.account_update', a.id, body, 'local');
+    const note = V.str(body.note, 'note', { optional: true, max: 2000 });
+    if (body.canHost === true && !a.can_host) notify(a.id, 'account', 'You can host classes on the Kea Hub now', 'Make a class from My classes and share its invite code.', { note });
+    if (body.canHost === false && a.can_host) notify(a.id, 'account', 'Hosting classes on the Kea Hub is off for your account', 'Classes you already made stay as they are.', { note });
+    if (body.identityVerified === true && !a.identity_verified) notify(a.id, 'account', 'Your identity is verified', 'A verified mark shows next to your name where you teach.', { note });
+    if (body.emailVerified === true && !a.email_verified) notify(a.id, 'account', 'Your email is verified', 'Kea’s creator verified it by hand.', { note });
     return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', a.id)) };
   });
   // Parent sign-offs: see them all, and approve or withdraw one by hand (for example after a parent emailed).
@@ -1375,6 +1658,8 @@ export function createHub({
         randomUUID(), a.id, parentEmail, sha(`owner:${randomUUID()}`), note, now(), now(), now());
     } else h.run("UPDATE parent_consents SET status = 'revoked', note = COALESCE(?, note), decided_at = ? WHERE account_id = ? AND status IN ('pending','approved')", note, now(), a.id);
     audit('owner', approved ? 'owner.consent_approve' : 'owner.consent_revoke', a.id, { note }, 'local');
+    if (approved) notify(a.id, 'parent_signoff', 'Your parent’s or guardian’s sign-off is recorded', 'Kea’s shared Claude works for you now.', { data: { status: 'approved' } });
+    else notify(a.id, 'parent_signoff', 'Your parent’s or guardian’s sign-off was withdrawn', 'Kea’s shared Claude is off for you until a parent or guardian signs off again. Everything else in Kea works as before.', { data: { status: 'revoked' } });
     return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', a.id)) };
   });
   O('POST', '/owner/accounts/:id/unlock', ({ params }) => {
@@ -1394,6 +1679,9 @@ export function createHub({
       h.run('UPDATE host_applications SET status = ?, decided_at = ?, note = ? WHERE id = ?', approve ? 'approved' : 'denied', now(), V.str(body.note, 'note', { optional: true, max: 2000 }), app.id);
       if (approve) h.run('UPDATE accounts SET can_host = 1, updated_at = ? WHERE id = ?', now(), app.account_id);
     });
+    const hostNote = V.str(body.note, 'note', { optional: true, max: 2000 });
+    if (approve) notify(app.account_id, 'hosting', 'You can host classes on the Kea Hub now', 'Your application was approved. Make a class from My classes and share its invite code.', { note: hostNote });
+    else notify(app.account_id, 'hosting', 'Your application to host classes wasn’t approved', 'You can still join classes, and host them on your own organization’s server.', { note: hostNote });
     audit('owner', approve ? 'owner.hosting_approve' : 'owner.hosting_deny', app.account_id, null, 'local');
     return { ok: true };
   });
@@ -1413,13 +1701,6 @@ export function createHub({
       accounts: h.get('SELECT COUNT(*) AS n FROM accounts').n,
     };
   });
-  O('POST', '/owner/accounts/:id/quota', ({ params, body }) => {
-    const a = getAccount(params.id);
-    const gb = body.gb === null ? null : V.int(body.gb, 'gb', { min: 0, max: 100_000 });
-    h.run('UPDATE accounts SET quota_bytes = ?, updated_at = ? WHERE id = ?', gb == null ? null : gb * 1024 ** 3, now(), a.id);
-    audit('owner', 'owner.quota', a.id, { gb }, 'local');
-    return { used: usedBy(a.id), quota: quotaOf(h.get('SELECT * FROM accounts WHERE id = ?', a.id)) };
-  });
 
   // (After /owner/scan/queue, so that one isn't taken for a job id.)
   // The running job, for the worker: what was asked for and where it goes.
@@ -1437,7 +1718,7 @@ export function createHub({
     return rawOut(spaceRead(sp, spaceRow(sp, String(query.path ?? '')) ?? notFound()));
   });
   // Organizations (hub/org/): members and codes, structure, budgets, certs, availability, schedules, the to-do box.
-  mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, bad, forbidden, notFound, rawOut });
+  mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, bad, forbidden, notFound, rawOut, notify, extrasFor });
 
   // ================= request handling =================
   const clientIp = (req) => {
@@ -1622,7 +1903,13 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
     const data = await readRaw(req, maxFileBytes);
     const used = usedBy(me.id) - (row?.size ?? 0);
     const quota = quotaOf(me);
-    if (quota >= 0 && used + data.length > quota) throw new HttpError(507, `Your Kea storage is full (${(quota / 1024 ** 3).toFixed(1)} GB). Delete some files or ask for more space.`, { used, quota });
+    // Full (or over, after a limit went down): nothing is deleted, and a file can still be replaced by one no bigger.
+    if (used + data.length > quota && data.length > (row?.size ?? 0)) {
+      const all = used + (row?.size ?? 0);
+      throw new HttpError(507, all > quota
+        ? `Your Kea storage is over its limit: ${fmtBytes(all)} of ${fmtBytes(quota)}. Nothing has been deleted, but new files wait until you’re under the limit. Delete some files to make room.`
+        : `Your Kea storage is full (${fmtBytes(quota)}). Delete some files to make room.`, { used: all, quota, storageFull: true });
+    }
     try { const fs = statfsSync(storageDir); if (fs.bavail * fs.bsize - data.length < minFreeBytes) throw new HttpError(507, "The Kea Hub's drive is nearly full. Try again later."); } catch (e) { if (e instanceof HttpError) throw e; }
     const blob = randomUUID();
     const dir = join(storageDir, me.id);
@@ -1683,6 +1970,7 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
       return { port: await listenOn(apiServer, port), ownerPort: await listenOn(ownerServer, ownerPort) };
     },
     close() {
+      clearInterval(sweepTimer);
       return Promise.all([apiServer, ownerServer].map((s) => new Promise((r) => (s.listening ? s.close(() => r()) : r())))).then(() => h.close());
     },
   };

@@ -10,7 +10,8 @@ import { loadOrCreateKey, signToken, verifyToken } from '../../hub/lib/tokens.mj
 import { Windows, lockFor, FREE, MAX_LOCK_MS } from '../../hub/lib/limiter.mjs';
 import { scoreAnswer, POINTS, INTERVAL_DAYS, levelOf, xpForLevel, streak, weekStart, capped, DAILY_CAP } from '../../hub/lib/study.mjs';
 import { seal, open } from '../../hub/backup.mjs';
-import { courseKey, decide, isMinor, pickNext, DEFAULTS } from '../../hub/lib/budget.mjs';
+import { courseKey, decide, isMinor, pickNext, DEFAULTS, limitsFor, cleanOverride, describeOverride, ACCOUNT_LIMITS } from '../../hub/lib/budget.mjs';
+import { normalizePhone, phoneShownIn, fmtBytes, addMonthsUtc, supporterUntil } from '../../hub/lib/account.mjs';
 
 test('claude budget: course keys match however they are typed', () => {
   assert.equal(courseKey({ school: 'UCCS', code: 'BIO 1010', term: 'Spring 2027', section: '002' }), courseKey({ school: ' uccs ', code: 'bio-1010', term: 'spring  2027', section: '002' }));
@@ -181,4 +182,53 @@ test('backup sealing: round trip, wrong passphrase refused', () => {
   const b = seal(Buffer.from('hello hub'), 'a long recovery phrase');
   assert.equal(open(b, 'a long recovery phrase').toString(), 'hello hub');
   assert.throws(() => open(b, 'the wrong phrase here'), /passphrase/);
+});
+
+test('claude budget: per-account limits, trusted and blocked', () => {
+  const facts = { verified: true, birthYear: 1990, year: 2026, myQueued: 0, myJobsToday: 3, myJobsThisWeek: 3 };
+  assert.equal(decide('initial_scan', limitsFor({}, null), facts).code, 'day_cap');
+  assert.equal(decide('initial_scan', limitsFor({}, { limits: { perAccountDaily: 5 } }), facts).action, 'queue');
+  assert.equal(decide('initial_scan', limitsFor({ perAccountDaily: 9 }, { limits: { perAccountDaily: 2 } }), facts).code, 'day_cap', 'the person’s own number wins');
+  const trusted = limitsFor({}, { trusted: true });
+  assert.equal(trusted.perAccountDaily, Infinity);
+  assert.equal(trusted.globalDaily, DEFAULTS.globalDaily, 'the Hub-wide total still applies');
+  assert.equal(trusted.requestsBeforeSuspend, DEFAULTS.requestsBeforeSuspend, 'abuse checks still apply');
+  assert.equal(decide('initial_scan', trusted, { ...facts, myJobsToday: 99, myJobsThisWeek: 99, myQueued: 50 }).action, 'queue');
+  const blocked = decide('initial_scan', trusted, { ...facts, blocked: true, blockedReason: 'Ask me first.' });
+  assert.deepEqual([blocked.code, /Ask me first/.test(blocked.reason)], ['blocked', true]);
+  assert.equal(decide('initial_scan', {}, { ...facts, owner: true, blocked: true }).action, 'queue', 'the owner is never blocked');
+  // Stored settings are cleaned: unknown keys, negatives and non-integers dropped.
+  assert.deepEqual(cleanOverride({ limits: { perAccountDaily: 2, globalDaily: 1, perAccountWeekly: -1, questionBatchesPerDay: 1.5 }, trusted: 'yes' }), { limits: { perAccountDaily: 2 }, trusted: false, blocked: false, reason: null });
+  assert.ok(ACCOUNT_LIMITS.every((k) => k in DEFAULTS));
+});
+
+test('claude budget: what changed, in plain words', () => {
+  assert.deepEqual(describeOverride(null, { limits: { perAccountWeekly: 20 } }), ['You can now use Kea’s shared Claude up to 20 times a week (a class scan or a batch of questions each).']);
+  assert.deepEqual(describeOverride({ limits: { perAccountWeekly: 20 } }, null, { perAccountWeekly: 12 }), ['Your weekly limit on Kea’s shared Claude is back to the usual 12.']);
+  assert.deepEqual(describeOverride(null, { trusted: true, limits: { perAccountDaily: 9 } }), ['You can now use Kea’s shared Claude without the usual daily and weekly limits.'], 'a lifted cap isn’t also listed');
+  assert.match(describeOverride(null, { blocked: true, reason: 'Paused while we talk.' })[0], /turned off for your account\. Paused while we talk\./);
+  assert.deepEqual(describeOverride(null, { limits: { refusalsBeforeFlag: 40 } }), ['Your settings for Kea’s shared Claude were adjusted.']);
+  assert.deepEqual(describeOverride({ trusted: true }, { trusted: true }), []);
+  assert.match(describeOverride(null, { limits: { questionBatchesPerDay: 1 } })[0], /up to 1 batch of new practice questions a day/);
+});
+
+test('account: phone numbers, who sees them, sizes, supporter months', () => {
+  assert.equal(normalizePhone('+1 (719) 555-0100'), '+17195550100');
+  assert.equal(normalizePhone('020 7946 0958'), '02079460958', 'no country assumed without a +');
+  assert.equal(normalizePhone(' 719.555.0100 '), '7195550100');
+  for (const bad of ['', '555', '+0 20 7946 0958', 'call 719 555 0100', '1+2345678', '1234567890123456', '+'.repeat(3)]) assert.throws(() => normalizePhone(bad), /phone number/i, bad);
+  assert.throws(() => normalizePhone(7195550100), /text/);
+  assert.deepEqual(['nobody', 'classes', 'orgs', 'both'].map((v) => [phoneShownIn(v, 'classes'), phoneShownIn(v, 'orgs')]), [[false, false], [true, false], [false, true], [true, true]]);
+  assert.equal(fmtBytes(5000 * 1024 ** 3), '5,000 GB');
+  assert.equal(fmtBytes(5 * 1024 ** 3), '5 GB');
+  assert.equal(fmtBytes(1.5 * 1024 ** 3), '1.5 GB');
+  assert.equal(fmtBytes(300 * 1024 ** 2), '300 MB');
+  const jan31 = Date.UTC(2027, 0, 31, 12);
+  assert.equal(new Date(addMonthsUtc(jan31, 1)).toISOString(), '2027-02-28T12:00:00.000Z');
+  assert.equal(new Date(addMonthsUtc(Date.UTC(2027, 11, 15), 1)).toISOString().slice(0, 10), '2028-01-15');
+  const now = Date.UTC(2026, 10, 5);
+  assert.equal(supporterUntil(null, now), Date.UTC(2026, 11, 5), 'a month from now');
+  assert.equal(supporterUntil(Date.UTC(2026, 11, 1), now, { months: 2 }), Date.UTC(2027, 1, 1), 'renewing adds to the end');
+  assert.equal(supporterUntil(Date.UTC(2026, 0, 1), now), Date.UTC(2026, 11, 5), 'an old end: from now');
+  assert.equal(supporterUntil(Date.UTC(2026, 11, 1), now, { until: 123 }), 123);
 });

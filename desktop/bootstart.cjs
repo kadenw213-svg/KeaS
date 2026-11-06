@@ -75,7 +75,7 @@ function hubEnv(config, { port = 4860 } = {}) {
     ELECTRON_RUN_AS_NODE: '1',
     KEA_HUB_DATA: config.dataDir,
     KEA_HUB_STORAGE: config.storageDir || path.win32.join(config.dataDir, 'storage'),
-    KEA_HUB_QUOTA_GB: String(config.quotaGb || 25),
+    KEA_HUB_QUOTA_GB: String(config.quotaGb || 5),
     KEA_HUB_PORT: String(port),
     KEA_HUB_OWNER_PORT: String(port + 1),
   };
