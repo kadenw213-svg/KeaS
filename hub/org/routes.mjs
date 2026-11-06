@@ -453,9 +453,13 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   const shiftsOf = (oid, aid, from, to, exceptId = null) =>
     h.all('SELECT * FROM org_shifts WHERE org_id = ? AND account_id = ? AND end_at > ? AND start_at < ?' + (exceptId ? ' AND id != ?' : ''), oid, aid, from, to, ...(exceptId ? [exceptId] : []))
       .map((s) => ({ id: s.id, start: new Date(s.start_at).toISOString(), end: new Date(s.end_at).toISOString() }));
+  // The rules engine writes times as ISO; people read "Sat, Dec 12, 5:00 PM" in the org's zone.
+  const readable = (tz, list) => list.map((p) => ({ ...p, message: p.message
+    .replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, (t) => new Date(t).toLocaleString('en-US', { timeZone: tz, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))
+    .replace(/\b(\d{4})-(\d{2})-(\d{2})\b/g, (_, y, m, d) => new Date(Date.UTC(+y, +m - 1, +d, 12)).toLocaleDateString('en-US', { timeZone: 'UTC', month: 'short', day: 'numeric', year: 'numeric' })) }));
   const problemsFor = (o, cx, aid, positionId, startAt, endAt, exceptId) => {
     const person = cx.people.get(aid) ?? bad('That person is not an active member.');
-    return cx.check(person, { id: exceptId ?? undefined, positionId, start: new Date(startAt).toISOString(), end: new Date(endAt).toISOString() }, shiftsOf(o.id, aid, startAt - 8 * 86400_000, endAt + 8 * 86400_000, exceptId));
+    return readable(o.tz, cx.check(person, { id: exceptId ?? undefined, positionId, start: new Date(startAt).toISOString(), end: new Date(endAt).toISOString() }, shiftsOf(o.id, aid, startAt - 8 * 86400_000, endAt + 8 * 86400_000, exceptId)));
   };
 
   // ---------- certifications ----------

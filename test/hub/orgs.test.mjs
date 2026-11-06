@@ -342,6 +342,9 @@ test('scheduling: live rule checks (certs, minors, overlap), manual assign, auto
   const clash = await call('POST', `/v1/orgs/${pool.id}/shifts`, mgr.token, { scheduleId: sched.id, accountId: ana.id, positionId: lgPos.id, date: '2026-12-01', start: '08:00', end: '10:00' });
   assert.equal(clash.status, 409);
   assert.ok(clash.body.canForce && clash.body.problems.some((p) => p.code === 'overlap'));
+  // Messages read as local times, not ISO stamps.
+  assert.match(clash.body.problems.find((p) => p.code === 'overlap').message, /Tue, Dec 1, 4:45 AM/);
+  assert.match(benChk.problems.find((p) => p.code === 'cert_expired').message, /Nov 25, 2026/);
   assert.equal((await call('POST', `/v1/orgs/${pool.id}/shifts`, mgr.token, { scheduleId: sched.id, accountId: ben.id, positionId: lgPos.id, date: '2026-12-01', blockId: 'e2', force: true })).status, 409, 'cert blocks are never forced');
   // Budget: Lifeguards (department) gets $1,000 for December; its subtree's shifts count.
   ok(await call('POST', `/v1/orgs/${pool.id}/budgets`, admin.token, { departmentId: deptTree.guards.id, periodStart: '2026-12-01', periodEnd: '2026-12-31', amount: 1000 }), 201);
