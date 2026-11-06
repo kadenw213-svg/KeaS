@@ -29,6 +29,18 @@
   },
   "minimumWage": { "standard": 7.25, "tipped": 2.13, "youthDiscountPct": null, "localOverrides": [] },
   "sickLeave": null,
+  "leave": [
+    { "law": "FMLA", "weeks": 12, "eligibility": { "monthsEmployed": 12, "hoursWorked": 1250, "employeesWithin75Miles": 50 }, "note": "Family and Medical Leave Act: up to 12 weeks of unpaid, job-protected leave in a 12-month period for covered employers (50+ employees). Entered from memory, not verified." }
+  ],
+  "cobra": { "minEmployees": 20, "employerNoticeDays": 30, "administratorNoticeDays": 14, "note": "Federal COBRA: group health plans of employers with 20+ employees; the employer tells the plan administrator within 30 days of the qualifying event, and the administrator sends the election notice within 14 days. Many states have their own continuation laws for smaller employers. Entered from memory, not verified." },
+  "aca": { "fullTimeMonthlyHours": 130, "note": "ACA: 130 hours in a month counts as full-time for the monthly measurement method. Entered from memory, not verified." },
+  "newHire": { "reportDays": 20 },
+  "retention": [
+    { "category": "i9", "yearsAfterCreated": 3, "yearsAfterTermination": 1, "note": "Form I-9: 3 years after hire or 1 year after employment ends, whichever is later." },
+    { "category": "tax_form", "yearsAfterCreated": 4, "note": "Employment tax records (W-4 and the like): at least 4 years." },
+    { "category": "offer", "yearsAfterCreated": 3, "note": "Payroll records under the FLSA: 3 years." },
+    { "category": "receipt", "yearsAfterCreated": 4 }
+  ],
   "notes": ["Federal floor only. States and cities may be stricter; mergeRules keeps the strictest value."],
   "source": [
     { "title": "29 U.S.C. 207 - Maximum hours (FLSA overtime)", "url": "https://www.law.cornell.edu/uscode/text/29/207", "checked": "2026-10-27" },

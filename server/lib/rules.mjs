@@ -39,6 +39,20 @@ function mergeTwo(a, b) {
   } : null;
   const sa = a.sickLeave, sb = b.sickLeave;
   out.sickLeave = (sa || sb) ? { accrueHoursPer: minN(sa?.accrueHoursPer, sb?.accrueHoursPer), cap: maxN(sa?.cap, sb?.cap) } : null;
+  // Payroll and HR rules: leave laws add up; a state's final-pay and payout rules replace the federal default;
+  // the earliest new-hire report deadline wins; retention keeps the longest period per category.
+  out.leave = [...(a.leave || []), ...(b.leave || [])];
+  out.finalPay = b.finalPay || a.finalPay || null;
+  out.ptoPayout = b.ptoPayout || a.ptoPayout || null;
+  out.cobra = a.cobra || b.cobra ? { ...(a.cobra || {}), ...(b.cobra || {}) } : null;
+  out.aca = a.aca || b.aca || null;
+  out.newHire = a.newHire || b.newHire ? { reportDays: minN(a.newHire?.reportDays, b.newHire?.reportDays) } : null;
+  const ret = new Map();
+  for (const r of [...(a.retention || []), ...(b.retention || [])]) {
+    const cur = ret.get(r.category);
+    ret.set(r.category, cur ? { ...cur, yearsAfterCreated: maxN(cur.yearsAfterCreated, r.yearsAfterCreated), yearsAfterTermination: maxN(cur.yearsAfterTermination, r.yearsAfterTermination), note: [cur.note, r.note].filter(Boolean).join(' ') } : { ...r });
+  }
+  out.retention = [...ret.values()];
   out.notes = [...(a.notes || []), ...(b.notes || [])];
   out.source = [...(a.source || []), ...(b.source || [])];
   out.verifiedFor = a.verifiedFor && b.verifiedFor ? `${a.verifiedFor}+${b.verifiedFor}` : null;

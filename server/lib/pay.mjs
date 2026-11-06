@@ -98,58 +98,83 @@ export function coloradoWithholding({ grossCents, periodsPerYear, w4 = {}, coAll
   };
 }
 
-/** One employee's pay-run line. */
-export function payLine({ person, totals, rateCents, otMultiplier = 1.5, periodsPerYear = 26, ytdWagesCents = 0, org, tables }) {
-  const { us, co } = tables;
-  const unverified = !us.verified || !co.verified;
-  const gross = grossPay({ rateCents, regularMin: totals.regularMin, overtimeMin: totals.overtimeMin, restPremiumMin: totals.restPremiumMin, otMultiplier });
-  const g = gross.cents;
+/** One employee's pay-run line.
+ * Either `totals` (minutes; gross from one rate) or `earnings` ([{code,label,cents,hours?,taxable?,explain?}]).
+ * tables: { us, state } (state may be null when there's no state table; `co` is accepted for state). */
+export function payLine({ person, totals, earnings, rateCents, otMultiplier = 1.5, periodsPerYear = 26, ytdWagesCents = 0, org, tables }) {
+  const us = tables.us;
+  const st = tables.state !== undefined ? tables.state : tables.co ?? null;
+  const unverified = !us.verified || !st || !st.verified;
+  const J = (st?.jurisdiction || 'state').toLowerCase();
+  const place = st?.label || st?.jurisdiction || 'State';
+  let g, grossDetail, grossExplain, nonTaxable = 0, nonTaxableItems = [];
+  if (earnings) {
+    const taxable = earnings.filter((e) => e.taxable !== false);
+    nonTaxableItems = earnings.filter((e) => e.taxable === false);
+    g = taxable.reduce((a, e) => a + e.cents, 0);
+    nonTaxable = nonTaxableItems.reduce((a, e) => a + e.cents, 0);
+    grossDetail = Object.fromEntries(taxable.map((e) => [e.code, e.cents]));
+    grossExplain = [...taxable.flatMap((e) => (e.explain?.length ? e.explain : [`${e.label}${e.hours != null ? ` (${e.hours} h)` : ''}: ${$(e.cents)}`])), `Gross = ${taxable.map((e) => $(e.cents)).join(' + ') || '$0.00'} = ${$(g)}`];
+  } else {
+    const gross = grossPay({ rateCents, regularMin: totals.regularMin, overtimeMin: totals.overtimeMin, restPremiumMin: totals.restPremiumMin, otMultiplier });
+    g = gross.cents;
+    grossDetail = { regular: gross.regularCents, overtime: gross.overtimeCents, restPremium: gross.restPremiumCents };
+    grossExplain = gross.explain;
+  }
+  const w4 = person.w4 || {};
   const f = fica({ grossCents: g, ytdWagesCents, table: us });
-  const fed = federalWithholding({ grossCents: g, periodsPerYear, w4: person.w4 || {}, table: us });
-  const st = coloradoWithholding({ grossCents: g, periodsPerYear, w4: person.w4 || {}, coAllowance: person.coAllowance ?? null, table: co });
-  const famliCap = c(us.fica.socialSecurityWageBase);
-  const famliWages = Math.max(0, Math.min(g, famliCap - ytdWagesCents));
-  const famliEe = Math.round(famliWages * co.famli.employeeRate);
-  const smallEmployer = (org.employeeCount ?? 0) < co.famli.smallEmployerThreshold;
-  const famliEr = smallEmployer ? 0 : Math.round(famliWages * co.famli.employerRate);
-  const futaBase = c(us.futa.wageBase);
-  const futaWages = Math.max(0, Math.min(g, futaBase - ytdWagesCents));
-  const futa = org.futaExempt ? 0 : Math.round(futaWages * us.futa.rate);
-  const sutaBase = c(org.sutaWageBase ?? co.suta.wageBase);
-  const sutaRate = org.sutaRate ?? co.suta.defaultRate;
-  const sutaWages = Math.max(0, Math.min(g, sutaBase - ytdWagesCents));
-  const suta = Math.round(sutaWages * sutaRate);
-
+  const fed = w4.exempt ? { cents: 0, explain: ['Exempt from federal income tax withholding (Form W-4)'] } : federalWithholding({ grossCents: g, periodsPerYear, w4, table: us });
   const taxes = [
     { code: 'federal_income', label: 'Federal income tax (estimate)', cents: fed.cents, explain: fed.explain },
     { code: 'social_security', label: 'Social Security', cents: f.socialSecurity.cents, explain: f.socialSecurity.explain },
     { code: 'medicare', label: 'Medicare', cents: f.medicare.cents, explain: f.medicare.explain },
-    { code: 'co_income', label: 'Colorado income tax (estimate)', cents: st.cents, explain: st.explain },
-    { code: 'co_famli', label: 'Colorado FAMLI (employee)', cents: famliEe, explain: [`${$(famliWages)} x ${(co.famli.employeeRate * 100).toFixed(2)}% = ${$(famliEe)}`] },
   ];
   const employer = [
     { code: 'social_security', label: 'Employer Social Security', cents: f.employerSocialSecurity.cents, explain: f.employerSocialSecurity.explain },
     { code: 'medicare', label: 'Employer Medicare', cents: f.employerMedicare.cents, explain: f.employerMedicare.explain },
-    { code: 'co_famli', label: 'Colorado FAMLI (employer)', cents: famliEr, explain: [smallEmployer ? `Fewer than ${co.famli.smallEmployerThreshold} employees (${org.employeeCount}): no employer share` : `${org.employeeCount} employees (>= ${co.famli.smallEmployerThreshold}): ${$(famliWages)} x ${(co.famli.employerRate * 100).toFixed(2)}% = ${$(famliEr)}`] },
-    { code: 'futa', label: 'FUTA', cents: futa, explain: [org.futaExempt ? 'Org is marked FUTA-exempt (501(c)(3)): $0.00' : `${$(futaWages)} (first ${d$(us.futa.wageBase)}) x ${(us.futa.rate * 100).toFixed(1)}% = ${$(futa)}`] },
-    { code: 'co_suta', label: 'Colorado unemployment (SUTA)', cents: suta, explain: [`${$(sutaWages)} (wage base ${$(sutaBase)}, YTD ${$(ytdWagesCents)}) x ${(sutaRate * 100).toFixed(2)}% = ${$(suta)}`] },
   ];
+  if (st?.incomeTax?.method === 'DR 1098 annualized') {
+    const s = coloradoWithholding({ grossCents: g, periodsPerYear, w4, coAllowance: person.coAllowance ?? null, table: st });
+    taxes.push({ code: `${J}_income`, label: `${place} income tax (estimate)`, cents: s.cents, explain: s.explain });
+  }
+  if (st?.famli) {
+    const famliCap = c(us.fica.socialSecurityWageBase);
+    const famliWages = Math.max(0, Math.min(g, famliCap - ytdWagesCents));
+    const famliEe = Math.round(famliWages * st.famli.employeeRate);
+    const smallEmployer = (org.employeeCount ?? 0) < st.famli.smallEmployerThreshold;
+    const famliEr = smallEmployer ? 0 : Math.round(famliWages * st.famli.employerRate);
+    taxes.push({ code: `${J}_famli`, label: `${place} FAMLI (employee)`, cents: famliEe, explain: [`${$(famliWages)} x ${(st.famli.employeeRate * 100).toFixed(2)}% = ${$(famliEe)}`] });
+    employer.push({ code: `${J}_famli`, label: `${place} FAMLI (employer)`, cents: famliEr, explain: [smallEmployer ? `Fewer than ${st.famli.smallEmployerThreshold} employees (${org.employeeCount}): no employer share` : `${org.employeeCount} employees (>= ${st.famli.smallEmployerThreshold}): ${$(famliWages)} x ${(st.famli.employerRate * 100).toFixed(2)}% = ${$(famliEr)}`] });
+  }
+  const futaBase = c(us.futa.wageBase);
+  const futaWages = Math.max(0, Math.min(g, futaBase - ytdWagesCents));
+  const futa = org.futaExempt ? 0 : Math.round(futaWages * us.futa.rate);
+  employer.push({ code: 'futa', label: 'FUTA', cents: futa, explain: [org.futaExempt ? 'Org is marked FUTA-exempt (501(c)(3)): $0.00' : `${$(futaWages)} (first ${d$(us.futa.wageBase)}) x ${(us.futa.rate * 100).toFixed(1)}% = ${$(futa)}`] });
+  if (st?.suta) {
+    const sutaBase = c(org.sutaWageBase ?? st.suta.wageBase);
+    const sutaRate = org.sutaRate ?? st.suta.defaultRate;
+    const sutaWages = Math.max(0, Math.min(g, sutaBase - ytdWagesCents));
+    const suta = Math.round(sutaWages * sutaRate);
+    employer.push({ code: `${J}_suta`, label: `${place} unemployment (SUTA)`, cents: suta, explain: [`${$(sutaWages)} (wage base ${$(sutaBase)}, YTD ${$(ytdWagesCents)}) x ${(sutaRate * 100).toFixed(2)}% = ${$(suta)}`] });
+  }
+
   const withheld = taxes.reduce((s, t) => s + t.cents, 0);
-  const net = g - withheld;
+  const net = g - withheld + nonTaxable;
   const employerTotal = employer.reduce((s, t) => s + t.cents, 0);
   const explain = [
-    ...gross.explain,
+    ...grossExplain,
     `Employee taxes withheld: ${taxes.map((t) => `${t.label} ${$(t.cents)}`).join(', ')} = ${$(withheld)}`,
-    `Net = ${$(g)} - ${$(withheld)} = ${$(net)}`,
+    ...nonTaxableItems.map((e) => `${e.label} (not taxed): + ${$(e.cents)}`),
+    `Net = ${$(g)} - ${$(withheld)}${nonTaxable ? ` + ${$(nonTaxable)}` : ''} = ${$(net)}`,
     `Employer cost on top of gross: ${$(employerTotal)}`,
+    ...(!st ? ['There is no state tax table for this state yet: this line can’t be finalized.'] : []),
     ...(unverified ? ['Tax tables not yet verified for this year: this line can’t be finalized.'] : []),
   ];
   return {
     personId: person.id, name: person.name,
-    hours: { regular: +(totals.regularMin / 60).toFixed(2), overtime: +(totals.overtimeMin / 60).toFixed(2), restPremium: +(totals.restPremiumMin / 60).toFixed(2) },
+    hours: totals ? { regular: +(totals.regularMin / 60).toFixed(2), overtime: +(totals.overtimeMin / 60).toFixed(2), restPremium: +(totals.restPremiumMin / 60).toFixed(2) } : undefined,
     rateCents,
-    gross: g, grossDetail: { regular: gross.regularCents, overtime: gross.overtimeCents, restPremium: gross.restPremiumCents },
-    taxes, withheld, net, employer, employerTotal, explain,
+    gross: g, grossDetail, nonTaxable, taxes, withheld, net, employer, employerTotal, explain,
     unverified, canFinalize: false,
   };
 }

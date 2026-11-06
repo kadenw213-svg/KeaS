@@ -3,6 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { migratePayroll } from './payroll/schema.mjs';
 
 export const DEFAULT_DB = join(dirname(fileURLToPath(import.meta.url)), 'data', 'demo.db');
 
@@ -73,7 +74,9 @@ export function openDb(file = DEFAULT_DB) {
   const db = new DatabaseSync(file);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 3000;');
   db.exec(SCHEMA);
+  migratePayroll(db);
   const cache = new Map();
+  let depth = 0;
   const st = (sql) => { let s = cache.get(sql); if (!s) { s = db.prepare(sql); cache.set(sql, s); } return s; };
   return {
     db,
@@ -81,8 +84,11 @@ export function openDb(file = DEFAULT_DB) {
     get: (sql, ...p) => st(sql).get(...p),
     run: (sql, ...p) => st(sql).run(...p),
     tx(fn) {
+      // Nested calls join the outer transaction.
+      if (depth > 0) { depth++; try { return fn(); } finally { depth--; } }
       db.exec('BEGIN IMMEDIATE');
-      try { const r = fn(); db.exec('COMMIT'); return r; } catch (e) { db.exec('ROLLBACK'); throw e; }
+      depth = 1;
+      try { const r = fn(); db.exec('COMMIT'); return r; } catch (e) { db.exec('ROLLBACK'); throw e; } finally { depth = 0; }
     },
     isEmpty() { return st('SELECT COUNT(*) AS n FROM orgs').get().n === 0; },
     close() { db.close(); },
@@ -96,7 +102,10 @@ export function rowToPerson(r) {
   return {
     id: r.id, orgId: r.org_id, name: r.name, email: r.email, roles: J(r.roles, []), positions: J(r.positions, []),
     status: r.status, birthdate: r.birthdate, payRateCents: r.pay_rate_cents, w4: J(r.w4, {}),
-    coAllowance: r.co_allowance, ytdWagesCents: r.ytd_wages_cents, deposit: J(r.deposit, null),
+    coAllowance: r.co_allowance, ytdWagesCents: r.ytd_wages_cents, depositRaw: r.deposit ?? null, piiRaw: r.pii_enc ?? null,
+    hireDate: r.hire_date ?? null, termDate: r.term_date ?? null, departmentId: r.department_id ?? null, entityId: r.entity_id ?? null,
+    managerId: r.manager_id ?? null, gradeId: r.grade_id ?? null, workerType: r.worker_type || 'employee', employeeNumber: r.employee_number ?? null,
+    defaultAllocations: J(r.default_allocations, []), holidayCalendarId: r.holiday_calendar_id ?? null, ytdYear: r.ytd_year ?? null, legalName: r.legal_name ?? null,
   };
 }
 export function rowToOrg(r) {
@@ -104,7 +113,7 @@ export function rowToOrg(r) {
   return {
     id: r.id, name: r.name, state: r.state, tz: r.tz, lateThresholdMin: r.late_threshold_min, workweekStart: r.workweek_start,
     payFrequency: r.pay_frequency, payPeriodAnchor: r.pay_period_anchor, futaExempt: !!r.futa_exempt, sutaRate: r.suta_rate,
-    ruleOverrides: J(r.rule_overrides, {}), bank: J(r.bank, {}),
+    ruleOverrides: J(r.rule_overrides, {}), bankRaw: r.bank ?? null, settings: J(r.settings, {}),
   };
 }
 export const rowToShift = (r) => r && ({ id: r.id, positionId: r.position_id, personId: r.person_id, start: r.start, end: r.end, status: r.status, note: r.note ?? null });

@@ -8,8 +8,11 @@ import { fileURLToPath } from 'node:url';
 import { openDb, DEFAULT_DB, rowToPerson, rowToOrg, rowToShift, rowToPosition, rowToCertType, rowToPunch, rowToRequest, rowToSwap } from './db.mjs';
 import { seed } from './seed.mjs';
 import { mergeRules, checkAssignment, timecard, unforceable, isBlocked } from './lib/rules.mjs';
-import { payLine } from './lib/pay.mjs';
-import { buildNacha } from './lib/nacha.mjs';
+import { makeVault, openDevVault, VaultLocked } from './payroll/vaultstate.mjs';
+import { makeHubClient } from './payroll/hub.mjs';
+import { makeTables } from './payroll/run.mjs';
+import { makeApprovals } from './payroll/approvals.mjs';
+import { registerPayroll } from './payroll/index.mjs';
 import { localDate, zonedToUtc, addDays, dayNum, iso, toMs, ageOn } from './lib/time.mjs';
 
 export const VERSION = '0.1.0';
@@ -53,16 +56,26 @@ function sameOrigin(req, secure) {
 }
 
 // ---------- server ----------
-export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = process.env.KEAS_WEB_DIR || DEFAULT_WEB_DIR, log = true, now = () => Date.now() } = {}) {
+/**
+ * vault: true runs the payroll vault (the payroll admin's own PC): it starts locked and empty, and payroll admins sign
+ * in with their Kea Hub account plus the vault passphrase. Otherwise the workforce server runs with its vault opened by
+ * a passphrase kept next to the database, and fills an empty database with the sample workplace.
+ */
+export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = process.env.KEAS_WEB_DIR || DEFAULT_WEB_DIR, log = true, now = () => Date.now(),
+  vault: vaultMode = process.env.KEAS_VAULT === '1', hubUrl = process.env.KEAS_HUB_URL || null, sharedDir = SHARED, passphrase = process.env.KEAS_VAULT_PASSPHRASE || null, fetchImpl = globalThis.fetch } = {}) {
   const h = openDb(dbFile);
-  if (h.isEmpty()) seed(h, { now: now() });
-  const us = readJson(join(SHARED, 'labor', 'US.json'));
-  const taxUs = readJson(join(SHARED, 'tax', 'US-2026.json'));
-  const taxCo = readJson(join(SHARED, 'tax', 'CO-2026.json'));
+  const vault = makeVault(h);
+  if (vaultMode) h.run('DELETE FROM sessions');
+  else {
+    openDevVault(vault, dbFile, passphrase);
+    if (h.isEmpty()) seed(h, { now: now(), vault });
+  }
+  const us = readJson(join(sharedDir, 'labor', 'US.json'));
+  const tablesFor = makeTables(sharedDir);
 
   const loadOrg = (id) => rowToOrg(h.get('SELECT * FROM orgs WHERE id = ?', id));
   const rulesFor = (org) => {
-    const f = join(SHARED, 'labor', `${org.state}.json`);
+    const f = join(sharedDir, 'labor', `${org.state}.json`);
     return mergeRules(us, existsSync(f) ? readJson(f) : null, org.ruleOverrides);
   };
   const audit = (org, actor, action, target, detail) => h.run('INSERT INTO audit_log (org_id,actor,action,target,detail,at) VALUES (?,?,?,?,?,?)', org, actor, action, target, JSON.stringify(detail ?? null), iso(now()));
@@ -135,54 +148,28 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     };
   }
 
-  function payrun(org, period) {
-    const people = h.all(`SELECT * FROM people WHERE org_id = ? AND status = 'active' ORDER BY name`, org.id).map(rowToPerson);
-    const rules = rulesFor(org);
-    const lines = [], warnings = [];
-    const tables = [
-      { name: 'IRS Pub 15-T 2026 percentage method (derived)', verified: !!taxUs.verified, note: taxUs.note },
-      { name: 'Colorado DR 1098 2026', verified: !!taxCo.verified, note: taxCo.note },
-      { name: `Labor rules ${rules.jurisdiction}`, verified: rules.verifiedFor != null, note: 'Labor-rule defaults' },
-    ];
-    const unverified = tables.some((t) => !t.verified);
-    if (unverified) warnings.push({ code: 'unverified_tables', message: 'The tax and labor tables haven’t been verified for this year yet, so this pay run can be reviewed but not finalized.' });
-    if (org.futaExempt) warnings.push({ code: 'futa_exempt', message: 'Org is marked FUTA-exempt (501(c)(3)); FUTA shows $0.' });
-    const mw = rules.minimumWage;
-    for (const p of people) {
-      if (p.payRateCents == null) continue;
-      const tc = computeTimecard(org, p, period);
-      if (tc.totals.workedMin === 0 && tc.totals.restPremiumMin === 0) continue;
-      const line = payLine({ person: p, totals: tc.totals, rateCents: p.payRateCents, otMultiplier: rules.overtime?.multiplier ?? 1.5, periodsPerYear: 26, ytdWagesCents: p.ytdWagesCents, org: { employeeCount: people.length, futaExempt: org.futaExempt, sutaRate: org.sutaRate }, tables: { us: taxUs, co: taxCo } });
-      line.approved = !!tc.approved;
-      line.flags = tc.flags.filter((f) => ['missed_punch', 'missed_rest', 'late', 'no_show'].includes(f.code)).map((f) => f.code);
-      lines.push(line);
-      if (!tc.approved) warnings.push({ code: 'timecard_not_approved', personId: p.id, message: `${p.name}: timecard not approved` });
-      if (tc.flags.some((f) => f.code === 'missed_punch')) warnings.push({ code: 'missed_punch', personId: p.id, message: `${p.name}: missed punch in this period (hours may be short)` });
-      if (tc.pendingRequests) warnings.push({ code: 'pending_requests', personId: p.id, message: `${p.name}: ${tc.pendingRequests} punch request(s) still pending` });
-      if (mw?.standard != null) {
-        const age = p.birthdate ? ageOn(p.birthdate, period.end) : 99;
-        const floor = Math.round(mw.standard * 100 * (age < 18 && mw.youthDiscountPct ? 1 - mw.youthDiscountPct / 100 : 1));
-        if (p.payRateCents < floor) warnings.push({ code: 'below_minimum_wage', personId: p.id, message: `${p.name}: $${(p.payRateCents / 100).toFixed(2)}/h is below the $${(floor / 100).toFixed(2)} minimum` });
-      }
-    }
-    const sum = (f) => lines.reduce((s, l) => s + f(l), 0);
-    const totals = { gross: sum((l) => l.gross), withheld: sum((l) => l.withheld), net: sum((l) => l.net), employer: sum((l) => l.employerTotal), regularHours: +sum((l) => l.hours.regular).toFixed(2), overtimeHours: +sum((l) => l.hours.overtime).toFixed(2), people: lines.length };
-    return { period, payDate: addDays(period.end, 6), units: 'cents', unverified, canFinalize: false, tables, lines, totals, warnings };
-  }
-
   // ---------- routes ----------
   const routes = [];
-  const route = (method, path, handler, { auth = true } = {}) => {
+  const route = (method, path, handler, { auth = true, maxBody = MAX_BODY, open = false } = {}) => {
     const keys = [];
     const re = new RegExp('^' + path.replace(/:(\w+)/g, (_, k) => { keys.push(k); return '([^/]+)'; }) + '$');
-    routes.push({ method, re, keys, handler, auth });
+    routes.push({ method, re, keys, handler, auth, maxBody, open });
   };
 
-  route('GET', '/v1/health', () => ({ ok: true, version: VERSION, minClient: '0.58.0' }), { auth: false });
+  route('GET', '/v1/health', () => ({ ok: true, version: VERSION, minClient: '0.58.0', mode: vaultMode ? 'vault' : 'org' }), { auth: false, open: true });
 
-  route('GET', '/v1/auth/demo-users', () => h.all(`SELECT * FROM people ORDER BY id`).map(rowToPerson).map((p) => ({ id: p.id, name: p.name, roles: p.roles, positions: p.positions, status: p.status })), { auth: false });
+  const newSession = (personId, secure) => {
+    const token = randomBytes(32).toString('hex');
+    const expiresAt = iso(now() + SESSION_HOURS * 3600000);
+    h.run('INSERT INTO sessions (token_hash,person_id,created_at,expires_at) VALUES (?,?,?,?)', createHash('sha256').update(token).digest('hex'), personId, iso(now()), expiresAt);
+    const p = rowToPerson(h.get('SELECT * FROM people WHERE id = ?', personId));
+    return { token, expiresAt, person: publicPerson(p, p, loadOrg(p.orgId)), cookies: [sessionCookie(token, SESSION_HOURS * 3600, secure)] };
+  };
 
-  route('POST', '/v1/auth/demo-login', ({ body, secure }) => {
+  // Development sign-in (pick a person). Not available in the payroll vault.
+  if (!vaultMode) route('GET', '/v1/auth/demo-users', () => h.all(`SELECT * FROM people ORDER BY id`).map(rowToPerson).map((p) => ({ id: p.id, name: p.name, roles: p.roles, positions: p.positions, status: p.status })), { auth: false });
+
+  if (!vaultMode) route('POST', '/v1/auth/demo-login', ({ body, secure }) => {
     const personId = V.id(body.personId, 'personId');
     const row = h.get('SELECT * FROM people WHERE id = ?', personId);
     if (!row) throw new HttpError(404, 'person not found');
@@ -198,9 +185,9 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
   route('POST', '/v1/auth/logout', ({ token, secure }) => {
     if (token) h.run('DELETE FROM sessions WHERE token_hash = ?', createHash('sha256').update(token).digest('hex'));
     return { ok: true, cookies: [sessionCookie('', 0, secure)] };
-  }, { auth: false });
+  }, { auth: false, open: true });
 
-  route('GET', '/v1/me', ({ me, org }) => ({ person: publicPerson(me, me, org), certs: certsOf(me.id), org: { id: org.id, name: org.name, state: org.state, tz: org.tz, lateThresholdMin: org.lateThresholdMin, workweekStart: org.workweekStart }, period: { current: currentPeriod(org), lastCompleted: lastCompleted(org) } }));
+  route('GET', '/v1/me', ({ me, org }) => ({ mode: vaultMode ? 'vault' : 'org', person: publicPerson(me, me, org), certs: certsOf(me.id), org: { id: org.id, name: org.name, state: org.state, tz: org.tz, lateThresholdMin: org.lateThresholdMin, workweekStart: org.workweekStart }, period: { current: currentPeriod(org), lastCompleted: lastCompleted(org) } }));
 
   route('GET', '/v1/org', ({ me, org }) => {
     const people = h.all('SELECT * FROM people WHERE org_id = ? ORDER BY name', org.id).map(rowToPerson);
@@ -465,32 +452,40 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     const period = parsePeriod(org, V.date(body.periodStart, 'periodStart'), null);
     if (person.id === me.id && !me.roles.includes('owner')) throw new HttpError(403, 'you cannot approve your own timecard');
     if (h.get('SELECT 1 FROM timecard_approvals WHERE person_id = ? AND period_start = ?', person.id, period.start)) throw new HttpError(409, 'already approved');
+    if (approvals.configured(org.id, 'timecard')) {
+      // A configured chain: this approval is one step; the timecard counts as approved when the chain finishes.
+      const target = `${person.id}:${period.start}`;
+      let ap = approvals.find(org.id, 'timecard', target);
+      if (!ap) ap = approvals.start({ orgId: org.id, kind: 'timecard', targetId: target, requestedBy: 'system', subjectPersonId: person.id, departmentId: person.departmentId, title: `Timecard: ${person.name}, ${period.start} to ${period.end}` });
+      ap = approvals.decide(ap.id, me.id, true, null);
+      audit(org.id, me.id, 'timecard_approve_step', person.id, { periodStart: period.start, status: ap.status });
+      return { approval: ap, approved: ap.status === 'approved' ? { by: me.id, at: iso(now()) } : null, personId: person.id, period };
+    }
     h.run('INSERT INTO timecard_approvals (person_id,period_start,approved_by,at) VALUES (?,?,?,?)', person.id, period.start, me.id, iso(now()));
     audit(org.id, me.id, 'timecard_approve', person.id, { periodStart: period.start });
     return { approved: { by: me.id, at: iso(now()) }, personId: person.id, period };
   });
 
-  // Pay run
-  route('GET', '/v1/payrun/preview', ({ me, org, query }) => {
-    need(me, 'payroll');
-    return payrun(org, parsePeriod(org, query.periodStart, lastCompleted(org)));
+  // ---------- payroll and HR ----------
+  const approvals = makeApprovals({ h, now, iso, uid: (p) => `${p}-${randomUUID()}`, audit, HttpError });
+  approvals.on('timecard', {
+    approved(a, actor) { const [pid, ps] = a.targetId.split(':'); h.run('INSERT OR IGNORE INTO timecard_approvals (person_id,period_start,approved_by,at) VALUES (?,?,?,?)', pid, ps, actor, iso(now())); },
   });
-  route('GET', '/v1/payrun/nacha', ({ me, org, query }) => {
-    need(me, 'payroll');
-    const pr = payrun(org, parsePeriod(org, query.periodStart, lastCompleted(org)));
-    const people = new Map(h.all('SELECT * FROM people WHERE org_id = ?', org.id).map(rowToPerson).map((p) => [p.id, p]));
-    const entries = pr.lines.filter((l) => l.net > 0 && people.get(l.personId)?.deposit).map((l) => { const d = people.get(l.personId).deposit; return { name: l.name, id: l.personId, routing: d.routing, account: d.account, accountType: d.accountType, amountCents: l.net }; });
-    const b = org.bank;
-    const file = buildNacha({ company: { name: b.name, id: b.companyId, originRouting: b.originRouting, destinationRouting: b.destinationRouting, destinationName: b.destinationName }, entries, effectiveDate: new Date(pr.payDate + 'T12:00:00Z'), now: new Date(now()) });
-    audit(org.id, me.id, 'nacha_sample', pr.period.start, { entries: file.entryCount });
-    return { text: file.text, note: 'For review: KeaS never sends payments', period: pr.period, entryCount: file.entryCount, totalCreditCents: file.totalCreditCents, unverified: true, canFinalize: false };
-  });
+  const ctx = {
+    mode: vaultMode ? 'vault' : 'org', h, route, V, HttpError, bad, need, has, privileged, audit, now, iso, vault, approvals,
+    hub: makeHubClient({ fetchImpl, now }), defaultHubUrl: hubUrl,
+    uid: (p) => `${p}-${randomUUID()}`, today: (org) => localDate(now(), org.tz),
+    getPerson, getShift, loadOrg, rulesFor, tablesFor, computeTimecard, positionsOf,
+    periodOf, currentPeriod, lastCompleted, parsePeriod, newSession, sessionCookie,
+    saveOrgSettings(org, patch) { org.settings = { ...org.settings, ...patch }; h.run('UPDATE orgs SET settings = ? WHERE id = ?', JSON.stringify(org.settings), org.id); },
+  };
+  registerPayroll(ctx);
 
   // ---------- dispatcher ----------
-  async function readBody(req) {
+  async function readBody(req, max = MAX_BODY) {
     return new Promise((resolve, reject) => {
       let size = 0; const chunks = [];
-      req.on('data', (c) => { size += c.length; if (size > MAX_BODY) { reject(new HttpError(413, 'body too large (1 MB max)')); req.destroy(); } else chunks.push(c); });
+      req.on('data', (c) => { size += c.length; if (size > max) { reject(new HttpError(413, `body too large (${Math.round(max / 1048576)} MB max)`)); req.destroy(); } else chunks.push(c); });
       req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
       req.on('error', reject);
     });
@@ -513,7 +508,8 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
       const params = {}; const m = url.pathname.match(r.re); r.keys.forEach((k, i) => (params[k] = decodeURIComponent(m[i + 1])));
       let body = {};
       if (req.method === 'POST') {
-        const raw = await readBody(req);
+        if (vaultMode && !r.open && !vault.unlocked()) throw new HttpError(423, 'The payroll vault is locked. Sign in with the vault passphrase.', { locked: true });
+        const raw = await readBody(req, r.maxBody);
         if (raw.trim()) { try { body = JSON.parse(raw); } catch { bad('invalid JSON'); } }
         body = V.obj(body);
       }
@@ -530,6 +526,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
         if (viaCookie && req.headers['x-keas'] !== '1') throw new HttpError(403, 'missing X-KeaS header');
       }
       ctx.token = bearer || cookieToken;
+      if (vaultMode && !r.open && !vault.unlocked()) throw new HttpError(423, 'The payroll vault is locked. Sign in with the vault passphrase.', { locked: true });
       if (r.auth) {
         if (!ctx.token) throw new HttpError(401, 'missing or malformed bearer token');
         const sess = h.get('SELECT * FROM sessions WHERE token_hash = ?', createHash('sha256').update(ctx.token).digest('hex'));
@@ -541,10 +538,20 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
         ctx.org = loadOrg(ctx.me.orgId);
       }
       let out = await r.handler(ctx);
+      if (out && out.raw) {
+        // A file download (CSV, PDF, NACHA, a stored document).
+        const body = Buffer.isBuffer(out.raw.body) ? out.raw.body : Buffer.from(String(out.raw.body), 'utf8');
+        const name = String(out.raw.filename || 'download').replace(/[^A-Za-z0-9_.-]+/g, '_');
+        res.writeHead(200, { ...securityHeaders(), 'content-type': out.raw.type, 'content-length': body.length, 'content-disposition': `attachment; filename="${name}"`, 'cache-control': 'no-store' });
+        res.end(body);
+        if (log) console.log(`${new Date().toISOString()} ${req.method} ${url.pathname} 200 ${Date.now() - t0}ms`);
+        return;
+      }
       if (out && Array.isArray(out.cookies)) { cookies = out.cookies; const { cookies: _c, ...rest } = out; out = rest; }
       if (out && typeof out.status === 'number' && 'body' in out) { status = out.status; payload = out.body; } else payload = out;
     } catch (e) {
       if (e instanceof HttpError) { status = e.status; payload = { error: e.message, ...(e.extra || {}) }; }
+      else if (e instanceof VaultLocked) { status = 423; payload = { error: e.message, locked: true }; }
       else { status = 500; payload = { error: 'internal error' }; console.error(e); }
     }
     const text = JSON.stringify(payload ?? {});
@@ -557,7 +564,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
 
   const server = http.createServer((req, res) => { handle(req, res).catch((e) => { console.error(e); try { res.writeHead(500); res.end('{"error":"internal error"}'); } catch {} }); });
   return {
-    server, h,
+    server, h, vault,
     listen(port = Number(process.env.KEA_PORT) || 4850) { return new Promise((resolve) => server.listen(port, HOST, () => resolve(server.address().port))); },
     close() { return new Promise((resolve) => server.close(() => { h.close(); resolve(); })); },
   };
