@@ -203,7 +203,10 @@ export function autofill({ slots, people, answers, shifts, check, options = {} }
 }
 
 // ---------- CSV ----------
-const cell = (v) => { const s = v == null ? '' : String(v); return /[",\r\n]/.test(s) || /^[=+\-@]/.test(s) ? `"${(/^[=+\-@]/.test(s) ? `'${s}` : s).replace(/"/g, '""')}"` : s; };
+// A cell a spreadsheet could take for a formula (starting with = + - @, a tab or a carriage return, or their full-width
+// forms ＝ ＋ － ＠, which some spreadsheet apps read as the plain ones) gets a ' in front, and is quoted.
+const FORMULA_START = /^[=+\-@\t\r＝＋－＠]/;
+export const cell = (v) => { const s = v == null ? '' : String(v); const f = FORMULA_START.test(s); return f || /[",\r\n]/.test(s) ? `"${(f ? `'${s}` : s).replace(/"/g, '""')}"` : s; };
 export const toCsv = (rows) => rows.map((r) => r.map(cell).join(',')).join('\r\n') + '\r\n';
 
 /** "12/1/2026 14:05:33" in the org's time zone, the way Google Sheets writes a form's Timestamp. */
@@ -237,6 +240,8 @@ export function sheetsExport({ form, slots, rows, tz, questions = {} }) {
   for (const q of custom) header.push(q.label);
   header.push('Notes by date');
   if (questions.notes?.on !== false) header.push('Notes');
+  // (Whether the person proved their email with Google or the Hub's owner did: an unverified one may not be theirs.)
+  header.push('Email verified');
   const out = [header];
   for (const r of rows) {
     const line = [r.submittedAt ? sheetsTimestamp(r.submittedAt, tz) : '', r.email, r.name];
@@ -249,6 +254,7 @@ export function sheetsExport({ form, slots, rows, tz, questions = {} }) {
     for (const q of custom) { const v = r.extra?.[q.id]; line.push(Array.isArray(v) ? v.join(', ') : v === true ? 'Yes' : v === false ? 'No' : v ?? ''); }
     line.push(Object.entries(r.dateNotes || {}).sort().map(([d, n]) => `${shortDate(d)}: ${n}`).join('; '));
     if (questions.notes?.on !== false) line.push(r.note || '');
+    line.push(r.emailVerified ? 'Yes' : 'No');
     out.push(line);
   }
   return toCsv(out);
@@ -256,10 +262,10 @@ export function sheetsExport({ form, slots, rows, tz, questions = {} }) {
 
 /** One row per person, date and block (for spreadsheets and other tools). */
 export function longExport({ slots, rows }) {
-  const out = [['Name', 'Email', 'Date', 'Weekday', 'Block', 'Start', 'End', 'Answer', 'Note for the date']];
+  const out = [['Name', 'Email', 'Date', 'Weekday', 'Block', 'Start', 'End', 'Answer', 'Note for the date', 'Email verified']];
   for (const r of rows) for (const s of slots) {
     const a = r.answers[s.key];
-    out.push([r.name, r.email, s.date, DAY_NAMES[s.weekday], s.label || fmtRange(s), s.start, s.end, a === 'A' ? 'Available' : a === 'I' ? 'If needed' : 'Not available', r.dateNotes?.[s.date] || '']);
+    out.push([r.name, r.email, s.date, DAY_NAMES[s.weekday], s.label || fmtRange(s), s.start, s.end, a === 'A' ? 'Available' : a === 'I' ? 'If needed' : 'Not available', r.dateNotes?.[s.date] || '', r.emailVerified ? 'Yes' : 'No']);
   }
   return toCsv(out);
 }

@@ -38,6 +38,8 @@ export const ORG_DEFAULTS = {
 };
 export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, bad, forbidden, notFound, rawOut, notify = () => {}, extrasFor = () => ({}) }) {
   h.db.exec(ORG_SCHEMA);
+  // Org classes made before classes.org_id existed.
+  h.run('UPDATE classes SET org_id = (SELECT org_id FROM org_classes WHERE class_id = classes.id) WHERE org_id IS NULL AND id IN (SELECT class_id FROM org_classes)');
   const id = () => randomUUID();
   const J = (s, d) => { try { return s == null ? d : JSON.parse(s); } catch { return d; } };
   const today = (tz) => localDate(now(), tz);
@@ -70,12 +72,15 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   const memberRow = (oid, aid) => h.get('SELECT * FROM org_members WHERE org_id = ? AND account_id = ?', oid, aid);
   const roleWord = { member: 'members', manager: 'managers', admin: 'admins', owner: 'the owner' };
   /** The org and my membership, or 404 (other orgs are invisible), or 403 for too low a role. */
-  function asOrg(oid, me, min = 'member', { pendingOk = false, suspendedOk = false } = {}) {
+  // An organization works only once the Hub's owner has approved it (active), and stops when it's suspended. A route
+  // that must work before or after that (seeing the organization's own page) opts in with inactiveOk.
+  function asOrg(oid, me, min = 'member', { pendingOk = false, inactiveOk = false } = {}) {
     const o = loadOrg(oid);
     const m = o && memberRow(oid, me.id);
     if (!o || !m) notFound('Organization not found.');
     if (m.status !== 'active' && !pendingOk) forbidden('Your request to join is waiting for approval.');
-    if (o.status === 'suspended' && !suspendedOk) forbidden('This organization is suspended on the Kea Hub.');
+    if (o.status === 'suspended' && !inactiveOk) forbidden('This organization is suspended on the Kea Hub.');
+    if (o.status !== 'active' && !inactiveOk) forbidden('This organization is still waiting for approval on the Kea Hub.');
     if (RANK[m.role] < RANK[min]) forbidden(`Only ${min === 'manager' ? 'managers and admins' : min === 'admin' ? 'admins' : roleWord[min]} can do that.`);
     return { o, m, s: orgSettings(o), tz: o.tz, mgr: RANK[m.role] >= RANK.manager, admin: RANK[m.role] >= RANK.admin };
   }
@@ -91,7 +96,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   const memberOut = (r, viewer) => {
     const mgr = RANK[viewer.role] >= RANK.manager, admin = RANK[viewer.role] >= RANK.admin, self = r.account_id === viewer.account_id;
     return {
-      id: r.account_id, name: r.display_name, role: r.role, status: r.status, departmentId: r.department_id, title: r.title,
+      id: r.account_id, name: r.display_name, role: r.role, status: r.status, departmentId: r.department_id, title: r.title, emailVerified: !!r.email_verified,
       positionIds: positionsOf(r.org_id, r.account_id), joinedAt: r.joined_at, you: self,
       ...extrasFor(r, 'orgs', { phone: r.status === 'active' && viewer.status === 'active' }),
       ...(mgr || self ? { email: r.email, desiredMin: r.desired_min, desiredMax: r.desired_max, prefs: J(r.prefs, []), minor: r.birthdate ? ageOn(r.birthdate, localDate(now(), 'UTC')) < 18 : null } : {}),
@@ -100,14 +105,19 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     };
   };
   const membersOf = (oid, { status = 'active' } = {}) =>
-    h.all(`SELECT m.*, a.display_name, a.email, a.phone, a.phone_visibility, a.supporter_until FROM org_members m JOIN accounts a ON a.id = m.account_id WHERE m.org_id = ?${status ? ' AND m.status = ?' : ''} ORDER BY a.display_name`, ...(status ? [oid, status] : [oid]));
+    h.all(`SELECT m.*, a.display_name, a.email, a.email_verified, a.phone, a.phone_visibility, a.supporter_until FROM org_members m JOIN accounts a ON a.id = m.account_id WHERE m.org_id = ?${status ? ' AND m.status = ?' : ''} ORDER BY a.display_name`, ...(status ? [oid, status] : [oid]));
 
+  // How many rows of each kind one organization can have (audit 2026-11-06, section 2 L2): far above any real one, so a
+  // script can't fill the Hub's database through one organization.
+  const capRows = (table, oid, max, what) => {
+    if (h.get(`SELECT COUNT(*) AS n FROM ${table} WHERE org_id = ?`, oid).n >= max) bad(`This organization has the most ${what} it can have (${max}). Remove some first.`);
+  };
   const getSetting = (k, d) => { const r = h.get('SELECT value FROM settings WHERE key = ?', k); return r ? JSON.parse(r.value) : d; };
   const setSetting = (k, v) => h.run('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', k, JSON.stringify(v));
 
   OR('POST', '/v1/orgs', ({ me, body, ip }) => {
     if (!me.email_verified && me.role !== 'owner') forbidden('Verify your email first (Settings > Account > Verify with Google), then create the organization.');
-    const name = V.str(body.name, 'Name', { min: 2, max: 120 });
+    const name = V.name(body.name, 'Name', { min: 2, max: 120 });
     const kind = V.enum(body.kind ?? 'private', 'Kind', KINDS);
     const tz = validTz(V.str(body.tz ?? 'America/Denver', 'Time zone', { min: 3, max: 60 }));
     const state = body.state == null ? null : V.str(body.state, 'State', { min: 2, max: 10 }).toUpperCase();
@@ -125,6 +135,8 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   // (Before /v1/orgs/:id, which would otherwise match "join".)
   OR('POST', '/v1/orgs/join', ({ me, body, ip }) => {
     limit('join', ip); limit('join', me.id);
+    // Managers see the email as who someone is, so it must be proven first.
+    if (!me.email_verified && me.role !== 'owner') forbidden('Verify your email first (Settings > Account > Verify with Google), then join the organization.');
     const code = normCode(body.code);
     const c = code.length >= 10 ? h.get('SELECT * FROM org_codes WHERE code = ?', code) : null;
     const nope = "That code doesn't work. Check it, or ask for a new one.";
@@ -136,6 +148,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     if (existing) return { org: orgOut(o, existing), alreadyMember: true };
     const pending = !!c.needs_approval && !orgSettings(o).autoApproveJoins;
     h.tx(() => {
+      capRows('org_members', o.id, 5000, 'members');
       h.run('INSERT INTO org_members (org_id,account_id,role,status,department_id,joined_at,via_code) VALUES (?,?,?,?,?,?,?)', o.id, me.id, c.role, pending ? 'pending' : 'active', c.department_id, now(), c.code);
       if (c.position_id) h.run('INSERT OR IGNORE INTO org_member_positions (org_id,account_id,position_id) VALUES (?,?,?)', o.id, me.id, c.position_id);
       h.run('UPDATE org_codes SET uses = uses + 1 WHERE code = ?', c.code);
@@ -148,8 +161,8 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
       .map((o) => orgOut(o, { role: o.m_role, status: o.m_status })),
   }));
   OR('GET', '/v1/orgs/:id', ({ me, params }) => {
-    const { o, m } = asOrg(params.id, me, 'member', { pendingOk: true, suspendedOk: true });
-    return { org: orgOut(o, m), me: memberOut({ ...m, display_name: me.display_name, email: me.email, phone: me.phone, phone_visibility: me.phone_visibility, supporter_until: me.supporter_until }, m) };
+    const { o, m } = asOrg(params.id, me, 'member', { pendingOk: true, inactiveOk: true });
+    return { org: orgOut(o, m), me: memberOut({ ...m, display_name: me.display_name, email: me.email, email_verified: me.email_verified, phone: me.phone, phone_visibility: me.phone_visibility, supporter_until: me.supporter_until }, m) };
   });
   OR('POST', '/v1/orgs/:id', ({ me, params, body, ip }) => {
     const { o, s } = asOrg(params.id, me, 'admin');
@@ -175,7 +188,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
       if ('ruleOverrides' in b) next.ruleOverrides = V.obj(b.ruleOverrides);
     }
     h.run('UPDATE orgs SET name = ?, kind = ?, tz = ?, state = ?, workweek_start = ?, settings = ? WHERE id = ?',
-      body.name != null ? V.str(body.name, 'Name', { min: 2, max: 120 }) : o.name,
+      body.name != null ? V.name(body.name, 'Name', { min: 2, max: 120 }) : o.name,
       body.kind != null ? V.enum(body.kind, 'Kind', KINDS) : o.kind,
       body.tz != null ? validTz(V.str(body.tz, 'Time zone', { min: 3, max: 60 })) : o.tz,
       'state' in body ? (body.state == null ? null : V.str(body.state, 'State', { min: 2, max: 10 }).toUpperCase()) : o.state,
@@ -200,6 +213,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     const dept = body.departmentId ? deptRow(o.id, body.departmentId).id : null;
     const pos = body.positionId ? positionRow(o.id, body.positionId).id : null;
     const code = newOrgCode();
+    capRows('org_codes', o.id, 1000, 'join codes');
     h.run('INSERT INTO org_codes (code,org_id,role,label,department_id,position_id,needs_approval,max_uses,expires_at,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
       code, o.id, role, V.str(body.label, 'Label', { optional: true, max: 60 }), dept, pos,
       body.needsApproval == null ? (role === 'member' ? 0 : 1) : V.bool(body.needsApproval, 'Needs approval') ? 1 : 0,
@@ -258,7 +272,12 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     if ('departmentId' in body) { if (!mgr) forbidden('Only managers can change departments.'); set.department_id = body.departmentId ? deptRow(o.id, body.departmentId).id : null; }
     if ('title' in body) { if (!mgr) forbidden('Only managers can change titles.'); set.title = V.str(body.title, 'Title', { optional: true, max: 80 }); }
     if ('costRate' in body) { if (!admin) forbidden('Only admins can set cost rates.'); set.cost_rate = cents(body.costRate, 'Cost rate'); }
-    if ('birthdate' in body) { if (!self && !admin) forbidden('Only admins can change a birthdate.'); set.birthdate = date(body.birthdate, 'Birthdate', { optional: true }); }
+    if ('birthdate' in body) {
+      if (!self && !admin) forbidden('Only admins can change a birthdate.');
+      // (Your own only while it's empty: the minor labor rules depend on it, so changing it is an admin's job.)
+      if (self && !admin && t.birthdate != null) forbidden('Your birthdate is already set. Ask an admin to correct it.');
+      set.birthdate = date(body.birthdate, 'Birthdate', { optional: true });
+    }
     if ('desiredMin' in body) set.desired_min = num(body.desiredMin, 'Desired hours', { max: 168 });
     if ('desiredMax' in body) set.desired_max = num(body.desiredMax, 'Desired hours', { max: 168 });
     if ('prefs' in body) set.prefs = JSON.stringify(tags(body.prefs));
@@ -279,7 +298,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
       }
     });
     if (!self) audit(me.id, 'org.member_update', o.id, { account: t.account_id, ...Object.fromEntries(cols.filter((c) => c !== 'cost_rate' && c !== 'birthdate').map((c) => [c, set[c]])) }, ip);
-    const r = h.get('SELECT m.*, a.display_name, a.email, a.phone, a.phone_visibility, a.supporter_until FROM org_members m JOIN accounts a ON a.id = m.account_id WHERE m.org_id = ? AND m.account_id = ?', o.id, t.account_id);
+    const r = h.get('SELECT m.*, a.display_name, a.email, a.email_verified, a.phone, a.phone_visibility, a.supporter_until FROM org_members m JOIN accounts a ON a.id = m.account_id WHERE m.org_id = ? AND m.account_id = ?', o.id, t.account_id);
     return { member: { ...memberOut(r, m), ...(self ? { usualWeek: J(r.usual_week, {}) } : {}) } };
   });
   OR('POST', '/v1/orgs/:id/members/:aid/remove', ({ me, params, ip }) => {
@@ -336,6 +355,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   OR('POST', '/v1/orgs/:id/departments', ({ me, params, body }) => {
     const { o } = asOrg(params.id, me, 'admin');
     const did = id();
+    capRows('org_departments', o.id, 500, 'departments');
     h.run('INSERT INTO org_departments (id,org_id,parent_id,name,cost_center_id,location_id,sort) VALUES (?,?,?,?,?,?,?)', did, o.id,
       body.parentId ? deptRow(o.id, body.parentId).id : null, V.str(body.name, 'Name', { min: 1, max: 80 }),
       body.costCenterId ? ccRow(o.id, body.costCenterId).id : null, body.locationId ? locRow(o.id, body.locationId).id : null, V.int(body.sort ?? 0, 'Order', { min: 0, max: 10000 }));
@@ -372,6 +392,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   OR('POST', '/v1/orgs/:id/positions', ({ me, params, body }) => {
     const { o } = asOrg(params.id, me, 'admin');
     const pid = id();
+    capRows('org_positions', o.id, 500, 'positions');
     h.run('INSERT INTO org_positions (id,org_id,name,department_id,tags,cost_rate,color) VALUES (?,?,?,?,?,?,?)', pid, o.id, V.str(body.name, 'Name', { min: 1, max: 80 }),
       body.departmentId ? deptRow(o.id, body.departmentId).id : null, JSON.stringify(tags(body.tags)), cents(body.costRate, 'Cost rate'), V.str(body.color, 'Color', { optional: true, max: 20 }));
     return { status: 201, body: { position: posOut(positionRow(o.id, pid), true) } };
@@ -402,6 +423,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
       const { o } = asOrg(params.id, me, 'admin');
       const rid = id();
       const vals = fields.map(([f, n, min, max]) => V.str(body[f], n, { min, max, optional: min === 0 }));
+      capRows(table, o.id, 300, path.replace('-', ' '));
       h.run(`INSERT INTO ${table} (id,org_id,${fields.map((f) => f[0]).join(',')}) VALUES (?,?,${fields.map(() => '?').join(',')})`, rid, o.id, ...vals);
       return { status: 201, body: { item: out(h.get(`SELECT * FROM ${table} WHERE id = ?`, rid)) } };
     });
@@ -483,6 +505,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     const f = certTypeFields(o, body);
     if (!f.name) bad('Give the certification a name.');
     const tid = id();
+    capRows('org_cert_types', o.id, 300, 'certification types');
     h.run('INSERT INTO org_cert_types (id,org_id,name,valid_months,positions,warn_days) VALUES (?,?,?,?,?,?)', tid, o.id, f.name, f.valid, f.positions, f.warn);
     return { status: 201, body: { certType: certTypeOut(certTypeRow(o.id, tid)) } };
   });
@@ -519,6 +542,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     const t = certTypeRow(o.id, tid);
     const cid = id();
     const exp = expiresOn ?? (t.valid_months ? addDays(addMonths(issuedOn, t.valid_months), -1) : null);
+    capRows('org_certs', o.id, 50000, 'certification records');
     h.run('INSERT INTO org_certs (id,org_id,account_id,type_id,issued_on,expires_on,source,class_id,note,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)', cid, o.id, aid, t.id, issuedOn, exp, source, classId, note, by, now());
     return cid;
   };
@@ -540,7 +564,8 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   // ---------- org classes (Hub classes that belong to the org; finishing one can issue a cert) ----------
   const orgClassRow = (oid, cid) => h.get('SELECT oc.*, c.title, c.description, c.meeting_url, c.status FROM org_classes oc JOIN classes c ON c.id = oc.class_id WHERE oc.class_id = ? AND oc.org_id = ?', cid, oid) ?? notFound('Class not found.');
   const nextSession = (cid) => h.get('SELECT * FROM class_sessions WHERE class_id = ? AND end_at > ? ORDER BY start_at LIMIT 1', cid, now());
-  const sessOut = (s) => s && { id: s.id, title: s.title, start: new Date(s.start_at).toISOString(), end: new Date(s.end_at).toISOString(), startAt: s.start_at, location: s.location, meetingUrl: s.meeting_url };
+  const iso = (ms) => { const d = new Date(ms); return Number.isFinite(d.getTime()) ? d.toISOString() : null; };
+  const sessOut = (s) => s && { id: s.id, title: s.title, start: iso(s.start_at), end: iso(s.end_at), startAt: s.start_at, location: s.location, meetingUrl: s.meeting_url };
   const orgClassOut = (c, viewer) => {
     const mine = h.get('SELECT * FROM org_class_assignments WHERE class_id = ? AND account_id = ?', c.class_id, viewer.account_id);
     return {
@@ -562,11 +587,12 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   });
   OR('POST', '/v1/orgs/:id/classes', ({ me, params, body, ip }) => {
     const { o, m } = asOrg(params.id, me, 'manager');
+    capRows('org_classes', o.id, 500, 'classes');
     const cid = id();
     const cert = body.certTypeId ? certTypeRow(o.id, body.certTypeId).id : null;
     h.tx(() => {
-      h.run("INSERT INTO classes (id,owner_id,title,description,kind,meeting_url,created_at) VALUES (?,?,?,?,'class',?,?)", cid, me.id,
-        V.str(body.title, 'Title', { min: 1, max: 120 }), V.str(body.description, 'Description', { optional: true, max: 4000 }) ?? '', V.url(body.meetingUrl, 'Meeting link'), now());
+      h.run("INSERT INTO classes (id,owner_id,title,description,kind,meeting_url,created_at,org_id) VALUES (?,?,?,?,'class',?,?,?)", cid, me.id,
+        V.name(body.title, 'Title', { min: 1, max: 120 }), V.str(body.description, 'Description', { optional: true, max: 4000 }) ?? '', V.url(body.meetingUrl, 'Meeting link'), now(), o.id);
       h.run("INSERT INTO class_members (class_id,account_id,role,joined_at) VALUES (?,?,'instructor',?)", cid, me.id, now());
       h.run('INSERT INTO org_classes (class_id,org_id,cert_type_id,created_at) VALUES (?,?,?,?)', cid, o.id, cert, now());
     });
@@ -578,7 +604,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     const c = orgClassRow(o.id, params.cid);
     h.tx(() => {
       h.run('UPDATE classes SET title = ?, description = ?, meeting_url = ?, status = ? WHERE id = ?',
-        body.title != null ? V.str(body.title, 'Title', { min: 1, max: 120 }) : c.title,
+        body.title != null ? V.name(body.title, 'Title', { min: 1, max: 120 }) : c.title,
         body.description != null ? V.str(body.description, 'Description', { optional: true, max: 4000 }) ?? '' : c.description,
         'meetingUrl' in body ? V.url(body.meetingUrl, 'Meeting link') : c.meeting_url,
         body.status != null ? V.enum(body.status, 'Status', ['active', 'archived']) : c.status, c.class_id);
@@ -665,6 +691,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   OR('POST', '/v1/orgs/:id/block-sets', ({ me, params, body }) => {
     const { o } = asOrg(params.id, me, 'manager');
     const sid = id();
+    capRows('org_block_sets', o.id, 300, 'block templates');
     h.run('INSERT INTO org_block_sets (id,org_id,name,position_id,blocks,created_at) VALUES (?,?,?,?,?,?)', sid, o.id, V.str(body.name, 'Name', { min: 1, max: 80 }),
       body.positionId ? positionRow(o.id, body.positionId).id : null, JSON.stringify(parseBlocks(o.id, body.blocks)), now());
     return { status: 201, body: { blockSet: setOut(h.get('SELECT * FROM org_block_sets WHERE id = ?', sid)) } };
@@ -772,6 +799,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     }
     const month = new Date(`${start}T12:00:00Z`).toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
     const fid = id();
+    capRows('org_forms', o.id, 2000, 'availability forms');
     h.run('INSERT INTO org_forms (id,org_id,title,period_start,period_end,status,deadline_at,blocks,exceptions,questions,audience,minor_note,reminders,allow_changes,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
       fid, o.id, V.str(body.title ?? `${month} availability`, 'Title', { min: 1, max: 120 }), start, end, 'draft',
       body.deadline != null ? V.time(body.deadline, 'Deadline') : defaultDeadline(o, start),
@@ -938,7 +966,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     const rows = new Map(h.all('SELECT * FROM org_responses WHERE form_id = ?', f.id).map((r) => [r.account_id, r]));
     return audienceOf(o, f).map((m) => {
       const r = rows.get(m.account_id);
-      return { id: m.account_id, name: m.display_name, email: m.email, departmentId: m.department_id, positionIds: positionsOf(o.id, m.account_id),
+      return { id: m.account_id, name: m.display_name, email: m.email, emailVerified: !!m.email_verified, departmentId: m.department_id, positionIds: positionsOf(o.id, m.account_id),
         minor: m.birthdate ? ageOn(m.birthdate, f.period_start) < 18 : false, desiredMinProfile: m.desired_min, desiredMaxProfile: m.desired_max,
         ...(responseOut(r) || { answers: {}, dateNotes: {}, note: null, desiredMin: null, desiredMax: null, daysOff: null, extra: {}, submittedAt: null, updatedAt: null }) };
     });
@@ -1031,6 +1059,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     const start = f ? f.period_start : date(body.periodStart, 'Start'), end = f ? f.period_end : date(body.periodEnd, 'End');
     if (end < start) bad('The end must be on or after the start.');
     const sid = id();
+    capRows('org_schedules', o.id, 2000, 'schedules');
     h.run('INSERT INTO org_schedules (id,org_id,form_id,title,period_start,period_end,created_by,created_at) VALUES (?,?,?,?,?,?,?,?)', sid, o.id, f?.id ?? null,
       V.str(body.title ?? (f ? f.title.replace(/availability/i, 'schedule') : `Schedule ${start}`), 'Title', { min: 1, max: 120 }), start, end, me.id, now());
     audit(me.id, 'org.schedule_create', o.id, { schedule: sid }, ip);
@@ -1431,6 +1460,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   OR('POST', '/v1/orgs/:id/policies', ({ me, params, body }) => {
     const { o } = asOrg(params.id, me, 'manager');
     const pid = id();
+    capRows('org_policies', o.id, 1000, 'acknowledgments');
     h.run('INSERT INTO org_policies (id,org_id,title,body,url,due_on,audience,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)', pid, o.id, V.str(body.title, 'Title', { min: 1, max: 120 }),
       V.str(body.body, 'Text', { optional: true, max: 20000 }), V.url(body.url, 'Link'), date(body.dueOn, 'Due', { optional: true }), JSON.stringify(body.audience ? parseAudience(o.id, body.audience) : {}), me.id, now());
     return { status: 201, body: { id: pid } };
@@ -1578,6 +1608,14 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return todoFor(me);
   });
 
+  /** A suspended organization's classes: archived, and their invite codes revoked (managers can reopen them later). */
+  function shutClasses(oid) {
+    h.tx(() => {
+      h.run("UPDATE classes SET status = 'archived' WHERE org_id = ? OR id IN (SELECT class_id FROM org_classes WHERE org_id = ?)", oid, oid);
+      h.run('UPDATE invites SET revoked = 1 WHERE class_id IN (SELECT id FROM classes WHERE org_id = ?) OR class_id IN (SELECT class_id FROM org_classes WHERE org_id = ?)', oid, oid);
+    });
+  }
+
   // ================= owner console: orgs hosted on the Hub =================
   O('GET', '/owner/orgs', ({ query }) => ({
     orgs: h.all(`SELECT o.*, a.email AS creator FROM orgs o JOIN accounts a ON a.id = o.created_by${query.status ? ' WHERE o.status = ?' : ''} ORDER BY o.created_at DESC LIMIT 500`, ...(query.status ? [query.status] : []))
@@ -1589,6 +1627,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     const o = loadOrg(params.id) ?? notFound();
     const approve = V.bool(body.approve, 'approve');
     h.run('UPDATE orgs SET status = ?, decided_at = ?, note = ? WHERE id = ?', approve ? 'active' : 'suspended', now(), V.str(body.note, 'note', { optional: true, max: 2000 }), o.id);
+    if (!approve) shutClasses(o.id);
     audit('owner', approve ? 'owner.org_approve' : 'owner.org_deny', o.id, null, 'local');
     const why = V.str(body.note, 'note', { optional: true, max: 2000 });
     if (approve) notify(o.created_by, 'org', `${o.name} is approved on the Kea Hub`, 'Your organization is ready. Make join codes for your people in Work mode.', { note: why, data: { orgId: o.id, approved: true } });
@@ -1599,7 +1638,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     const o = loadOrg(params.id) ?? notFound();
     const st = V.enum(body.status, 'status', ['active', 'suspended']);
     h.run('UPDATE orgs SET status = ?, note = COALESCE(?, note) WHERE id = ?', st, V.str(body.note, 'note', { optional: true, max: 2000 }), o.id);
-    if (st === 'suspended') h.run('UPDATE org_codes SET revoked = 1 WHERE org_id = ?', o.id);
+    if (st === 'suspended') { h.run('UPDATE org_codes SET revoked = 1 WHERE org_id = ?', o.id); shutClasses(o.id); }
     audit('owner', `owner.org_${st}`, o.id, null, 'local');
     return { ok: true };
   });

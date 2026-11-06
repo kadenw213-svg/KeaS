@@ -64,7 +64,12 @@ export function clientAddress(headers, socketAddress, ipHeader) {
   const sock = cleanIp(socketAddress) ?? 'unknown';
   const proxied = headers['x-forwarded-for'] != null || headers['tailscale-funnel-request'] != null || headers['cf-connecting-ip'] != null;
   if (ipHeader) {
-    const v = headers[String(ipHeader).toLowerCase()];
+    const name = String(ipHeader).toLowerCase();
+    // X-Forwarded-For is what Tailscale Funnel sets, but any local program can send it too. It counts only on requests
+    // Funnel marked as its own (Tailscale-Funnel-Request: ?1, which Funnel strips from incoming requests and sets).
+    // Another header (cf-connecting-ip, or a proxy the owner configured) is trusted as configured.
+    const trusted = name !== 'x-forwarded-for' || String(headers['tailscale-funnel-request'] ?? '').trim() === '?1';
+    const v = trusted ? headers[name] : null;
     if (v != null) {
       const parts = String(v).split(',');
       const ip = cleanIp(parts[parts.length - 1]);

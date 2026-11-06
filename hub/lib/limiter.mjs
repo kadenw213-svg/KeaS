@@ -84,3 +84,28 @@ export function failures(h, nowFn) {
     },
   };
 }
+
+/**
+ * Token buckets: `rate` tokens a second, up to `burst`. take() spends `cost` tokens and returns 0, or the ms until
+ * there would be enough. Used for the cheap checks that run before anything else (requests per address and in all),
+ * and for bytes (egress, uploads).
+ */
+export class Buckets {
+  constructor(max = 100_000) { this.b = new Map(); this.max = max; }
+  take(key, rate, burst, nowMs, cost = 1) {
+    let x = this.b.get(key);
+    if (!x) { x = { t: burst, at: nowMs }; this.b.set(key, x); if (this.b.size > this.max) this.sweep(nowMs); }
+    x.t = Math.min(burst, x.t + ((nowMs - x.at) / 1000) * rate);
+    x.at = nowMs;
+    if (x.t >= cost) { x.t -= cost; return 0; }
+    return Math.ceil(((cost - x.t) / rate) * 1000);
+  }
+  /** Spends anyway (may go negative): for bytes already sent, so later sends wait longer. */
+  spend(key, rate, burst, nowMs, cost) {
+    const wait = this.take(key, rate, burst, nowMs, 0);
+    const x = this.b.get(key);
+    x.t -= cost;
+    return wait + (x.t < 0 ? Math.ceil((-x.t / rate) * 1000) : 0);
+  }
+  sweep(nowMs) { for (const [k, x] of this.b) if (nowMs - x.at > 600_000) this.b.delete(k); }
+}

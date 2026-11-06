@@ -10,6 +10,7 @@ const os = require('os');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const tailscale = require('./tailscale.cjs');
+const { verifyHubIdentity } = require('./hubid.cjs');
 const bootstart = require('./bootstart.cjs');
 
 const ROOT = path.join(__dirname, '..');
@@ -74,7 +75,7 @@ function removeKeyFile(file) {
 }
 async function startServices() {
   if (config.dataDir && !hub && !org && !hubExternal) await secureFolders();
-  if (config.role === 'hub' && !hub && await bootstart.hubAnswering(HUB_PORT)) {
+  if (config.role === 'hub' && !hub && await bootstart.hubAnswering(HUB_PORT, { dataDir: config.dataDir })) {
     if (!hubExternal) log('hub already running (started before sign-in); using it');
     hubExternal = true;
     watchExternalHub();
@@ -95,7 +96,8 @@ async function startServices() {
   if (config.role === 'org' && !org) {
     const { createApp } = await import(pathToFileURL(path.join(ROOT, 'server', 'index.mjs')).href);
     const { pass, legacy } = orgVaultPassphrase();
-    org = createApp({ dbFile: path.join(config.dataDir, 'org.db'), log: false, passphrase: pass, devKeyFile: false });
+    // (Never the demo sign-in here; the Funnel address is the only other name it answers to.)
+    org = createApp({ dbFile: path.join(config.dataDir, 'org.db'), log: false, passphrase: pass, devKeyFile: false, demo: false, publicHosts: config.publicUrl ? [config.publicUrl] : [] });
     if (legacy) removeKeyFile(legacy);
     await org.listen(ORG_PORT);
     log('org server started', config.dataDir);
@@ -105,7 +107,7 @@ const servicePort = () => (config.role === 'hub' ? HUB_PORT : ORG_PORT);
 function watchExternalHub() {
   if (hubWatch) return;
   hubWatch = setInterval(async () => {
-    if (!hubExternal || await bootstart.hubAnswering(HUB_PORT)) return;
+    if (!hubExternal || await bootstart.hubAnswering(HUB_PORT, { dataDir: config.dataDir })) return;
     log('the Hub started before sign-in stopped answering; starting it here');
     hubExternal = false;
     try { await startServices(); } catch (e) { log('start failed', e.message); }
@@ -292,6 +294,11 @@ function registerIpc() {
   handle('checkFolder', ({ dir }) => checkFolder(dir));
   handle('saveSetup', async ({ role, dataDir, storageDir, quotaGb, reach }) => {
     if (!['hub', 'org'].includes(role)) throw new Error('Pick what this PC is for.');
+    // A different role serves a different port: the old one's Funnel goes, so nothing stays public by accident.
+    if (config.role && config.role !== role && config.tailscale) {
+      try { await tailscale.funnelOff(servicePort()); } catch (e) { log('funnel off', e.message); }
+      config = writeConfig({ ...config, publicUrl: null });
+    }
     dataDir = (await checkFolder(dataDir)).dir;
     if (storageDir) storageDir = (await checkFolder(storageDir, 'The storage folder')).dir;
     config = writeConfig({ ...config, role, dataDir, storageDir: storageDir || path.join(dataDir, 'storage'), quotaGb: Number(quotaGb) || 5, tailscale: reach === 'tailscale' });
@@ -308,6 +315,12 @@ function registerIpc() {
   handle('ts:status', () => tailscale.status(servicePort()));
   handle('ts:install', () => tailscale.install((l) => send('progress', l)));
   handle('ts:login', () => tailscale.login((u) => shell.openExternal(u), (l) => send('progress', l)));
+  // Public access off: removes only KeaS's Funnel (https:443 to this server's port), nothing else in Tailscale.
+  handle('ts:funnelOff', async () => {
+    const s = await tailscale.funnelOff(servicePort());
+    config = writeConfig({ ...config, publicUrl: null });
+    return s;
+  });
   handle('ts:funnel', async () => {
     const s = await tailscale.funnel(servicePort(), (u) => shell.openExternal(u), (l) => send('progress', l));
     config = writeConfig({ ...config, publicUrl: s.url });
@@ -321,6 +334,8 @@ function registerIpc() {
   handle('terms', () => local('/v1/terms'));
   handle('owner:create', async ({ name, email, password, termsVersion, termsSections }) => {
     const db = await hubDb();
+    // The password goes only to OUR Hub: whatever answers on the port must prove it holds this Hub's signing key.
+    if (!(await verifyHubIdentity(HUB_PORT, config.dataDir))) throw new Error('The Kea Hub on this PC didn’t prove it’s the one in your data folder, so the password wasn’t sent. Restart KeaS; if this keeps happening, another program may be using port 4860.');
     let token;
     const existing = db.get('SELECT id FROM accounts WHERE email = ?', String(email).trim().toLowerCase());
     // Registering never returns a session (the Hub answers the same for new and existing emails), so a new account
@@ -334,7 +349,8 @@ function registerIpc() {
     config = writeConfig({ ...config, ownerEmail: a.email });
     ownerToken = token;
     // The owner must use two-step sign-in. (Already on: nothing to set up.)
-    const totp = a.totp_enabled ? null : await local('/v1/me/totp/setup', { method: 'POST', body: '{}' }, token);
+    // (Setting it up needs the password again: a session alone can't change how an account signs in.)
+    const totp = a.totp_enabled ? null : await local('/v1/me/totp/setup', { method: 'POST', body: JSON.stringify({ password }) }, token);
     return { email: a.email, totp };
   });
   handle('owner:totp', async ({ code }) => {

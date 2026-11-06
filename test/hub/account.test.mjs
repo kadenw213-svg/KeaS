@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHub } from '../../hub/index.mjs';
+import { ownerFetch } from '../../hub/lib/ownerauth.mjs';
 
 const DAY = 86400_000;
 const GB = 1024 ** 3;
@@ -14,7 +15,7 @@ let clock = Date.UTC(2026, 10, 5, 15);
 
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), 'kea-account-test-'));
-  hub = createHub({ dataDir: dir, now: () => clock, log: false, ipHeader: 'x-test-ip', defaultQuotaBytes: 1000, supporterQuotaBytes: 5000, minFreeBytes: 0, limits: { phone: [3, DAY] } });
+  hub = createHub({ dataDir: dir, now: () => clock, log: false, ipHeader: 'x-test-ip', defaultQuotaBytes: 1000, supporterQuotaBytes: 5000, minFreeBytes: 0, fileOverheadBytes: 0, limits: { phone: [3, DAY] } });
   const p = await hub.listen({ port: 0, ownerPort: 0 });
   base = `http://127.0.0.1:${p.port}`;
   ownerBase = `http://127.0.0.1:${p.ownerPort}`;
@@ -28,7 +29,7 @@ async function call(method, path, token, body, headers = {}) {
   return { status: r.status, body: await r.json() };
 }
 const owner = async (method, path, body) => {
-  const r = await fetch(ownerBase + path, { method, headers: { 'content-type': 'application/json', 'x-kea-owner-key': hub.ownerKey }, body: body && JSON.stringify(body) });
+  const r = await ownerFetch(ownerBase, hub.ownerKey, method, path, body);
   return { status: r.status, body: await r.json() };
 };
 const ok = (r, status = 200) => { assert.equal(r.status, status, JSON.stringify(r.body)); return r.body; };
@@ -151,6 +152,8 @@ test('the standard size is 5 GB, and a Hub that ran with 25 GB tells people when
     const t = (await (await fetch(`http://127.0.0.1:${p.port}/v1/terms`)).json()).terms;
     await fetch(`http://127.0.0.1:${p.port}/v1/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: 'old@example.com', password: 'lantern velvet orbit', displayName: 'Old', age13: true, termsVersion: t.version, termsSections: t.sections.map((s) => s.id) }) });
     const reg = await (await fetch(`http://127.0.0.1:${p.port}/v1/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: 'old@example.com', password: 'lantern velvet orbit' }) })).json();
+    // (A verified account: an unverified one gets the small unverified size.)
+    h2.h.run("UPDATE accounts SET email_verified = 1 WHERE email = 'old@example.com'");
     const me = await (await fetch(`http://127.0.0.1:${p.port}/v1/me`, { headers: { authorization: `Bearer ${reg.token}` } })).json();
     assert.equal(me.storage.quota, 5 * GB);
     assert.equal(me.storage.standard, 5 * GB);
@@ -320,7 +323,8 @@ test('phone number: shown only to classmates or coworkers it’s shared with, ne
   const out = await person('ph-out@example.com', 'Outsider Oz');
   const pend = await person('ph-pend@example.com', 'Pending Pia');
   const hubOwner = await person('ph-owner@example.com', 'Hub Owner');
-  hub.h.run("UPDATE accounts SET role = 'owner' WHERE id = ?", hubOwner.id);
+  // (The owner account has two-step sign-in on: owner powers wait for it.)
+  hub.h.run("UPDATE accounts SET role = 'owner', totp_enabled = 1 WHERE id = ?", hubOwner.id);
   ok(await owner('POST', `/owner/accounts/${host.id}`, { canHost: true }));
   const cls = ok(await call('POST', '/v1/classes', host.token, { title: 'Chemistry' }), 201).class;
   const code = ok(await call('POST', `/v1/classes/${cls.id}/invites`, host.token, { role: 'student' }), 201).code;
@@ -422,11 +426,11 @@ test('notifications for existing events: org approved, join approved, sign-off d
   assert.equal(ok(await call('POST', '/v1/scan', b.token, { kind: 'more_questions', course, chapter: 'Ch 3', joinCode: sectionCode })).status, 'joined');
   let next = ok(await owner('POST', '/owner/scan/next')).job;
   while (next && next.id !== ja.job.id) { ok(await owner('POST', `/owner/scan/${next.id}/finish`, { ok: false, note: 'skip' })); next = ok(await owner('POST', '/owner/scan/next')).job; }
-  await fetch(`${ownerBase}/owner/scan/${ja.job.id}/course-file?path=material/questions/ch3.json`, { method: 'PUT', headers: { 'x-kea-owner-key': hub.ownerKey }, body: '[]' });
+  await ownerFetch(ownerBase, hub.ownerKey, 'PUT', `/owner/scan/${ja.job.id}/course-file?path=material/questions/ch3.json`, '[]');
   ok(await owner('POST', `/owner/scan/${ja.job.id}/finish`, { ok: true }));
   n = await latest(a);
-  assert.deepEqual([n.kind, n.title], ['scan_done', 'Your new practice questions are ready: HIS 101, Ch 3']);
+  assert.deepEqual([n.kind, n.title], ['scan_done', 'Your new practice questions are ready: HIS101, spring 2027, section 1, Ch 3']);
   n = await latest(b);
-  assert.deepEqual([n.kind, n.title], ['material', 'New practice questions: HIS 101, Ch 3']);
+  assert.deepEqual([n.kind, n.title], ['material', 'New practice questions: HIS101, spring 2027, section 1, Ch 3']);
   assert.ok(ok(await call('GET', '/v1/files?prefix=kea/Kea/School/Shared/', b.token)).files.length >= 1);
 });

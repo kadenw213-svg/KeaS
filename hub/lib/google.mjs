@@ -6,17 +6,27 @@ import { createPublicKey, verify } from 'node:crypto';
 const CERTS = 'https://www.googleapis.com/oauth2/v3/certs';
 const ISSUERS = new Set(['accounts.google.com', 'https://accounts.google.com']);
 
-/** Fetches and caches Google's signing keys (honours Cache-Control max-age; at least 5 minutes). */
-export function googleKeys({ fetchFn = fetch, nowFn = Date.now } = {}) {
-  let cache = null, until = 0;
+/**
+ * Fetches and caches Google's signing keys (honours Cache-Control max-age; at least 5 minutes). A forced refetch (a
+ * token named a key we don't have) happens at most once per `forceEveryMs`, and callers at the same moment share one
+ * fetch, so tokens with made-up key ids can't make the Hub hammer Google.
+ */
+export function googleKeys({ fetchFn = fetch, nowFn = Date.now, forceEveryMs = 60_000 } = {}) {
+  let cache = null, until = 0, forcedAt = -Infinity, inflight = null;
+  const load = () => (inflight ??= (async () => {
+    try {
+      const r = await fetchFn(CERTS);
+      if (!r.ok) throw new Error(`Couldn't reach Google (${r.status}).`);
+      const age = Number(/max-age=(\d+)/.exec(r.headers.get('cache-control') || '')?.[1]) || 3600;
+      cache = (await r.json()).keys || [];
+      until = nowFn() + Math.max(300, age) * 1000;
+      return cache;
+    } finally { inflight = null; }
+  })());
   return async (force = false) => {
-    if (!force && cache && nowFn() < until) return cache;
-    const r = await fetchFn(CERTS);
-    if (!r.ok) throw new Error(`Couldn't reach Google (${r.status}).`);
-    const age = Number(/max-age=(\d+)/.exec(r.headers.get('cache-control') || '')?.[1]) || 3600;
-    cache = (await r.json()).keys || [];
-    until = nowFn() + Math.max(300, age) * 1000;
-    return cache;
+    if (cache && nowFn() < until && (!force || nowFn() - forcedAt < forceEveryMs)) return cache;
+    if (force) forcedAt = nowFn();
+    return load();
   };
 }
 
@@ -28,7 +38,7 @@ export async function verifyGoogleIdToken(idToken, { clientIds, keys, nowMs = Da
   if (parts.length !== 3) fail('That Google sign-in is not valid.');
   let head, p;
   try { head = JSON.parse(Buffer.from(parts[0], 'base64url')); p = JSON.parse(Buffer.from(parts[1], 'base64url')); } catch { fail('That Google sign-in is not valid.'); }
-  if (head.alg !== 'RS256' || !head.kid) fail('That Google sign-in is not valid.');
+  if (head.alg !== 'RS256' || typeof head.kid !== 'string' || !/^[\w-]{1,128}$/.test(head.kid)) fail('That Google sign-in is not valid.');
   let jwk = (await keys()).find((k) => k.kid === head.kid);
   if (!jwk) jwk = (await keys(true)).find((k) => k.kid === head.kid);
   if (!jwk) fail('That Google sign-in is not valid.');

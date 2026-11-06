@@ -9,7 +9,8 @@ const procs = [
   ['server', [process.execPath, 'server/index.mjs']],
   ['web', [process.execPath, vite, 'web']],
 ].map(([name, [cmd, ...args]]) => {
-  const p = spawn(cmd, args, { stdio: 'inherit', env: process.env });
+  // (The sample workplace and pick-a-person sign-in are for development only: KEAS_DEV_DEMO=1.)
+  const p = spawn(cmd, args, { stdio: 'inherit', env: name === 'server' ? { ...process.env, KEAS_DEV_DEMO: '1' } : process.env });
   p.on('exit', (code) => {
     console.log(`[dev] ${name} exited (${code ?? 'signal'}); stopping the rest.`);
     stop(code ?? 1);

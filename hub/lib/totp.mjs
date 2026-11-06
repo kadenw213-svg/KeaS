@@ -50,3 +50,31 @@ export function checkCode(secret, code, nowMs, lastStep = -1) {
 
 export const otpauthUri = (secret, account, issuer = 'Kea') =>
   `otpauth://totp/${encodeURIComponent(issuer)}:${encodeURIComponent(account)}?secret=${secret}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`;
+
+// ---------- TOTP secrets at rest ----------
+// Stored sealed (AES-256-GCM), bound to the account id, so a copy of hub.db alone gives nobody the codes. The key is
+// derived from the Hub's signing key (hub-signing-key.pem, in the same locked-down folder and in every backup), so a
+// restored backup still opens them. Secrets stored before this (plain base32) are sealed when the Hub starts.
+import { createCipheriv, createDecipheriv, hkdfSync } from 'node:crypto';
+
+const SEALED = 'v1:';
+/** The sealing key, from the Hub's Ed25519 private KeyObject. */
+export const totpKeyFrom = (privateKey) => Buffer.from(hkdfSync('sha256', privateKey.export({ type: 'pkcs8', format: 'der' }), 'kea-hub', 'totp-secrets v1', 32));
+export const isSealed = (stored) => typeof stored === 'string' && stored.startsWith(SEALED);
+export function sealSecret(key, secret, accountId) {
+  const iv = randomBytes(12);
+  const c = createCipheriv('aes-256-gcm', key, iv);
+  c.setAAD(Buffer.from(`kea-totp:${accountId}`));
+  const ct = Buffer.concat([c.update(String(secret), 'utf8'), c.final()]);
+  return SEALED + Buffer.concat([iv, c.getAuthTag(), ct]).toString('base64url');
+}
+/** The base32 secret (a plain one from before sealing comes back as is), or null for none. Throws if tampered with. */
+export function openSecret(key, stored, accountId) {
+  if (stored == null) return null;
+  if (!isSealed(stored)) return stored;
+  const b = Buffer.from(stored.slice(SEALED.length), 'base64url');
+  const d = createDecipheriv('aes-256-gcm', key, b.subarray(0, 12));
+  d.setAAD(Buffer.from(`kea-totp:${accountId}`));
+  d.setAuthTag(b.subarray(12, 28));
+  return Buffer.concat([d.update(b.subarray(28)), d.final()]).toString('utf8');
+}

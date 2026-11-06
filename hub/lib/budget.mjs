@@ -29,6 +29,8 @@ export const DEFAULTS = {
   // The owner's home internet: big downloads from the Hub, all together, never go faster than this (megabits per
   // second), so they can't fill the upload. Small files (sync data) skip the limit and go first.
   maxSendMbps: 10,
+  // Jobs waiting in the line for everyone together (the owner's own jobs aren't counted against it).
+  maxQueuedJobs: 100,
 };
 export const KINDS = ['initial_scan', 'update_scan', 'more_questions'];
 

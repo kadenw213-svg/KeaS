@@ -8,7 +8,7 @@ import { createApp } from '../../server/index.mjs';
 let app, base, dir;
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), 'kea-server-test-'));
-  app = createApp({ dbFile: join(dir, 'test.db'), log: false, devKeyFile: true });
+  app = createApp({ dbFile: join(dir, 'test.db'), log: false, devKeyFile: true, demo: true });
   const port = await app.listen(0);
   base = `http://127.0.0.1:${port}`;
 });
