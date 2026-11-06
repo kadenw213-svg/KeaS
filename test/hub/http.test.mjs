@@ -571,3 +571,57 @@ test('terms change: everyone must re-agree; only changes shown; reading, export 
   assert.equal((await owner('POST', '/owner/terms', { sections: [{ id: 'Bad Id', title: 'x', body: 'y' }] })).status, 400);
   assert.equal((await call('POST', '/v1/auth/logout', t)).status, 200);
 });
+
+test('leaderboard name for every class, invite preview, invite link page, leaving a class', async () => {
+  const teach = await register('lb-inst@example.com', 'Lena Instructor');
+  await owner('POST', '/owner/accounts/lb-inst@example.com', { canHost: true });
+  const a = (await call('POST', '/v1/classes', teach, { title: 'Chemistry 110' })).body.class;
+  const b = (await call('POST', '/v1/classes', teach, { title: 'Physics 120' })).body.class;
+  const codeA = (await call('POST', `/v1/classes/${a.id}/invites`, teach, {})).body.code;
+  const codeB = (await call('POST', `/v1/classes/${b.id}/invites`, teach, {})).body.code;
+  const s = await register('lb-s@example.com', 'Rita Real');
+
+  // The account's choice starts as the real name.
+  assert.deepEqual((await call('GET', '/v1/me', s)).body.account.leaderboard, { show: 'name', nickname: null });
+  assert.equal((await call('POST', '/v1/me/leaderboard', s, { show: 'nickname' })).status, 400, 'a nickname is needed first');
+
+  // Preview before joining: the class, not the members.
+  const pre = await call('GET', `/v1/invites/${codeA.toLowerCase()}`, s);
+  assert.equal(pre.status, 200);
+  assert.equal(pre.body.class.title, 'Chemistry 110');
+  assert.equal(pre.body.role, 'student');
+  assert.equal(pre.body.alreadyMember, false);
+  assert.equal((await call('GET', '/v1/invites/AAAAAAAAAA', s)).status, 404);
+
+  await call('POST', '/v1/join', s, { code: codeA });
+  assert.equal((await call('GET', `/v1/invites/${codeA}`, s)).body.alreadyMember, true);
+  const set = await call('POST', '/v1/me/leaderboard', s, { show: 'nickname', nickname: 'Rocket' });
+  assert.equal(set.status, 200);
+  assert.deepEqual(set.body.account.leaderboard, { show: 'nickname', nickname: 'Rocket' });
+  // Applied to the class already joined, and the default for the next one.
+  assert.equal((await call('GET', `/v1/classes/${a.id}`, s)).body.class.board, 'nickname');
+  await call('POST', '/v1/join', s, { code: codeB });
+  const inB = (await call('GET', `/v1/classes/${b.id}`, s)).body.class;
+  assert.equal(inB.board, 'nickname');
+  assert.equal(inB.nickname, 'Rocket');
+
+  // Hidden everywhere, but keep a class's own choice when asked.
+  await call('POST', `/v1/classes/${a.id}/me`, s, { board: 'name' });
+  await call('POST', '/v1/me/leaderboard', s, { show: 'hidden', everyClass: false });
+  assert.equal((await call('GET', `/v1/classes/${a.id}`, s)).body.class.board, 'name');
+  assert.equal((await call('GET', '/v1/me', s)).body.account.leaderboard.show, 'hidden');
+
+  // The link page names the code and nothing else.
+  const page = await fetch(`${base}/join/${codeA.toLowerCase()}`);
+  assert.equal(page.status, 200);
+  assert.match(page.headers.get('content-type'), /text\/html/);
+  const html = await page.text();
+  assert.ok(html.includes(codeA));
+  assert.ok(!html.includes('Chemistry'));
+  assert.equal((await fetch(`${base}/join/<script>`)).status, 404);
+
+  // Leaving: gone from My classes; the creator can't leave.
+  assert.equal((await call('POST', `/v1/classes/${b.id}/leave`, s)).status, 200);
+  assert.deepEqual((await call('GET', '/v1/classes', s)).body.classes.map((c) => c.title), ['Chemistry 110']);
+  assert.equal((await call('POST', `/v1/classes/${a.id}/leave`, teach)).status, 400);
+});

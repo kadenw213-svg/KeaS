@@ -156,6 +156,9 @@ const COLUMNS = [
   ['accounts', 'google_sub', 'TEXT'],
   // A scan waits (ready = 0) until the person's Kea has uploaded what it collected from their class site.
   ['scan_jobs', 'ready', 'INTEGER NOT NULL DEFAULT 1'],
+  // How the person shows on leaderboards unless a class says otherwise: 'name', 'nickname' or 'hidden'.
+  ['accounts', 'board_default', "TEXT NOT NULL DEFAULT 'name'"],
+  ['accounts', 'nickname', 'TEXT'],
 ];
 
 export function openDb(file) {
