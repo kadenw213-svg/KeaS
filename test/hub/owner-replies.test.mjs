@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { readFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -101,4 +101,17 @@ test('LOW: a held port is written to logs/hub.log before the Hub exits', async (
     assert.match(log, /already in use by another program/);
     assert.equal(existsSync(join(d, 'hub.pid')), false);
   } finally { blocker.close(); rmSync(d, { recursive: true, force: true }); }
+});
+
+test('MED: the Hub started by itself won’t serve from a folder KeaS refused', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'kea-owner-refused-'));
+  writeFileSync(join(d, '.keas-lockdown-pending'), 'x');
+  const { ELECTRON_RUN_AS_NODE, ...env } = process.env;
+  try {
+    const code = await new Promise((resolve) => {
+      execFile(process.execPath, [HUB_ENTRY], { env: { ...env, KEA_HUB_DATA: d, KEA_HUB_PORT: '0', KEA_HUB_OWNER_PORT: '0', KEA_HUB_STORAGE: join(d, 'storage') }, timeout: 30_000 }, (e) => resolve(e ? e.code : 0));
+    });
+    assert.equal(code, 3);
+    assert.equal(existsSync(join(d, 'hub.db')), false, 'nothing was opened');
+  } finally { rmSync(d, { recursive: true, force: true }); }
 });
