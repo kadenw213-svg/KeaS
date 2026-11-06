@@ -223,6 +223,8 @@ test('account: phone numbers, who sees them, sizes, supporter months', () => {
   assert.equal(fmtBytes(5 * 1024 ** 3), '5 GB');
   assert.equal(fmtBytes(1.5 * 1024 ** 3), '1.5 GB');
   assert.equal(fmtBytes(300 * 1024 ** 2), '300 MB');
+  assert.equal(fmtBytes(3000), '2.9 KB');
+  assert.equal(fmtBytes(600), '600 bytes');
   const jan31 = Date.UTC(2027, 0, 31, 12);
   assert.equal(new Date(addMonthsUtc(jan31, 1)).toISOString(), '2027-02-28T12:00:00.000Z');
   assert.equal(new Date(addMonthsUtc(Date.UTC(2027, 11, 15), 1)).toISOString().slice(0, 10), '2028-01-15');

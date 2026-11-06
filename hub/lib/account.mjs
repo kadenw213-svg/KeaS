@@ -23,11 +23,14 @@ export function normalizePhone(v) {
 /** Whether a phone number with this visibility shows in a list of this kind ('classes' or 'orgs'). */
 export const phoneShownIn = (visibility, where) => visibility === 'both' || visibility === where;
 
-/** 5368709120 -> "5 GB"; 5000 GB -> "5,000 GB"; small sizes in MB. */
+/** 5368709120 -> "5 GB"; 5000 GB -> "5,000 GB"; smaller sizes in MB, KB or bytes. */
 export function fmtBytes(b) {
-  const gb = b / 1024 ** 3;
-  if (gb >= 1) return `${(Math.round(gb * 10) / 10).toLocaleString('en-US')} GB`;
-  return `${Math.max(0, Math.round(b / 1024 ** 2)).toLocaleString('en-US')} MB`;
+  const n = Math.max(0, Number(b) || 0);
+  const at = (unit, size) => `${(Math.round((n / size) * 10) / 10).toLocaleString('en-US')} ${unit}`;
+  if (n >= 1024 ** 3) return at('GB', 1024 ** 3);
+  if (n >= 1024 ** 2) return at('MB', 1024 ** 2);
+  if (n >= 1024) return at('KB', 1024);
+  return `${n.toLocaleString('en-US')} bytes`;
 }
 
 /** "December 5, 2026" (UTC, so the same everywhere). */

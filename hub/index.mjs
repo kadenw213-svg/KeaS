@@ -1559,7 +1559,7 @@ export function createHub({
     const after = h.get('SELECT * FROM accounts WHERE id = ?', a.id);
     const quota = quotaOf(after), used = usedBy(a.id);
     audit('owner', 'owner.quota', a.id, { bytes, note }, 'local');
-    notify(a.id, 'storage', `Your Kea storage is now ${fmtBytes(quota)}`, [bytes == null ? 'That’s the standard size.' : '', used > quota ? overText(used, quota) : ''].filter(Boolean).join(' '), { note, data: { quota } });
+    notify(a.id, 'storage', `Your Kea storage is now ${fmtBytes(quota)}`, [bytes == null ? (supporterActive(after) ? 'That’s the supporter size, while you’re a supporter.' : 'That’s the standard size.') : '', used > quota ? overText(used, quota) : ''].filter(Boolean).join(' '), { note, data: { quota } });
     return { used, quota, account: ownerView(after) };
   });
   // Kea's shared Claude for one person: any per-account limit from hub/lib/budget.mjs (null = the Hub-wide number),

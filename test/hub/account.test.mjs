@@ -236,7 +236,7 @@ test('supporters: a month, renewing extends, badge in classes and orgs, storage,
   const n = await latest(sup);
   assert.deepEqual([n.kind, n.title, n.note], ['supporter', 'Thank you for supporting Kea!', 'Thanks for the donation!']);
   assert.match(n.body, /December 5, 2026/);
-  assert.match(n.body, /5,000 bytes|0 MB/);
+  assert.match(n.body, /your Kea storage is 4\.9 KB/);
   assert.equal(ok(await call('GET', '/v1/me', sup.token)).storage.quota, 5000);
   // Renewing adds to the end.
   const r2 = ok(await owner('POST', `/owner/accounts/${sup.id}/supporter`, { months: 1 }));
