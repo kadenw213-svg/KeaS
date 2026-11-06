@@ -166,6 +166,18 @@ CREATE TABLE IF NOT EXISTS notifications (
   created_at INTEGER NOT NULL, read_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS notifications_account ON notifications(account_id, id);
+-- Getting into a course section someone else already started: someone in it lets them in (a request they see in
+-- Kea), or they type the section's join code, which anyone in the section can see and share.
+CREATE TABLE IF NOT EXISTS course_join_requests (
+  id TEXT PRIMARY KEY, course_key TEXT NOT NULL, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  target TEXT, label TEXT,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','declined','cancelled')),
+  created_at INTEGER NOT NULL, decided_by TEXT, decided_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS course_join_requests_course ON course_join_requests(course_key, status);
+CREATE TABLE IF NOT EXISTS course_codes (
+  course_key TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, created_by TEXT, created_at INTEGER NOT NULL
+);
 `;
 
 // Columns added after the first release, applied to existing databases.

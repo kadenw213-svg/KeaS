@@ -19,7 +19,9 @@ import { openDb, DATA_DIR } from './db.mjs';
 import { hashPassword, verifyPassword, needsRehash, passwordProblem } from './lib/passwords.mjs';
 import { newSecret, checkCode, otpauthUri } from './lib/totp.mjs';
 import { loadOrCreateKey, signToken } from './lib/tokens.mjs';
+import { writeSecretFile } from './lib/secureFile.mjs';
 import { Windows, failures } from './lib/limiter.mjs';
+import { clientAddress, ipBucket, isLoopback } from './lib/clientip.mjs';
 import { scoreAnswer, capped, levelOf, weekStart, dayKey, streak } from './lib/study.mjs';
 import { mountOrgs } from './org/routes.mjs';
 
@@ -82,14 +84,25 @@ function sameOrigin(req, secure) {
   const origin = req.headers.origin;
   return origin == null || origin === `${secure ? 'https' : 'http'}://${req.headers.host}`;
 }
-function readBody(req, max = MAX_BODY) {
+/**
+ * Reads a request body of at most `max` bytes. A body announced (Content-Length) or found to be bigger is refused
+ * without reading more of it: the answer goes out with Connection: close (handleApi), so the rest is never taken in.
+ */
+function readRaw(req, max, message = 'Request too large.') {
   return new Promise((resolve, reject) => {
+    const declared = Number(req.headers['content-length']);
+    if (Number.isFinite(declared) && declared > max) { req.pause(); return reject(new HttpError(413, message)); }
     let size = 0; const chunks = [];
-    req.on('data', (c) => { size += c.length; if (size > max) { reject(new HttpError(413, 'Request too large.')); req.destroy(); } else chunks.push(c); });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    const onData = (c) => {
+      size += c.length;
+      if (size > max) { req.off('data', onData); req.pause(); chunks.length = 0; reject(new HttpError(413, message)); } else chunks.push(c);
+    };
+    req.on('data', onData);
+    req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
+const readBody = async (req, max = MAX_BODY) => (await readRaw(req, max)).toString('utf8');
 // Codes people type: no 0/O/1/I/L confusion. 10 characters of 31 symbols is about 49 bits, and joining is rate-limited.
 const CODE_ALPHA = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const newCode = () => [...randomBytes(10)].map((b) => CODE_ALPHA[b % CODE_ALPHA.length]).join('');
@@ -127,7 +140,9 @@ export function createHub({
   dataDir = DATA_DIR,
   dbFile = join(dataDir, 'hub.db'),
   now = () => Date.now(),
-  ipHeader = process.env.KEA_HUB_IP_HEADER || null, // e.g. 'cf-connecting-ip' behind Cloudflare, 'x-forwarded-for' behind Funnel
+  // The header the tunnel puts the visitor's address in: 'x-forwarded-for' behind Tailscale Funnel (KeaS sets it),
+  // 'cf-connecting-ip' behind Cloudflare. Only its last entry is used (hub/lib/clientip.mjs).
+  ipHeader = process.env.KEA_HUB_IP_HEADER || null,
   limits = {},
   log = true,
   // Kea storage: where account files live (point this at the big drive), and each account's default limit and a
@@ -156,15 +171,19 @@ export function createHub({
   const gKeys = googleKeyFn ?? googleKeys({ nowFn: now });
   const key = loadOrCreateKey(join(dataDir, 'hub-signing-key.pem'));
   const ownerKeyFile = join(dataDir, 'owner.key');
-  if (!existsSync(ownerKeyFile)) writeFileSync(ownerKeyFile, randomBytes(32).toString('hex'), { mode: 0o600 });
+  if (!existsSync(ownerKeyFile)) writeSecretFile(ownerKeyFile, randomBytes(32).toString('hex'));
   const ownerKey = Buffer.from(readFileSync(ownerKeyFile, 'utf8').trim());
   const windows = new Windows();
   const fails = failures(h, now);
   // phone: changes to the phone number, per account per day.
   const L = { login: [30, 10 * 60_000], register: [5, 60 * 60_000], join: [20, 10 * 60_000], answer: [240, 60_000], phone: [5, 86400_000], ...limits };
+  // An address that can stand for many people (the tunnel's own loopback address, when the Hub can't tell clients
+  // apart) gets SHARED_FACTOR times the limit, so a few bad requests can't lock everyone out of the Hub.
+  const SHARED_FACTOR = 20;
   const limit = (kind, who) => {
-    const [n, ms] = L[kind];
-    const wait = windows.hit(`${kind}:${who}`, n, ms, now());
+    const [base, ms] = L[kind];
+    const n = isLoopback(who) || who === 'unknown' ? base * SHARED_FACTOR : base;
+    const wait = windows.hit(`${kind}:${ipBucket(String(who))}`, n, ms, now());
     if (wait > 0) throw new HttpError(429, `Too many tries. Wait ${Math.ceil(wait / 1000)} seconds.`, { retryAfter: Math.ceil(wait / 1000) });
   };
   const audit = (actor, action, target, detail, ip) =>
@@ -239,13 +258,19 @@ export function createHub({
   };
   const markGoogleVerified = (accountId, g) =>
     h.run("UPDATE accounts SET email_verified = 1, verified_by = 'Google', google_sub = ?, updated_at = ? WHERE id = ?", g.sub, now(), accountId);
-  const requireTotp = (a, code, nh, ip) => {
+  // Two-step sign-in. A missing code counts as a failure too: "code needed" only comes after a correct password, so it
+  // would otherwise let someone test passwords without ever being throttled. (Kea's normal first try without a code
+  // costs one count, which the successful sign-in right after clears.)
+  const requireTotp = (a, code, nh, ipKey, ip) => {
     if (!a.totp_enabled) return;
-    if (code == null || code === '') throw new HttpError(401, 'Enter the 6-digit code from your authenticator app.', { totpRequired: true });
+    if (code == null || code === '') { fails.fail(nh, ipKey); throw new HttpError(401, 'Enter the 6-digit code from your authenticator app.', { totpRequired: true }); }
     const step = checkCode(a.totp_secret, code, now(), a.totp_last_step);
-    if (step == null) { fails.fail(nh); audit(a.id, 'auth.fail_totp', null, null, ip); throw new HttpError(401, 'That code is wrong or already used.', { totpRequired: true }); }
+    if (step == null) { fails.fail(nh, ipKey); audit(a.id, 'auth.fail_totp', null, null, ip); throw new HttpError(401, 'That code is wrong or already used.', { totpRequired: true }); }
     h.run('UPDATE accounts SET totp_last_step = ? WHERE id = ?', step, a.id);
   };
+  const lockedError = (ms, everywhere) => new HttpError(429, everywhere
+    ? `Too many wrong tries for this account from many places. Wait ${Math.ceil(ms / 1000)} seconds, or sign in with Google.`
+    : `Too many wrong tries for this account. Wait ${Math.ceil(ms / 1000)} seconds.`, { retryAfter: Math.ceil(ms / 1000) });
 
   // ---------- storage ----------
   // Everyone gets the default; a supporter gets at least the supporter size; the owner can set any size for one
@@ -463,6 +488,10 @@ export function createHub({
   R('GET', '/v1/health', () => ({ ok: true, service: 'kea-hub', version: VERSION }), { auth: false });
   R('GET', '/v1/keys', () => ({ keys: [key.jwk] }), { auth: false });
 
+  // Making an account answers the same whether or not the email already has one (so it can't be used to find out who
+  // has a Kea account), and never signs anyone in: the app signs in right after with the same email and password. For
+  // a new email that works at once; for one that already had an account it works only with that account's password.
+  const REGISTERED = 'If this email isn’t registered yet, your account is ready. If it is, sign in with your password.';
   R('POST', '/v1/auth/register', async ({ body, ip, client }) => {
     limit('register', ip);
     const email = V.email(body.email);
@@ -471,42 +500,69 @@ export function createHub({
     const problem = passwordProblem(body.password, { email, name: displayName });
     if (problem) bad(problem, { field: 'password' });
     const birthYear = body.birthYear == null ? null : birthYearOf(body.birthYear);
-    if (h.get('SELECT 1 FROM accounts WHERE email = ?', email)) throw new HttpError(409, 'An account with that email already exists. Sign in instead.');
     const cur = currentTerms();
     if (body.termsVersion !== cur.n) throw new HttpError(409, 'The terms changed. Read the latest version and agree to it.', { termsVersion: cur.n });
+    const agreed = new Set(Array.isArray(body.termsSections) ? body.termsSections : []);
+    const missing = cur.sections.filter((s) => !agreed.has(s.id)).map((s) => s.id);
+    if (missing.length) bad('Agree to every section of the terms.', { missing });
     const g = body.googleIdToken ? await google(body.googleIdToken) : null;
     if (g && g.email !== email) bad(`That Google account is ${g.email}, not ${email}.`);
-    const id = randomUUID();
-    const t = now();
+    // (Hashed either way, so both answers take the same time.)
     const pwHash = await hashPassword(body.password);
-    h.tx(() => {
-      h.run('INSERT INTO accounts (id,email,display_name,pw_hash,created_at,updated_at,birth_year) VALUES (?,?,?,?,?,?,?)', id, email, displayName, pwHash, t, t, birthYear);
-      recordAgreement(id, body, ip, client);
-      if (g) markGoogleVerified(id, g);
-    });
-    audit(id, 'account.register', id, { google: !!g }, ip);
-    const token = newSession(id, client);
-    return { status: 201, body: { token, account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', id)) }, token };
+    const existing = h.get('SELECT id FROM accounts WHERE email = ?', email);
+    if (existing) {
+      audit(existing.id, 'account.register_existing', existing.id, null, ip);
+    } else {
+      const id = randomUUID();
+      const t = now();
+      h.tx(() => {
+        h.run('INSERT INTO accounts (id,email,display_name,pw_hash,created_at,updated_at,birth_year) VALUES (?,?,?,?,?,?,?)', id, email, displayName, pwHash, t, t, birthYear);
+        recordAgreement(id, body, ip, client);
+        if (g) markGoogleVerified(id, g);
+      });
+      audit(id, 'account.register', id, { google: !!g }, ip);
+    }
+    return { status: 202, body: { ok: true, signIn: true, message: REGISTERED } };
   }, { auth: false });
 
-  R('POST', '/v1/auth/login', async ({ body, ip, client }) => {
-    limit('login', ip);
+  R('POST', '/v1/auth/login', async ({ body, ip, ipKey, client }) => {
+    limit('login', ipKey);
     const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
     const password = typeof body.password === 'string' ? body.password : '';
     if (!email || !password) bad('Enter your email and password.');
     const nh = nameHash(email);
-    const locked = fails.locked(nh);
-    if (locked > 0) throw new HttpError(429, `Too many wrong tries for this account. Wait ${Math.ceil(locked / 1000)} seconds.`, { retryAfter: Math.ceil(locked / 1000) });
+    // Locked from this address: refused, even with the right password.
+    const pairMs = fails.pairLocked(nh, ipKey);
+    if (pairMs > 0) throw lockedError(pairMs, false);
     const a = h.get('SELECT * FROM accounts WHERE email = ?', email);
+    // Locked everywhere (guessing spread over many addresses): only a correct password WITH a correct two-step code
+    // gets through, and any miss looks exactly like the lock, so it tells a guesser nothing.
+    const globalMs = fails.globalLocked(nh);
+    if (globalMs > 0) {
+      const code = body.code;
+      const hasCode = code != null && code !== '';
+      const pwOk = hasCode && (await verifyPassword(password, a?.pw_hash ?? null));
+      const step = pwOk && a.totp_enabled && a.status === 'active' ? checkCode(a.totp_secret, code, now(), a.totp_last_step) : null;
+      if (step == null) {
+        if (hasCode) { fails.fail(nh, ipKey); audit(a?.id ?? null, 'auth.fail', null, { lockedEverywhere: true }, ip); }
+        throw lockedError(globalMs, true);
+      }
+      h.run('UPDATE accounts SET totp_last_step = ? WHERE id = ?', step, a.id);
+      fails.clear(nh, ipKey);
+      audit(a.id, 'auth.login', null, { lockedEverywhere: true }, ip);
+      const token = newSession(a.id, client);
+      return { body: { token, account: publicAccount(a), terms: termsStatus(a.id) }, token };
+    }
     const ok = await verifyPassword(password, a?.pw_hash ?? null);
     if (!ok) {
-      const f = fails.fail(nh);
+      const f = fails.fail(nh, ipKey);
       audit(a?.id ?? null, 'auth.fail', null, { count: f.count }, ip);
       throw new HttpError(401, 'Wrong email or password.');
     }
+    // (Only after the right password, so this says nothing to someone who doesn't have it.)
     if (a.status !== 'active') throw new HttpError(403, 'This account is suspended. Contact Kea support.');
-    requireTotp(a, body.code, nh, ip);
-    fails.clear(nh);
+    requireTotp(a, body.code, nh, ipKey, ip);
+    fails.clear(nh, ipKey);
     if (needsRehash(a.pw_hash)) h.run('UPDATE accounts SET pw_hash = ?, updated_at = ? WHERE id = ?', await hashPassword(password), now(), a.id);
     audit(a.id, 'auth.login', null, null, ip);
     const token = newSession(a.id, client);
@@ -514,17 +570,18 @@ export function createHub({
   }, { auth: false });
 
   // Sign in with Google instead of a password (the account must already exist with that email). Two-step sign-in
-  // still applies. Also proves the email.
-  R('POST', '/v1/auth/google', async ({ body, ip, client }) => {
-    limit('login', ip);
+  // still applies. Also proves the email. A fresh, single-use Google sign-in proves who it is, so the password lockouts
+  // don't apply to it; only guessing the two-step code from one address is throttled.
+  R('POST', '/v1/auth/google', async ({ body, ip, ipKey, client }) => {
+    limit('login', ipKey);
     const g = await google(body.idToken);
     const a = h.get('SELECT * FROM accounts WHERE email = ?', g.email);
     if (!a) throw new HttpError(404, `There's no Kea account for ${g.email} yet. Create one first.`, { email: g.email, name: g.name });
     if (a.status !== 'active') throw new HttpError(403, 'This account is suspended. Contact Kea support.');
     const nh = nameHash(a.email);
-    const locked = fails.locked(nh);
-    if (locked > 0) throw new HttpError(429, `Too many wrong tries for this account. Wait ${Math.ceil(locked / 1000)} seconds.`, { retryAfter: Math.ceil(locked / 1000) });
-    requireTotp(a, body.code, nh, ip);
+    if (a.totp_enabled) { const ms = fails.pairLocked(nh, ipKey); if (ms > 0) throw lockedError(ms, false); }
+    requireTotp(a, body.code, nh, ipKey, ip);
+    fails.clear(nh, ipKey);
     markGoogleVerified(a.id, g);
     audit(a.id, 'auth.login_google', null, null, ip);
     const token = newSession(a.id, client);
@@ -532,8 +589,8 @@ export function createHub({
   }, { auth: false });
 
   // Forgot your password: prove the email with Google, then set a new one. Every other session is signed out.
-  R('POST', '/v1/auth/reset/google', async ({ body, ip, client }) => {
-    limit('login', ip);
+  R('POST', '/v1/auth/reset/google', async ({ body, ip, ipKey, client }) => {
+    limit('login', ipKey);
     const g = await google(body.idToken);
     const a = h.get('SELECT * FROM accounts WHERE email = ?', g.email);
     if (!a) throw new HttpError(404, `There's no Kea account for ${g.email}.`);
@@ -541,14 +598,16 @@ export function createHub({
     const problem = passwordProblem(body.password, { email: a.email, name: a.display_name });
     if (problem) bad(problem, { field: 'password' });
     const nh = nameHash(a.email);
-    requireTotp(a, body.code, nh, ip);
+    if (a.totp_enabled) { const ms = fails.pairLocked(nh, ipKey); if (ms > 0) throw lockedError(ms, false); }
+    requireTotp(a, body.code, nh, ipKey, ip);
     const pwHash = await hashPassword(body.password);
     h.tx(() => {
       h.run('UPDATE accounts SET pw_hash = ?, updated_at = ? WHERE id = ?', pwHash, now(), a.id);
       h.run('DELETE FROM sessions WHERE account_id = ?', a.id);
       markGoogleVerified(a.id, g);
     });
-    fails.clear(nh);
+    // A new password: earlier guesses at the old one don't matter any more.
+    fails.clearAll(nh);
     audit(a.id, 'account.reset_google', a.id, null, ip);
     const token = newSession(a.id, client);
     return { body: { token, account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', a.id)), terms: termsStatus(a.id) }, token };
@@ -755,8 +814,8 @@ export function createHub({
     });
     return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', me.id)) };
   });
-  R('POST', '/v1/me/password', async ({ me, body, token, ip }) => {
-    if (!(await verifyPassword(body.current ?? '', me.pw_hash))) { fails.fail(nameHash(me.email)); throw new HttpError(401, 'Your current password is wrong.'); }
+  R('POST', '/v1/me/password', async ({ me, body, token, ip, ipKey }) => {
+    if (!(await verifyPassword(body.current ?? '', me.pw_hash))) { fails.fail(nameHash(me.email), ipKey); throw new HttpError(401, 'Your current password is wrong.'); }
     const problem = passwordProblem(body.next, { email: me.email, name: me.display_name });
     if (problem) bad(problem, { field: 'next' });
     h.run('UPDATE accounts SET pw_hash = ?, updated_at = ? WHERE id = ?', await hashPassword(body.next), now(), me.id);
@@ -1039,7 +1098,8 @@ export function createHub({
   R('POST', '/v1/sets/:id/answer', ({ me, params, body }) => {
     limit('answer', me.id);
     const s = loadSet(params.id);
-    asMember(s.class_id, me);
+    const { m } = asMember(s.class_id, me);
+    const teacher = ['instructor', 'ta'].includes(m.role);
     const q = h.get('SELECT * FROM questions WHERE id = ? AND set_id = ?', V.str(body.questionId, 'Question', { min: 1, max: 100 }), s.id) ?? notFound('Question not found.');
     const choice = V.int(body.choice, 'Choice', { min: 0, max: JSON.parse(q.choices).length - 1 });
     const correct = choice === q.answer;
@@ -1055,6 +1115,11 @@ export function createHub({
         points = capped(r.points, today);
         if (points > 0) h.run('INSERT INTO xp_events (account_id,class_id,question_id,points,at,day) VALUES (?,?,?,?,?,?)', me.id, s.class_id, q.id, points, t, dayKey(t));
       }
+      // A leaderboard set doesn't hand out its answer key: a wrong answer while the question still scores says only
+      // that it was wrong (it comes back to try again). The answer and why come once it's right, or when the question
+      // isn't scoring for this person now (they already got it right this round), and always in practice-only sets.
+      const reveal = !s.leaderboard || teacher || correct || !r.due;
+      if (!reveal) return { correct: false, again: true, points: 0, scoring: true, capped: false, nextDueAt: r.state.dueAt, box: r.state.box, progress: progressOf(me.id) };
       return {
         correct, answer: q.answer, why: q.why, points, scoring: r.due,
         capped: s.leaderboard && r.points > 0 && points < r.points,
@@ -1219,6 +1284,84 @@ export function createHub({
     return n;
   }
 
+  // ---------- Getting into a course section ----------
+  // A course key ("school|code|term|section") is easy to guess, so knowing it isn't enough: the people already in a
+  // section let someone in (a request each of them sees in Kea, and a notice), or share the section's join code.
+  // Until then they get no material and no course_members row.
+  const isCourseMember = (key, accountId) => !!h.get('SELECT 1 FROM course_members WHERE course_key = ? AND account_id = ?', key, accountId);
+  const sectionExists = (key) => !!key && !!(h.get('SELECT 1 FROM course_members WHERE course_key = ? LIMIT 1', key) || h.get('SELECT 1 FROM course_files WHERE course_key = ? LIMIT 1', key));
+  const sectionLabel = (body) => {
+    const c = body.course && typeof body.course === 'object' ? body.course : {};
+    const code = String(body.detail?.courseCode || c.code || '').trim().slice(0, 60);
+    const term = String(c.term || '').trim().slice(0, 40);
+    const sec = String(c.section || '').trim().slice(0, 20);
+    return [code || 'a course', term, sec ? `section ${sec}` : ''].filter(Boolean).join(', ');
+  };
+  /** In: a member from now on, with what the section already has copied over, and in its first scan if that's still running. */
+  function admit(key, accountId, target, by) {
+    h.run('INSERT OR IGNORE INTO course_members (course_key,account_id,joined_at,target) VALUES (?,?,?,?)', key, accountId, now(), target ?? null);
+    if (target) h.run('UPDATE course_members SET target = ? WHERE course_key = ? AND account_id = ?', target, key, accountId);
+    h.run("UPDATE course_join_requests SET status = 'approved', decided_by = ?, decided_at = ? WHERE course_key = ? AND account_id = ? AND status = 'pending'", by, now(), key, accountId);
+    const scan = h.get("SELECT * FROM scan_jobs WHERE course_key = ? AND kind = 'initial_scan' AND status IN ('queued','running') ORDER BY created_at LIMIT 1", key);
+    if (scan && scan.account_id !== accountId) h.run('INSERT OR IGNORE INTO scan_job_members (job_id,account_id,joined_at,target) VALUES (?,?,?,?)', scan.id, accountId, now(), target ?? null);
+    const delivered = deliver(key, spaceList(spaces.course(key), 'material/'), [{ id: accountId, target: target ?? h.get('SELECT target FROM course_members WHERE course_key = ? AND account_id = ?', key, accountId)?.target }]);
+    return { delivered, jobId: scan?.id ?? null };
+  }
+  const requestOut = (r) => ({ id: r.id, course: r.course_key, label: r.label, status: r.status, createdAt: r.created_at, decidedAt: r.decided_at });
+  function askToJoin(me, key, target, label, ip) {
+    const PENDING = 'Someone in this section has to let you in. They got your request in Kea. Or ask one of them for the section code.';
+    const open = h.get("SELECT * FROM course_join_requests WHERE course_key = ? AND account_id = ? AND status = 'pending'", key, me.id);
+    if (open) {
+      if (target) h.run('UPDATE course_join_requests SET target = ? WHERE id = ?', target, open.id);
+      return { status: 'pending', message: PENDING, request: requestOut(open), allowance: allowance(me) };
+    }
+    // Said no recently: no new request (and no new notices for them) for a day.
+    const no = h.get("SELECT * FROM course_join_requests WHERE course_key = ? AND account_id = ? AND status = 'declined' AND decided_at > ? ORDER BY decided_at DESC LIMIT 1", key, me.id, now() - DAY_MS);
+    if (no) return { status: 'declined', message: 'Someone in this section said no. Ask one of them for the section code instead.', request: requestOut(no), allowance: allowance(me) };
+    const id = randomUUID();
+    h.run('INSERT INTO course_join_requests (id,course_key,account_id,target,label,created_at) VALUES (?,?,?,?,?,?)', id, key, me.id, target, label, now());
+    audit(me.id, 'course.join_request', id, { course: key }, ip);
+    for (const m of h.all('SELECT account_id FROM course_members WHERE course_key = ? ORDER BY joined_at LIMIT 50', key))
+      notify(m.account_id, 'course_join', `${me.display_name} asks to join ${label}`, 'Let them in from Kea’s shared Claude panel, or give them this section’s code. Say no if you don’t know them.', { data: { requestId: id, course: key, label, name: me.display_name } });
+    return { status: 'pending', message: PENDING, request: requestOut(h.get('SELECT * FROM course_join_requests WHERE id = ?', id)), allowance: allowance(me) };
+  }
+  const sectionKeyOf = (v) => (typeof v === 'string' ? V.str(v, 'Course', { min: 3, max: 400 }) : courseKey(V.obj(v))) ?? bad('Say which course.');
+  const asSectionMember = (me, key) => { if (me.role !== 'owner' && !isCourseMember(key, me.id)) notFound('Course not found.'); };
+  // Requests to join sections I'm in (to let in or turn down), and my own.
+  R('GET', '/v1/course-sections/requests', ({ me }) => ({
+    incoming: h.all("SELECT r.*, a.display_name FROM course_join_requests r JOIN accounts a ON a.id = r.account_id WHERE r.status = 'pending' AND r.course_key IN (SELECT course_key FROM course_members WHERE account_id = ?) ORDER BY r.created_at", me.id)
+      .map((r) => ({ ...requestOut(r), name: r.display_name })),
+    mine: h.all('SELECT * FROM course_join_requests WHERE account_id = ? ORDER BY created_at DESC LIMIT 50', me.id).map(requestOut),
+  }));
+  R('POST', '/v1/course-sections/requests/:id/decide', ({ me, params, body, ip }) => {
+    const r = h.get('SELECT * FROM course_join_requests WHERE id = ?', params.id) ?? notFound('Request not found.');
+    asSectionMember(me, r.course_key);
+    const approve = V.bool(body.approve, 'approve');
+    if (r.status !== 'pending') return { request: requestOut(r) };
+    if (approve) {
+      const got = admit(r.course_key, r.account_id, r.target, me.id);
+      notify(r.account_id, 'course_join', `You’re in: ${r.label}`, got.jobId ? 'The class scan is still running. Its material comes into Kea when it finishes.' : 'The section’s material comes into Kea with the next sync.', { data: { requestId: r.id, course: r.course_key, status: 'approved' } });
+    } else {
+      h.run("UPDATE course_join_requests SET status = 'declined', decided_by = ?, decided_at = ? WHERE id = ?", me.id, now(), r.id);
+      notify(r.account_id, 'course_join', `Your request to join ${r.label} wasn’t accepted`, 'You can ask someone in the section for its code.', { data: { requestId: r.id, course: r.course_key, status: 'declined' } });
+    }
+    audit(me.id, approve ? 'course.join_approve' : 'course.join_decline', r.id, { course: r.course_key, account: r.account_id }, ip);
+    return { request: requestOut(h.get('SELECT * FROM course_join_requests WHERE id = ?', r.id)) };
+  });
+  // The section's join code, for someone in it to share (made the first time it's asked for; reset: true makes a new
+  // one, so an old code that went around stops working).
+  R('POST', '/v1/course-sections/code', ({ me, body, ip }) => {
+    const key = sectionKeyOf(body.course);
+    asSectionMember(me, key);
+    let c = h.get('SELECT * FROM course_codes WHERE course_key = ?', key);
+    if (!c || body.reset === true) {
+      h.run('INSERT INTO course_codes (course_key,code,created_by,created_at) VALUES (?,?,?,?) ON CONFLICT(course_key) DO UPDATE SET code = excluded.code, created_by = excluded.created_by, created_at = excluded.created_at', key, newCode(), me.id, now());
+      audit(me.id, 'course.code', null, { course: key, reset: !!c }, ip);
+      c = h.get('SELECT * FROM course_codes WHERE course_key = ?', key);
+    }
+    return { course: key, code: c.code, createdAt: c.created_at };
+  });
+
   R('POST', '/v1/scan', ({ me, body, ip }) => {
     limit('join', me.id);
     const kind = V.str(body.kind, 'Kind', { min: 1, max: 40 });
@@ -1244,9 +1387,28 @@ export function createHub({
       myBatchesToday: kind === 'more_questions' ? h.get(`SELECT COUNT(*) AS n FROM scan_jobs j WHERE ${MINE} AND kind = 'more_questions' AND created_at >= ? AND status NOT IN ('cancelled','failed')`, me.id, me.id, dayStart()).n : 0,
     };
     const d = decide(kind, limitsOf(me), facts);
-    watchRequests(me, kind, d.action === 'refuse' ? `refuse:${d.code}` : d.action, ip);
+    const gated = d.action !== 'refuse' && me.role !== 'owner' && sectionExists(key) && !isCourseMember(key, me.id);
+    watchRequests(me, kind, d.action === 'refuse' ? `refuse:${d.code}` : gated ? 'gate' : d.action, ip);
     if (d.action === 'refuse') throw new HttpError(429, d.reason, { code: d.code, allowance: allowance(me) });
-    if (kind === 'initial_scan') {
+    // A section someone else already started (its material, its running jobs): only for people in it. Getting in takes
+    // the section's join code, or someone in it saying yes to a request.
+    if (gated) {
+      if (body.joinCode != null && body.joinCode !== '') {
+        limit('join', ip);
+        const c = h.get('SELECT * FROM course_codes WHERE course_key = ?', key);
+        if (!c || c.code !== normCode(body.joinCode)) notFound("That section code doesn't work. Check it, or ask someone in the section.");
+        const got = admit(key, me.id, target, null);
+        audit(me.id, 'course.join_code', null, { course: key }, ip);
+        if (kind === 'initial_scan') return { status: 'shared', message: 'You’re in this section now. Its material comes into Kea with the next sync.', delivered: got.delivered, allowance: allowance(me) };
+        // (Asking for something else, like more questions: carry on with that now they're in.)
+      } else if (kind === 'initial_scan') {
+        return askToJoin(me, key, target, sectionLabel(body), ip);
+      } else {
+        throw new HttpError(403, 'Join this section first: ask for its class scan, or use the section code from someone in it.', { code: 'not_in_section', allowance: allowance(me) });
+      }
+    }
+    // The first person in a section (by asking for anything on it) is its first member, and can let others in.
+    if (kind === 'initial_scan' || (d.action === 'queue' && !sectionExists(key))) {
       h.run('INSERT OR IGNORE INTO course_members (course_key,account_id,joined_at) VALUES (?,?,?)', key, me.id, t);
       if (target) h.run('UPDATE course_members SET target = ? WHERE course_key = ? AND account_id = ?', target, key, me.id);
     }
@@ -1534,6 +1696,8 @@ export function createHub({
     classes: h.get("SELECT COUNT(*) AS n FROM classes WHERE status = 'active'").n,
     pendingHosting: h.get("SELECT COUNT(*) AS n FROM host_applications WHERE status = 'pending'").n,
     failedSignInsToday: h.get("SELECT COUNT(*) AS n FROM audit WHERE action LIKE 'auth.fail%' AND at > ?", now() - 86400_000).n,
+    // How the Hub tells visitors apart (the header it trusts), and any setup problem with it.
+    clientAddress: { header: ipHeader || null, warnings: [...ipWarnings].map((code) => ({ code, text: IP_WARN[code] })) },
   }));
   O('GET', '/owner/accounts', ({ query }) => {
     const q = `%${String(query.q ?? '').toLowerCase()}%`;
@@ -1664,7 +1828,7 @@ export function createHub({
   });
   O('POST', '/owner/accounts/:id/unlock', ({ params }) => {
     const a = getAccount(params.id);
-    fails.clear(nameHash(a.email));
+    fails.clearAll(nameHash(a.email));
     audit('owner', 'owner.unlock', a.id, null, 'local');
     return { ok: true };
   });
@@ -1721,16 +1885,29 @@ export function createHub({
   mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, bad, forbidden, notFound, rawOut, notify, extrasFor });
 
   // ================= request handling =================
-  const clientIp = (req) => {
-    // Behind one trusted proxy (Tailscale Funnel), X-Forwarded-For's LAST entry is the address the proxy saw; earlier
-    // entries come from the client and can be faked to dodge the per-IP limits. Single-value headers
-    // (cf-connecting-ip) are used as they are.
-    if (ipHeader) {
-      const v = req.headers[ipHeader.toLowerCase()];
-      if (v) { const parts = String(v).split(',').map((s) => s.trim()).filter(Boolean); if (parts.length) return parts[parts.length - 1]; }
-    }
-    return req.socket.remoteAddress || 'unknown';
+  // Where requests come from: see hub/lib/clientip.mjs for what the tunnel sends and what is trusted.
+  // A setup mistake that makes every visitor look like one address (so per-IP limits act on everyone at once) is
+  // warned about once in the log and shown in /owner/stats.
+  const ipWarnings = new Set();
+  const warnIp = (code, text) => {
+    if (ipWarnings.has(code)) return;
+    ipWarnings.add(code);
+    console.warn(`Kea Hub warning: ${text}`);
   };
+  const IP_WARN = {
+    forwarded: 'Requests are arriving through a proxy (X-Forwarded-For), but the Hub wasn’t told which header holds the visitor’s address (KEA_HUB_IP_HEADER, for example x-forwarded-for behind Tailscale Funnel). Everyone looks like one address, so per-address limits are loosened for it and sign-in lockouts can affect everyone.',
+    exposed: 'The public API is listening on an address other than this PC’s own (127.0.0.1) and no KEA_HUB_IP_HEADER is set.',
+  };
+  const clientOf = (req) => {
+    const c = clientAddress(req.headers, req.socket.remoteAddress, ipHeader);
+    if (c.forwardedUntrusted) warnIp('forwarded', IP_WARN.forwarded);
+    return c;
+  };
+  // Body size limits. Before anyone is signed in, only small bodies are read (sign-in, making an account, a parent's
+  // sign-off); the big limit is only for the person whose own job is running, answering one of its relay calls.
+  const PRE_AUTH_BODY = 64 * 1024;
+  const RELAY_RESULT_BODY = 48 * 1024 * 1024;
+  const RELAY_RESULT = /^\/v1\/scan\/([^/]+)\/calls\/[^/]+\/result$/;
 
   async function handleApi(req, res) {
     const t0 = Date.now();
@@ -1747,12 +1924,6 @@ export function createHub({
       const fileMatch = /^\/v1\/files\/(.+)$/.exec(url.pathname);
       const fileRoute = fileMatch && ['GET', 'PUT', 'DELETE'].includes(req.method);
       const { r, params } = fileRoute ? { r: { auth: true, terms: true }, params: {} } : api.find(req.method, url.pathname);
-      let body = {};
-      if (req.method === 'POST') {
-        const raw = await readBody(req, /^\/v1\/scan\/[^/]+\/calls\/[^/]+\/result$/.test(url.pathname) ? 48 * 1024 * 1024 : MAX_BODY);
-        if (raw.trim()) { try { body = JSON.parse(raw); } catch { bad('Invalid JSON.'); } }
-        body = V.obj(body);
-      }
       const auth = req.headers.authorization;
       const bearer = auth ? /^Bearer ([0-9a-f]{64})$/.exec(auth)?.[1] ?? null : null;
       if (auth && !bearer) throw new HttpError(401, 'Sign in again.');
@@ -1761,7 +1932,9 @@ export function createHub({
         if (!sameOrigin(req, secure)) forbidden('Cross-site request refused.');
         if (cookieToken && req.headers['x-kea'] !== '1') forbidden('Missing X-Kea header.');
       }
-      const ctx = { params, body, query: Object.fromEntries(url.searchParams), ip: clientIp(req), client: String(req.headers['x-kea-client'] || req.headers['user-agent'] || '').slice(0, 120), token: bearer || cookieToken, origin: `${secure ? 'https' : 'http'}://${String(req.headers.host || 'localhost').replace(/[^\w.:[\]-]/g, '')}` };
+      const from = clientOf(req);
+      const ctx = { params, body: {}, query: Object.fromEntries(url.searchParams), ip: from.ip, ipKey: ipBucket(from.ip), client: String(req.headers['x-kea-client'] || req.headers['user-agent'] || '').slice(0, 120), token: bearer || cookieToken, origin: `${secure ? 'https' : 'http'}://${String(req.headers.host || 'localhost').replace(/[^\w.:[\]-]/g, '')}` };
+      // Who it is comes first: nothing is read from a request body until the sign-in checks out.
       if (r.auth) {
         if (!ctx.token) throw new HttpError(401, 'Sign in first.');
         const s = h.get('SELECT * FROM sessions WHERE token_hash = ?', sha(ctx.token));
@@ -1778,6 +1951,15 @@ export function createHub({
           const ts = termsStatus(me.id);
           if (ts.needsAgreement) throw new HttpError(428, 'The Kea terms have changed. Read what changed and agree to keep using Kea.', { termsRequired: true, ...ts });
         }
+      }
+      if (req.method === 'POST') {
+        let max = ctx.me ? MAX_BODY : PRE_AUTH_BODY;
+        const relay = RELAY_RESULT.exec(url.pathname);
+        if (relay && ctx.me && h.get("SELECT 1 FROM scan_jobs WHERE id = ? AND account_id = ? AND status = 'running'", decodeURIComponent(relay[1]), ctx.me.id)) max = RELAY_RESULT_BODY;
+        const raw = await readBody(req, max);
+        let body = {};
+        if (raw.trim()) { try { body = JSON.parse(raw); } catch { bad('Invalid JSON.'); } }
+        ctx.body = V.obj(body);
       }
       if (fileRoute) return await handleFile(req, res, ctx, decodeURIComponent(fileMatch[1]), t0);
       let out = await r.handler(ctx);
@@ -1798,6 +1980,8 @@ export function createHub({
       else { status = 500; payload = { error: 'Something went wrong on the Hub.' }; console.error(e); }
     }
     if (status === 429 && payload?.retryAfter) res.setHeader('retry-after', String(payload.retryAfter));
+    // Refused before its body was read (or while reading it): answer and close, rather than taking in the rest.
+    if (!req.complete) res.setHeader('connection', 'close');
     send(res, status, payload, cookies);
     if (log) console.log(`${new Date().toISOString()} ${req.method} ${url.pathname} ${status} ${Date.now() - t0}ms`);
   }
@@ -1858,15 +2042,23 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
   function checkPath(p) {
     if (p.length > 500) bad('That path is too long.');
     const parts = p.split('/');
-    if (parts.length > 12 || parts.some((s) => !SEGMENT.test(s) || s === '.' || s === '..' || s.trim() !== s)) bad('That file path has characters Kea storage does not allow.');
+    if (parts.length > 12 || parts.some((s) => !SEGMENT.test(s) || s === '.' || s === '..' || s.trim() !== s || !plainDecoded(s))) bad('That file path has characters Kea storage does not allow.');
     return parts.join('/');
   }
-  const readRaw = (req, max) => new Promise((resolve, reject) => {
-    let size = 0; const chunks = [];
-    req.on('data', (c) => { size += c.length; if (size > max) { reject(new HttpError(413, `Files can be at most ${Math.round(max / 1024 ** 2)} MB.`)); req.destroy(); } else chunks.push(c); });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
+  const readFileBody = (req, max) => readRaw(req, max, `Files can be at most ${Math.round(max / 1024 ** 2)} MB.`);
+  /**
+   * Kea writes characters the Hub doesn't allow in names as ~<hex>~ and turns them back when it saves the file
+   * (electron/scholar/hubsync.cjs, decodeSeg). A stored name must still be a plain name after that: not "." or "..",
+   * no / \ or :, no control characters, not a Windows device name (CON, NUL, COM1, ...).
+   */
+  function plainDecoded(seg) {
+    let d = seg;
+    if (seg.includes('~')) { try { d = seg.replace(/~([0-9a-f]+)~/g, (_, x) => String.fromCodePoint(parseInt(x, 16))); } catch { return false; } }
+    if (!d || d === '.' || d === '..' || d.trim() === '' ) return false;
+    if (/[\\/:\x00-\x1f\x7f]/.test(d)) return false;
+    if (/^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\$|conout\$)(\..*)?$/i.test(d)) return false;
+    return true;
+  }
   const etagVersion = (v) => { const m = /^"?(\d+)"?$/.exec(String(v ?? '').trim()); return m ? Number(m[1]) : null; };
 
   async function handleFile(req, res, ctx, rawPath, t0) {
@@ -1900,16 +2092,23 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
       return done(200, { ok: true });
     }
     // PUT
-    const data = await readRaw(req, maxFileBytes);
-    const used = usedBy(me.id) - (row?.size ?? 0);
     const quota = quotaOf(me);
     // Full (or over, after a limit went down): nothing is deleted, and a file can still be replaced by one no bigger.
-    if (used + data.length > quota && data.length > (row?.size ?? 0)) {
-      const all = used + (row?.size ?? 0);
-      throw new HttpError(507, all > quota
-        ? `Your Kea storage is over its limit: ${fmtBytes(all)} of ${fmtBytes(quota)}. Nothing has been deleted, but new files wait until you’re under the limit. Delete some files to make room.`
-        : `Your Kea storage is full (${fmtBytes(quota)}). Delete some files to make room.`, { used: all, quota, storageFull: true });
-    }
+    // `before` is the size of the file being replaced (0 for a new one). Checked once before writing anything, and
+    // again inside the database transaction, so uploads running at the same time can't all fit under one limit.
+    const checkRoom = (size, before) => {
+      const used = usedBy(me.id) - before;
+      if (used + size > quota && size > before) {
+        const all = used + before;
+        throw new HttpError(507, all > quota
+          ? `Your Kea storage is over its limit: ${fmtBytes(all)} of ${fmtBytes(quota)}. Nothing has been deleted, but new files wait until you’re under the limit. Delete some files to make room.`
+          : `Your Kea storage is full (${fmtBytes(quota)}). Delete some files to make room.`, { used: all, quota, storageFull: true });
+      }
+    };
+    const declared = Number(req.headers['content-length']);
+    if (Number.isFinite(declared) && declared <= maxFileBytes) checkRoom(declared, row?.size ?? 0);
+    const data = await readFileBody(req, maxFileBytes);
+    checkRoom(data.length, row?.size ?? 0);
     try { const fs = statfsSync(storageDir); if (fs.bavail * fs.bsize - data.length < minFreeBytes) throw new HttpError(507, "The Kea Hub's drive is nearly full. Try again later."); } catch (e) { if (e instanceof HttpError) throw e; }
     const blob = randomUUID();
     const dir = join(storageDir, me.id);
@@ -1921,8 +2120,9 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
     try {
       h.tx(() => {
         // Re-check inside the transaction so two simultaneous writes can't both win.
-        const cur = h.get('SELECT version FROM files WHERE account_id = ? AND path = ?', me.id, path);
+        const cur = h.get('SELECT version, size FROM files WHERE account_id = ? AND path = ?', me.id, path);
         if ((cur?.version ?? 0) !== (row?.version ?? 0)) conflict();
+        checkRoom(data.length, cur?.size ?? 0);
         h.run('INSERT INTO files (account_id,path,blob,size,version,sha256,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(account_id,path) DO UPDATE SET blob=excluded.blob, size=excluded.size, version=excluded.version, sha256=excluded.sha256, updated_at=excluded.updated_at',
           me.id, path, blob, data.length, version, hash, now());
       });
@@ -1944,7 +2144,7 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
       const { r, params } = own.find(req.method, url.pathname);
       let body = {}, raw = null;
       if (req.method === 'POST') { const text = await readBody(req); if (text.trim()) { try { body = JSON.parse(text); } catch { bad('Invalid JSON.'); } } body = V.obj(body); }
-      if (req.method === 'PUT') raw = await readRaw(req, maxFileBytes);
+      if (req.method === 'PUT') raw = await readFileBody(req, maxFileBytes);
       payload = await r.handler({ params, body, raw, query: Object.fromEntries(url.searchParams) });
       if (payload && payload.__raw) {
         res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': payload.__raw.length, 'cache-control': 'no-store', ...payload.headers });
@@ -1962,7 +2162,14 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
   const apiServer = http.createServer(wrap(handleApi));
   const ownerServer = http.createServer(wrap(handleOwner));
   apiServer.headersTimeout = 15_000; apiServer.requestTimeout = 120_000;
-  const listenOn = (srv, port) => new Promise((resolve) => srv.listen(port, HOST, () => resolve(srv.address().port)));
+  // The owner console is local only, but a stuck or slow client still shouldn't hold it open. (Large worker uploads
+  // are 64 MB at most over loopback, so two minutes is plenty.)
+  ownerServer.headersTimeout = 15_000; ownerServer.requestTimeout = 120_000;
+  const listenOn = (srv, port) => new Promise((resolve) => srv.listen(port, HOST, () => {
+    const a = srv.address();
+    if (srv === apiServer && !ipHeader && !isLoopback(a.address)) warnIp('exposed', IP_WARN.exposed);
+    resolve(a.port);
+  }));
 
   return {
     h, key, ownerKey: ownerKey.toString(),

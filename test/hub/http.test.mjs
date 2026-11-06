@@ -52,8 +52,11 @@ async function agreement() {
 }
 async function register(email, name = 'Test Person', password = 'lantern velvet orbit', extra = {}) {
   const r = await call('POST', '/v1/auth/register', null, { email, password, displayName: name, age13: true, ...(await agreement()), ...extra }, freshIp());
-  assert.equal(r.status, 201, JSON.stringify(r.body));
-  return r.body.token;
+  assert.equal(r.status, 202, JSON.stringify(r.body));
+  assert.equal(r.body.token, undefined, 'making an account never signs in by itself');
+  const s = await call('POST', '/v1/auth/login', null, { email, password }, freshIp());
+  assert.equal(s.status, 200, JSON.stringify(s.body));
+  return s.body.token;
 }
 
 test('health and keys are public; the rest needs a session', async () => {
@@ -64,7 +67,7 @@ test('health and keys are public; the rest needs a session', async () => {
   assert.equal((await call('GET', '/v1/me', 'not-hex')).status, 401);
 });
 
-test('register: validation, age gate, weak password, duplicate email', async () => {
+test('register: validation, age gate, weak password; a taken email answers exactly like a new one', async () => {
   const ag = await agreement();
   const bad = (b) => call('POST', '/v1/auth/register', null, { email: 'a@b.co', password: 'lantern velvet orbit', displayName: 'A', age13: true, ...ag, ...b }, freshIp());
   assert.equal((await bad({ email: 'nope' })).status, 400);
@@ -75,7 +78,16 @@ test('register: validation, age gate, weak password, duplicate email', async () 
   const partial = await bad({ termsSections: ag.termsSections.slice(1) });
   assert.deepEqual([partial.status, partial.body.missing], [400, [ag.termsSections[0]]]);
   await register('dup@example.com');
-  assert.equal((await call('POST', '/v1/auth/register', null, { email: 'DUP@example.com', password: 'lantern velvet orbit', displayName: 'B', age13: true, ...ag }, freshIp())).status, 409);
+  const reg = (email, password) => call('POST', '/v1/auth/register', null, { email, password, displayName: 'B', age13: true, ...ag }, freshIp());
+  const taken = await reg('DUP@example.com', 'harbor maple quill');
+  const fresh = await reg('brand-new@example.com', 'harbor maple quill');
+  assert.deepEqual([taken.status, taken.body], [fresh.status, fresh.body], 'nothing tells a taken email apart');
+  assert.equal(taken.status, 202);
+  assert.equal(taken.headers.get('set-cookie'), null, 'no session either way');
+  // The new one signs in; the taken one only with its owner's password, and its owner is unaffected.
+  assert.equal((await call('POST', '/v1/auth/login', null, { email: 'brand-new@example.com', password: 'harbor maple quill' }, freshIp())).status, 200);
+  assert.equal((await call('POST', '/v1/auth/login', null, { email: 'dup@example.com', password: 'harbor maple quill' }, freshIp())).status, 401);
+  assert.equal((await call('POST', '/v1/auth/login', null, { email: 'dup@example.com', password: 'lantern velvet orbit' }, freshIp())).status, 200);
 });
 
 test('login: right password works, wrong is generic, unknown email looks identical, lockout doubles', async () => {
@@ -86,19 +98,74 @@ test('login: right password works, wrong is generic, unknown email looks identic
   const wrong = await call('POST', '/v1/auth/login', null, { email: 'learner@example.com', password: 'nope nope nope' }, freshIp());
   const ghost = await call('POST', '/v1/auth/login', null, { email: 'ghost@example.com', password: 'nope nope nope' }, freshIp());
   assert.deepEqual([wrong.status, wrong.body], [ghost.status, ghost.body]);
-  // Four more wrong tries (5 total) -> locked, even with the right password, even from new IPs.
-  for (let i = 0; i < 4; i++) await call('POST', '/v1/auth/login', null, { email: 'learner@example.com', password: 'nope nope nope' }, freshIp());
-  const locked = await call('POST', '/v1/auth/login', null, { email: 'learner@example.com', password: 'lantern velvet orbit' }, freshIp());
+  // Five wrong tries from one address -> that address is locked, even with the right password.
+  const attacker = { 'x-test-ip': '198.18.0.66' };
+  for (let i = 0; i < 5; i++) await call('POST', '/v1/auth/login', null, { email: 'learner@example.com', password: 'nope nope nope' }, attacker);
+  const locked = await call('POST', '/v1/auth/login', null, { email: 'learner@example.com', password: 'lantern velvet orbit' }, attacker);
   assert.equal(locked.status, 429);
   assert.ok(locked.body.retryAfter >= 1);
-  // Unknown emails lock the same way, so a lock reveals nothing.
-  for (let i = 0; i < 5; i++) await call('POST', '/v1/auth/login', null, { email: 'ghost@example.com', password: 'x' }, freshIp());
-  assert.equal((await call('POST', '/v1/auth/login', null, { email: 'ghost@example.com', password: 'x' }, freshIp())).status, 429);
-  // Time passes -> the right password works and clears the count.
-  clock += 60_000;
+  // ...but the account's owner, somewhere else, still signs in.
   assert.equal((await call('POST', '/v1/auth/login', null, { email: 'learner@example.com', password: 'lantern velvet orbit' }, freshIp())).status, 200);
+  assert.equal((await call('POST', '/v1/auth/login', null, { email: 'learner@example.com', password: 'lantern velvet orbit' }, attacker)).status, 429, 'still locked there');
+  // Unknown emails lock the same way, so a lock reveals nothing.
+  const ghostIp = { 'x-test-ip': '198.18.0.67' };
+  for (let i = 0; i < 5; i++) await call('POST', '/v1/auth/login', null, { email: 'ghost@example.com', password: 'x' }, ghostIp);
+  assert.equal((await call('POST', '/v1/auth/login', null, { email: 'ghost@example.com', password: 'x' }, ghostIp)).status, 429);
+  // Time passes -> the right password works there too.
+  clock += 60_000;
+  assert.equal((await call('POST', '/v1/auth/login', null, { email: 'learner@example.com', password: 'lantern velvet orbit' }, attacker)).status, 200);
   // The owner console can unlock too.
   assert.equal((await owner('POST', '/owner/accounts/learner@example.com/unlock')).status, 200);
+});
+
+test('guessing one password from many addresses is still bounded; Google and two-step sign-in still get through', async () => {
+  await register('target@example.com', 'Tara Target');
+  const guess = (ip, extra = {}) => call('POST', '/v1/auth/login', null, { email: 'target@example.com', password: 'wrong guess here', ...extra }, { 'x-test-ip': ip });
+  // 4 tries from each of 13 addresses (each stays under its own lock): 52 failures from 13 places.
+  for (let n = 0; n < 13; n++) for (let i = 0; i < 4; i++) await guess(`198.19.${n}.1`);
+  // Now the name is locked everywhere for a short while: even a brand-new address can't try.
+  const r = await guess('198.19.200.1');
+  assert.deepEqual([r.status, /many places/.test(r.body.error)], [429, true]);
+  // The real owner without two-step: the same short lock (a guess and a right password look alike).
+  const own = await call('POST', '/v1/auth/login', null, { email: 'target@example.com', password: 'lantern velvet orbit' }, freshIp());
+  assert.equal(own.status, 429);
+  assert.ok(own.body.retryAfter <= 5 * 60, 'the everywhere-lock is short');
+  // Sign in with Google is never blocked by it.
+  assert.equal((await call('POST', '/v1/auth/google', null, { idToken: googleToken({ email: 'target@example.com', sub: 'g-target' }) }, freshIp())).status, 200);
+  // Once it runs out, one more failure locks it again at once: tries stay rare however many addresses are used.
+  clock += 5 * 60_000 + 1000;
+  assert.equal((await guess('198.19.201.1')).status, 401, 'one try once the lock runs out');
+  assert.equal((await guess('198.19.202.1')).status, 429, 'and locked again right away');
+  clock += 5 * 60_000 + 1000;
+
+  // With two-step sign-in on, a correct password and a correct code still get in during the lock.
+  const t = await call('POST', '/v1/auth/login', null, { email: 'target@example.com', password: 'lantern velvet orbit' }, freshIp());
+  assert.equal(t.status, 200);
+  const s = await call('POST', '/v1/me/totp/setup', t.body.token);
+  await call('POST', '/v1/me/totp/enable', t.body.token, { code: codeAt(s.body.secret, stepOf(clock)) });
+  clock += 30_000;
+  assert.equal((await guess('198.19.203.1')).status, 401); // (and locked again)
+  const noCode = await call('POST', '/v1/auth/login', null, { email: 'target@example.com', password: 'lantern velvet orbit' }, freshIp());
+  assert.equal(noCode.status, 429, 'no code: just the lock, no "code needed" hint');
+  const wrongPw = await call('POST', '/v1/auth/login', null, { email: 'target@example.com', password: 'nope nope nope', code: codeAt(s.body.secret, stepOf(clock)) }, freshIp());
+  assert.equal(wrongPw.status, 429, 'a wrong password with a right code looks the same');
+  const both = await call('POST', '/v1/auth/login', null, { email: 'target@example.com', password: 'lantern velvet orbit', code: codeAt(s.body.secret, stepOf(clock)) }, freshIp());
+  assert.equal(both.status, 200);
+  assert.equal((await owner('POST', '/owner/accounts/target@example.com/unlock')).status, 200);
+});
+
+test('two-step: a right password without a code counts toward the lock like a wrong one', async () => {
+  const t = await register('oracle@example.com');
+  const s = await call('POST', '/v1/me/totp/setup', t);
+  await call('POST', '/v1/me/totp/enable', t, { code: codeAt(s.body.secret, stepOf(clock)) });
+  const ip = { 'x-test-ip': '198.18.5.5' };
+  for (let i = 0; i < 5; i++) {
+    const r = await call('POST', '/v1/auth/login', null, { email: 'oracle@example.com', password: 'lantern velvet orbit' }, ip);
+    assert.deepEqual([r.status, r.body.totpRequired], [401, true], 'the code prompt itself stays');
+  }
+  assert.equal((await call('POST', '/v1/auth/login', null, { email: 'oracle@example.com', password: 'lantern velvet orbit' }, ip)).status, 429, 'testing passwords this way is throttled too');
+  clock += 30_000;
+  assert.equal((await call('POST', '/v1/auth/login', null, { email: 'oracle@example.com', password: 'lantern velvet orbit', code: codeAt(s.body.secret, stepOf(clock)) }, freshIp())).status, 200);
 });
 
 test('a faked forwarded address does not escape the per-IP limit', async () => {
@@ -235,8 +302,9 @@ test('classes end to end: invite, join, calendar, study, scoring, leaderboard, p
   assert.deepEqual([r.body.correct, r.body.points], [true, POINTS.newFirstTry]);
   r = await ans(s1, q1, 1);
   assert.deepEqual([r.body.points, r.body.scoring], [0, false], 'repeat is practice only');
+  // A wrong answer while it scores: just "wrong, it comes back" (no answer key to collect).
   r = await ans(s1, q2, 1);
-  assert.deepEqual([r.body.correct, r.body.answer, r.body.points], [false, 0, 0]);
+  assert.deepEqual([r.body.correct, r.body.answer, r.body.why, r.body.again, r.body.points], [false, undefined, undefined, true, 0]);
   r = await ans(s1, q2, 0);
   assert.equal(r.body.points, POINTS.afterMiss, 'brute force still earns a little');
   r = await ans(s2, q1, 1);
@@ -361,8 +429,14 @@ test('shared Claude: verified only, classmates share one scan, batches of 25, li
   // A queues the first scan of the course; B (same section, typed differently) joins it instead of a second run.
   const qa = await call('POST', '/v1/scan', a, { kind: 'initial_scan', course });
   assert.deepEqual([qa.status, qa.body.status, qa.body.job.position], [200, 'queued', 0]);
+  // (Knowing the course isn't enough: A, already in the section, lets B in.)
   const jb = await call('POST', '/v1/scan', b, { kind: 'initial_scan', course: { ...course, code: 'chem-1110' } });
-  assert.equal(jb.body.status, 'joined');
+  assert.equal(jb.body.status, 'pending');
+  const askB = (await call('GET', '/v1/course-sections/requests', a)).body.incoming;
+  assert.deepEqual(askB.map((r) => r.name), ['Test Person']);
+  assert.equal((await call('GET', '/v1/me/notifications', a)).body.notifications[0].kind, 'course_join');
+  assert.equal((await call('POST', `/v1/course-sections/requests/${askB[0].id}/decide`, b, { approve: true })).status, 404, 'not by the one asking');
+  assert.equal((await call('POST', `/v1/course-sections/requests/${askB[0].id}/decide`, a, { approve: true })).body.request.status, 'approved');
   assert.equal((await call('POST', '/v1/scan', a, { kind: 'initial_scan', course })).body.code, 'already_scanned');
   assert.equal((await call('POST', '/v1/scan', a, { kind: 'regenerate', course })).body.code, 'no_regenerate');
 
@@ -395,10 +469,14 @@ test('shared Claude: verified only, classmates share one scan, batches of 25, li
   assert.equal((await putOwner(`/owner/scan/${jobId}/course-file?path=late.md`, 'x')).status, 404, 'no writes after the job ends');
   assert.equal((await call('GET', '/v1/files?prefix=kea-results/', b)).body.files[0].path, 'kea-results/guides.json');
 
-  const sc = await call('POST', '/v1/scan', c, { kind: 'initial_scan', course });
-  assert.equal(sc.body.status, 'shared');
-  assert.equal(sc.body.allowance.today, 0, 'sharing costs nothing');
   const key = next.body.job.course;
+  const sc = await call('POST', '/v1/scan', c, { kind: 'initial_scan', course });
+  assert.equal(sc.body.status, 'pending');
+  assert.equal(sc.body.allowance.today, 0, 'sharing costs nothing');
+  assert.equal((await call('GET', `/v1/course-files?course=${encodeURIComponent(key)}`, c)).status, 404, 'nothing until someone lets them in');
+  const askC = (await call('GET', '/v1/course-sections/requests', b)).body.incoming;
+  assert.equal((await call('POST', `/v1/course-sections/requests/${askC[0].id}/decide`, b, { approve: true })).status, 200, 'anyone in the section can');
+  assert.equal((await call('GET', '/v1/me/notifications', c)).body.notifications[0].title.startsWith('You’re in'), true);
   const cf = await call('GET', `/v1/course-files?course=${encodeURIComponent(key)}`, c);
   assert.deepEqual(cf.body.files.map((f) => f.path), ['textbook/ch01.md']);
   const ch = await fetch(`${base}/v1/course-file?course=${encodeURIComponent(key)}&path=textbook/ch01.md`, { headers: { authorization: `Bearer ${c}` } });
@@ -612,7 +690,12 @@ test('course material: a question batch reaches everyone who asked; classmates w
   // A asks for 25 more on Ch 4; B (same section) joins. Each says where their Kea's folder is.
   const qa = await call('POST', '/v1/scan', a, { kind: 'more_questions', course, chapter: 'Ch 4', target: 'kea/Kea/School/', detail: { courseCode: 'BIO 2010', chapter: 'Ch 4' } });
   assert.equal(qa.body.status, 'queued');
-  assert.equal((await call('POST', '/v1/scan', b, { kind: 'more_questions', course, chapter: 'Ch 4', target: 'kea/Kea/Biology' })).body.status, 'joined');
+  assert.equal((await call('POST', '/v1/scan', b, { kind: 'more_questions', course, chapter: 'Ch 4', target: 'kea/Kea/Biology' })).body.code, 'not_in_section');
+  const code = (await call('POST', '/v1/course-sections/code', a, { course })).body.code;
+  assert.match(code, /^[A-HJ-NP-Z2-9]{10}$/);
+  assert.equal((await call('POST', '/v1/course-sections/code', b, { course })).status, 404, 'only people in the section see its code');
+  assert.equal((await call('POST', '/v1/scan', b, { kind: 'more_questions', course, chapter: 'Ch 4', target: 'kea/Kea/Biology', joinCode: 'AAAAAAAAAA' })).status, 404);
+  assert.equal((await call('POST', '/v1/scan', b, { kind: 'more_questions', course, chapter: 'Ch 4', target: 'kea/Kea/Biology', joinCode: code.toLowerCase() })).body.status, 'joined');
   const jobId = qa.body.job.id;
   await runUntil(jobId);
   const info = await owner('GET', `/owner/scan/${jobId}`);
@@ -631,8 +714,10 @@ test('course material: a question batch reaches everyone who asked; classmates w
   const course2 = { ...course, code: 'BIO 2020' };
   assert.equal((await putMine(d, 'kea/Kea/Dee/Devices/primary.json', '{"id":"d1"}')).status, 201);
   const sc = await call('POST', '/v1/scan', c, { kind: 'initial_scan', course: course2, target: 'kea/Kea/School/' });
-  assert.equal((await call('POST', '/v1/scan', d, { kind: 'initial_scan', course: course2 })).body.status, 'joined');
+  assert.equal((await call('POST', '/v1/scan', d, { kind: 'initial_scan', course: course2 })).body.status, 'pending');
   const scanId = sc.body.job.id;
+  const askD = (await call('GET', '/v1/course-sections/requests', c)).body.incoming[0];
+  await call('POST', `/v1/course-sections/requests/${askD.id}/decide`, c, { approve: true });
   await putMine(c, `scan-inbox/${scanId}/job.json`, '{}');
   await call('POST', `/v1/scan/${scanId}/ready`, c);
   await runUntil(scanId);
@@ -642,11 +727,20 @@ test('course material: a question batch reaches everyone who asked; classmates w
   assert.equal((await call('GET', '/v1/files?prefix=kea/Kea/School/Shared/', c)).body.files.length, 0);
 
   // Someone in the section later: shared at once, material included, no Claude.
-  const sh = await call('POST', '/v1/scan', a, { kind: 'initial_scan', course: course2, target: 'kea/Kea/School/' });
+  const code2 = (await call('POST', '/v1/course-sections/code', d, { course: course2 })).body.code;
+  // Asking without the code: a request (once; no new notices for each try); a "no" holds for a day.
+  const ask = await call('POST', '/v1/scan', a, { kind: 'initial_scan', course: course2, target: 'kea/Kea/School/' });
+  assert.equal(ask.body.status, 'pending');
+  assert.equal((await call('POST', '/v1/scan', a, { kind: 'initial_scan', course: course2 })).body.request.id, ask.body.request.id);
+  await call('POST', `/v1/course-sections/requests/${ask.body.request.id}/decide`, d, { approve: false });
+  assert.equal((await call('POST', '/v1/scan', a, { kind: 'initial_scan', course: course2 })).body.status, 'declined');
+  assert.equal(await readMine(a, 'kea/Kea/School/Shared/Textbooks/BIO 2020/Chapter 1.pdf'), '{"error":"No such file."}');
+  // With the code: in at once, material included, no Claude.
+  const sh = await call('POST', '/v1/scan', a, { kind: 'initial_scan', course: course2, target: 'kea/Kea/School/', joinCode: code2 });
   assert.deepEqual([sh.body.status, sh.body.delivered], ['shared', 1]);
   assert.equal(await readMine(a, 'kea/Kea/School/Shared/Textbooks/BIO 2020/Chapter 1.pdf'), '%PDF chapter one');
   // A failed job delivers nothing.
-  const qf = await call('POST', '/v1/scan', d, { kind: 'more_questions', course, chapter: 'Ch 9', target: 'kea/Kea/Dee/' });
+  const qf = await call('POST', '/v1/scan', b, { kind: 'more_questions', course, chapter: 'Ch 9', target: 'kea/Kea/Biology/' });
   await runUntil(qf.body.job.id);
   await putOwnerFile(`/owner/scan/${qf.body.job.id}/course-file?path=material/questions/exam-bad.json`, '{}');
   assert.equal((await owner('POST', `/owner/scan/${qf.body.job.id}/finish`, { ok: false, note: 'Claude stopped' })).body.delivered, 0);

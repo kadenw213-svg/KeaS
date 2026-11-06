@@ -34,7 +34,8 @@ const owner = async (method, path, body) => {
 const ok = (r, status = 200) => { assert.equal(r.status, status, JSON.stringify(r.body)); return r.body; };
 async function person(email, name, extra = {}) {
   const t = (await call('GET', '/v1/terms')).body.terms;
-  const r = ok(await call('POST', '/v1/auth/register', null, { email, password: 'lantern velvet orbit', displayName: name, age13: true, birthYear: 1995, termsVersion: t.version, termsSections: t.sections.map((s) => s.id), ...extra }, freshIp()), 201);
+  ok(await call('POST', '/v1/auth/register', null, { email, password: 'lantern velvet orbit', displayName: name, age13: true, birthYear: 1995, termsVersion: t.version, termsSections: t.sections.map((s) => s.id), ...extra }, freshIp()), 202);
+  const r = ok(await call('POST', '/v1/auth/login', null, { email, password: 'lantern velvet orbit' }, freshIp()));
   ok(await owner('POST', `/owner/accounts/${r.account.id}`, { emailVerified: true }));
   return { token: r.token, id: r.account.id, name, email };
 }
@@ -148,7 +149,8 @@ test('the standard size is 5 GB, and a Hub that ran with 25 GB tells people when
     let h2 = createHub({ dataDir: d, log: false, minFreeBytes: 0 });
     const p = await h2.listen({ port: 0, ownerPort: 0 });
     const t = (await (await fetch(`http://127.0.0.1:${p.port}/v1/terms`)).json()).terms;
-    const reg = await (await fetch(`http://127.0.0.1:${p.port}/v1/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: 'old@example.com', password: 'lantern velvet orbit', displayName: 'Old', age13: true, termsVersion: t.version, termsSections: t.sections.map((s) => s.id) }) })).json();
+    await fetch(`http://127.0.0.1:${p.port}/v1/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: 'old@example.com', password: 'lantern velvet orbit', displayName: 'Old', age13: true, termsVersion: t.version, termsSections: t.sections.map((s) => s.id) }) });
+    const reg = await (await fetch(`http://127.0.0.1:${p.port}/v1/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: 'old@example.com', password: 'lantern velvet orbit' }) })).json();
     const me = await (await fetch(`http://127.0.0.1:${p.port}/v1/me`, { headers: { authorization: `Bearer ${reg.token}` } })).json();
     assert.equal(me.storage.quota, 5 * GB);
     assert.equal(me.storage.standard, 5 * GB);
@@ -414,7 +416,10 @@ test('notifications for existing events: org approved, join approved, sign-off d
     assert.equal((await put(p.token, 'kea/Kea/School/Devices/pc.json', '{}')).status, 201);
   }
   const ja = ok(await call('POST', '/v1/scan', a.token, { kind: 'more_questions', course, chapter: 'Ch 3', detail: { courseCode: 'HIS 101' } }));
-  assert.equal(ok(await call('POST', '/v1/scan', b.token, { kind: 'more_questions', course, chapter: 'Ch 3' })).status, 'joined');
+  // (B gets into the section with the code A shares.)
+  assert.equal((await call('POST', '/v1/scan', b.token, { kind: 'more_questions', course, chapter: 'Ch 3' })).body.code, 'not_in_section');
+  const sectionCode = ok(await call('POST', '/v1/course-sections/code', a.token, { course })).code;
+  assert.equal(ok(await call('POST', '/v1/scan', b.token, { kind: 'more_questions', course, chapter: 'Ch 3', joinCode: sectionCode })).status, 'joined');
   let next = ok(await owner('POST', '/owner/scan/next')).job;
   while (next && next.id !== ja.job.id) { ok(await owner('POST', `/owner/scan/${next.id}/finish`, { ok: false, note: 'skip' })); next = ok(await owner('POST', '/owner/scan/next')).job; }
   await fetch(`${ownerBase}/owner/scan/${ja.job.id}/course-file?path=material/questions/ch3.json`, { method: 'PUT', headers: { 'x-kea-owner-key': hub.ownerKey }, body: '[]' });

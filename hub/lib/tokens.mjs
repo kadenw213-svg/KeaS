@@ -4,15 +4,16 @@
 import { createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify, createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { writeSecretFile } from './secureFile.mjs';
 
 const enc = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
 
-/** Loads the Hub key from `file`, creating it the first time. (On Windows the data folder is the protection; DPAPI wrapping comes with the installer.) */
+/** Loads the Hub key from `file`, creating it the first time. (Readable by the Hub's own account only: hub/lib/secureFile.mjs.) */
 export function loadOrCreateKey(file) {
   if (!existsSync(file)) {
     mkdirSync(dirname(file), { recursive: true });
     const { privateKey } = generateKeyPairSync('ed25519');
-    writeFileSync(file, privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600 });
+    writeSecretFile(file, privateKey.export({ type: 'pkcs8', format: 'pem' }));
   }
   const privateKey = createPrivateKey(readFileSync(file));
   const publicKey = createPublicKey(privateKey);

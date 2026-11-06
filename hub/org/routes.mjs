@@ -9,6 +9,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ORG_SCHEMA } from './schema.mjs';
+import { checkNoPayroll, PAYROLL_MESSAGE } from './payroll.mjs';
 import {
   isDate, isTime, toMin, nextMonth, datesIn, expandSlots, prefillUsual, prefillFrom, usualFromAnswers, cleanAnswers, hoursMarked,
   needOf, needTotal, autofill, sheetsExport, longExport, certStage, addMonths, sortTodo, fmtRange, DAY_NAMES, daysUntil,
@@ -35,24 +36,14 @@ export const ORG_DEFAULTS = {
   ruleOverrides: {},
   membersSeeSchedule: true,
 };
-// Keys are split into words first ("bankAccount" -> "bank account"), so "assigned" or "waiting" never match.
-const PAYROLL_WORDS = /\b(ssns?|itin|iban|swift|paychecks?|social security( numbers?)?|tax ids?|routing( numbers?)?|bank (accounts?|details|numbers?|info)|account numbers?|acct (no|num|numbers?)|w ?4s?|direct deposits?|pay runs?|payruns?)\b/;
-const keyWords = (k) => String(k).replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).join(' ');
-
 export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, bad, forbidden, notFound, rawOut, notify = () => {}, extrasFor = () => ({}) }) {
   h.db.exec(ORG_SCHEMA);
   const id = () => randomUUID();
   const J = (s, d) => { try { return s == null ? d : JSON.parse(s); } catch { return d; } };
   const today = (tz) => localDate(now(), tz);
 
-  /** Refuse payroll details anywhere in a request body. */
-  const noPayroll = (v, depth = 0) => {
-    if (!v || typeof v !== 'object' || depth > 6) return;
-    for (const [k, x] of Object.entries(v)) {
-      if (PAYROLL_WORDS.test(keyWords(k))) bad("Payroll details (SSNs, bank accounts, pay runs) stay in the payroll vault on the payroll admin's PC. They are never stored on the Kea Hub.");
-      noPayroll(x, depth + 1);
-    }
-  };
+  /** Refuse payroll details anywhere in a request body (./payroll.mjs). */
+  const noPayroll = (v) => checkNoPayroll(v, () => bad(PAYROLL_MESSAGE), () => { throw new HttpError(413, 'That request is too big to check. Send less at a time.'); });
   // Every org route goes through here: payroll guard first.
   const OR = (method, path, fn, opts) => R(method, path, (ctx) => { noPayroll(ctx.body); return fn(ctx); }, opts);
 

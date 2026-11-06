@@ -35,7 +35,8 @@ const owner = async (method, path, body) => {
 const ok = (r, status = 200) => { assert.equal(r.status, status, JSON.stringify(r.body)); return r.body; };
 async function person(email, name, { verified = true } = {}) {
   const t = (await call('GET', '/v1/terms')).body.terms;
-  const r = ok(await call('POST', '/v1/auth/register', null, { email, password: 'lantern velvet orbit', displayName: name, age13: true, termsVersion: t.version, termsSections: t.sections.map((s) => s.id) }, freshIp()), 201);
+  ok(await call('POST', '/v1/auth/register', null, { email, password: 'lantern velvet orbit', displayName: name, age13: true, termsVersion: t.version, termsSections: t.sections.map((s) => s.id) }, freshIp()), 202);
+  const r = ok(await call('POST', '/v1/auth/login', null, { email, password: 'lantern velvet orbit' }, freshIp()));
   if (verified) ok(await owner('POST', `/owner/accounts/${r.account.id}`, { emailVerified: true }));
   return { token: r.token, id: r.account.id, name };
 }
@@ -139,8 +140,18 @@ test('payroll details are refused anywhere on the Hub', async () => {
     assert.equal(r.status, 400, JSON.stringify(body));
     assert.match(r.body.error, /payroll vault/);
   }
-  // Ordinary words that merely contain those letters are fine.
-  ok(await call('POST', `/v1/orgs/${pool.id}/members/${ana.id}`, ana.token, { prefs: ['waiting', 'assigned'] }));
+  // Disguised keys, values shaped like an SSN or bank details, and payroll hidden deep down are refused too.
+  let deep = { ssn: 'x' };
+  for (let i = 0; i < 40; i++) deep = { a: deep };
+  for (const body of [{ 'ѕѕn': 'x' }, { 'ｓｓｎ': 'x' }, { 's.s.n': 'x' }, { 'ΒankΑccount': 'x' }, { note: 'my ssn is 123-45-6789' }, { note: '123456789' }, { note: 'routing 102000021 acct 12345678' }, deep]) {
+    const r = await call('POST', `/v1/orgs/${pool.id}/members/${ana.id}`, ana.token, body);
+    assert.equal(r.status, 400, JSON.stringify(body).slice(0, 80));
+  }
+  // A body too big to check is refused, not waved through.
+  const wide = { list: Array.from({ length: 30_000 }, (_, i) => i) };
+  assert.equal((await call('POST', `/v1/orgs/${pool.id}/members/${ana.id}`, ana.token, wide)).status, 413);
+  // Ordinary words that merely contain those letters are fine, and so are phone numbers and dates.
+  ok(await call('POST', `/v1/orgs/${pool.id}/members/${ana.id}`, ana.token, { prefs: ['waiting', 'assigned'], className: 'x', note: 'call 719-555-0134 on 2026-12-01' }));
 });
 
 test('structure: department tree of any depth, no cycles, positions, locations, cost centers', async () => {
