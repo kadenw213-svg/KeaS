@@ -37,6 +37,24 @@ web/            the workforce web app (Vite + React), served by the workforce se
 test/           node:test suites for the Hub and the workforce server
 ```
 
+## The payroll vault
+
+- **Run it:** in the KeaS app, **Payroll** (tray menu or the status page) starts `server/index.mjs` in vault mode on
+  127.0.0.1 (a free port) and opens it in a KeaS window. Data: `%APPDATA%\KeaS\Payroll\payroll-vault.db` (or
+  `payrollDir` in `keas-config.json`). Without the app: `KEAS_VAULT=1 KEAS_HUB_URL=http://127.0.0.1:4860 KEA_DB=<file> npm run server:dev`.
+- **Encryption:** AES-256-GCM with a key derived from the vault passphrase by scrypt (`server/lib/vault.mjs`). SSNs
+  and addresses (`people.pii_enc`), bank details (`people.deposit`, `orgs.bank`, `legal_entities.bank_enc`), signed
+  forms, I-9 Section 2 and documents are sealed. The key is only in memory while the vault is open; closing the
+  Payroll window stops the server. Changing the passphrase re-encrypts every sealed column.
+- **Sign-in:** the Kea Hub account (the vault relays the password to the Hub once, gets an Ed25519 token for the
+  audience `keas-payroll` and checks it with the Hub's `/v1/keys`) plus the passphrase; a local account
+  (scrypt) works when the Hub can't be reached.
+- **The workforce server** (`npm run dev`) runs the same payroll and HR code on its sample data with its vault opened
+  by a passphrase kept next to the database (`<db>.vaultkey`), so every screen can be tried there.
+- **Code:** `server/payroll/` (one module per area: vault sign-in, approvals, org structure, pay structure, leave,
+  pay run, onboarding, documents and expenses, reports, import, year-end, hiring and performance), screens in
+  `web/src/screens/`, tests in `test/server/payroll.test.mjs` and `test/server/vault.test.mjs`.
+
 ## Payroll rule
 
 A pay run can be finalized only with tax and labor tables verified for that year (`verified` / `verifiedFor` in `shared/`).
