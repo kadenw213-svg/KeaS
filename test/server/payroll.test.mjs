@@ -33,14 +33,14 @@ const login = async (personId) => (await call('POST', '/v1/auth/demo-login', nul
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), 'keas-payroll-test-'));
   // Which year is the last completed period paid in? Build verified tables for exactly that year.
-  const probe = createApp({ dbFile: join(dir, 'probe.db'), log: false, devKeyFile: true });
+  const probe = createApp({ dbFile: join(dir, 'probe.db'), log: false, devKeyFile: true, demo: true });
   const port0 = await probe.listen(0);
   base = `http://127.0.0.1:${port0}`;
   const t = await login('p03');
   const year = (await call('GET', '/v1/payrun/preview', t)).body.year;
   await probe.close();
   verifiedDir = verifiedTables(year);
-  app = createApp({ dbFile: join(dir, 'payroll.db'), log: false, sharedDir: verifiedDir, devKeyFile: true });
+  app = createApp({ dbFile: join(dir, 'payroll.db'), log: false, sharedDir: verifiedDir, devKeyFile: true, demo: true });
   base = `http://127.0.0.1:${await app.listen(0)}`;
 });
 after(async () => { await app?.close(); rmSync(dir, { recursive: true, force: true }); });
@@ -57,7 +57,7 @@ test('SSNs and bank details are sealed at rest', () => {
 });
 
 test('the real tables are unverified, so the real server refuses to finalize', async () => {
-  const real = createApp({ dbFile: join(dir, 'real.db'), log: false, devKeyFile: true });
+  const real = createApp({ dbFile: join(dir, 'real.db'), log: false, devKeyFile: true, demo: true });
   const port = await real.listen(0);
   const saved = base;
   base = `http://127.0.0.1:${port}`;

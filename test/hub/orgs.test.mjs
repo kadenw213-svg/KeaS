@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHub } from '../../hub/index.mjs';
+import { ownerFetch } from '../../hub/lib/ownerauth.mjs';
 
 const DAY = 86400_000;
 let hub, base, ownerBase, dir;
@@ -29,7 +30,7 @@ async function call(method, path, token, body, headers = {}) {
   return { status: r.status, body: json, headers: r.headers };
 }
 const owner = async (method, path, body) => {
-  const r = await fetch(ownerBase + path, { method, headers: { 'content-type': 'application/json', 'x-kea-owner-key': hub.ownerKey }, body: body && JSON.stringify(body) });
+  const r = await ownerFetch(ownerBase, hub.ownerKey, method, path, body);
   return { status: r.status, body: await r.json() };
 };
 const ok = (r, status = 200) => { assert.equal(r.status, status, JSON.stringify(r.body)); return r.body; };
@@ -58,9 +59,11 @@ test('setup: only verified accounts make orgs; new orgs wait for the Hub owner',
   assert.equal(pool.status, 'pending');
   assert.equal(pool.role, 'owner');
   assert.equal((await call('POST', '/v1/orgs', boss.token, { name: 'Bad tz', tz: 'Mars/Olympus' })).status, 400);
-  // A code works only once the org is approved.
-  const early = ok(await call('POST', `/v1/orgs/${pool.id}/codes`, boss.token, { role: 'member' }), 201).code;
-  assert.match((await call('POST', '/v1/orgs/join', ana.token, { code: early.code }, ip())).body.error, /waiting for approval/);
+  // Nothing works until the org is approved: no join codes, no classes (only its own page).
+  const early = await call('POST', `/v1/orgs/${pool.id}/codes`, boss.token, { role: 'member' });
+  assert.deepEqual([early.status, /waiting for approval/.test(early.body.error)], [403, true]);
+  assert.equal((await call('POST', `/v1/orgs/${pool.id}/classes`, boss.token, { title: 'Lifeguard training' })).status, 403);
+  assert.equal(ok(await call('GET', `/v1/orgs/${pool.id}`, boss.token)).org.status, 'pending');
   const list = ok(await owner('GET', '/owner/orgs?status=pending'));
   assert.ok(list.orgs.some((o) => o.id === pool.id && o.creator === 'boss@pool.org'));
   ok(await owner('POST', `/owner/orgs/${pool.id}/decide`, { approve: true }));

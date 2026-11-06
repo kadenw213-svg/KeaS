@@ -18,7 +18,7 @@ before(async () => {
   writeFileSync(join(web, 'assets', 'app-abc123.js'), 'console.log(1)');
   writeFileSync(join(web, 'manifest.webmanifest'), '{"name":"KeaS"}');
   writeFileSync(join(dir, 'secret.txt'), 'outside');
-  app = createApp({ dbFile: join(dir, 'test.db'), webDir: web, log: false, devKeyFile: true });
+  app = createApp({ dbFile: join(dir, 'test.db'), webDir: web, log: false, devKeyFile: true, demo: true });
   port = await app.listen(0);
   base = `http://127.0.0.1:${port}`;
 });

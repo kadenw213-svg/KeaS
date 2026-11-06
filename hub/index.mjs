@@ -6,8 +6,8 @@
 //     also needs the owner key from the Hub's data folder. Becoming an owner is only possible from this PC
 //     (`node hub/owner.mjs make-owner <email>`), never through the API.
 import http from 'node:http';
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, statfsSync } from 'node:fs';
+import { createHash, randomBytes, randomUUID, sign as edSign } from 'node:crypto';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, statfsSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkTerms, diffTerms, sameSections, termsPage } from './lib/terms.mjs';
@@ -17,7 +17,9 @@ import { googleKeys, verifyGoogleIdToken } from './lib/google.mjs';
 import { consentPage, consentCsp } from './lib/consentPage.mjs';
 import { openDb, DATA_DIR } from './db.mjs';
 import { hashPassword, verifyPassword, needsRehash, passwordProblem } from './lib/passwords.mjs';
-import { newSecret, checkCode, otpauthUri } from './lib/totp.mjs';
+import { newSecret, checkCode, otpauthUri, totpKeyFrom, sealSecret, openSecret, isSealed } from './lib/totp.mjs';
+import { ownerNonces, OWNER_AUTH_HEADER } from './lib/ownerauth.mjs';
+import { cleanText, isReservedName } from './lib/names.mjs';
 import { loadOrCreateKey, signToken } from './lib/tokens.mjs';
 import { writeSecretFile } from './lib/secureFile.mjs';
 import { Windows, failures } from './lib/limiter.mjs';
@@ -57,7 +59,26 @@ const V = {
   },
   bool(v, name, { optional = false } = {}) { if (v == null && optional) return null; if (typeof v !== 'boolean') bad(`${name} must be true or false.`); return v; },
   enum(v, name, list, { optional = false } = {}) { if (v == null && optional) return null; if (!list.includes(v)) bad(`${name} must be one of: ${list.join(', ')}.`); return v; },
-  time(v, name) { const t = typeof v === 'number' ? v : Date.parse(v); if (!Number.isFinite(t)) bad(`${name} must be a date and time.`); return t; },
+  // A time as whole milliseconds between 2000 and 2100 (a number, or text Date.parse reads).
+  time(v, name) {
+    const t = typeof v === 'number' ? v : typeof v === 'string' && v.length <= 64 ? Date.parse(v) : NaN;
+    if (!Number.isInteger(t) || t < TIME_MIN || t > TIME_MAX) bad(`${name} must be a date and time between 2000 and 2100.`);
+    return t;
+  },
+  /**
+   * A name people see (display name, nickname, title): cleaned (hub/lib/names.mjs), then its length checked. With
+   * `reserved`, names that pass for Kea or the Hub's owner are refused unless `owner` (the Hub owner is the one asking).
+   */
+  name(v, label, { optional = false, min = 1, max = 60, reserved = null } = {}) {
+    if ((v == null || v === '') && optional) return null;
+    if (typeof v !== 'string') bad(`${label} must be text.`);
+    const t = cleanText(v);
+    if (!t && optional) return null;
+    const n = [...t].length;
+    if (n < min || n > max) bad(`${label} must be ${min}-${max} characters.`);
+    if (reserved && !reserved.owner && isReservedName(t, reserved.ownerNames())) bad(`“${t}” is kept for Kea itself. Pick another ${label.toLowerCase()}.`);
+    return t;
+  },
   url(v, name) {
     const s = V.str(v, name, { optional: true, max: 500 });
     if (s == null) return null;
@@ -68,7 +89,11 @@ const V = {
   obj(v) { if (v == null) return {}; if (typeof v !== 'object' || Array.isArray(v)) bad('Body must be a JSON object.'); return v; },
 };
 
+const TIME_MIN = Date.UTC(2000, 0, 1), TIME_MAX = Date.UTC(2100, 0, 1);
+/** An ISO time, or null for a stored value that isn't one (an old bad row never breaks a whole list). */
+export const isoOrNull = (ms) => { const d = new Date(ms); return Number.isFinite(d.getTime()) ? d.toISOString() : null; };
 const sha = (s) => createHash('sha256').update(s).digest('hex');
+export const OWNER_TOTP_MESSAGE = 'The Kea Hub owner account needs two-step sign-in turned on first. Turn it on under Settings > Security (or in KeaS setup), then try again.';
 const nameHash = (email) => sha(`login:${email}`);
 const sessionCookie = (token, maxAge, secure) => `${COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}${secure ? '; Secure' : ''}`;
 function readCookie(header, name) {
@@ -114,7 +139,8 @@ function makeRouter() {
     const keys = [];
     const re = new RegExp('^' + path.replace(/:(\w+)/g, (_, k) => { keys.push(k); return '([^/]+)'; }) + '$');
     // terms: false lets an account that hasn't agreed to the current terms still use the route.
-    routes.push({ method, re, keys, handler, auth: opts.auth !== false, terms: opts.terms !== false });
+    // basic: true lets the Hub owner's account use the route before its two-step sign-in is on (setting it up).
+    routes.push({ method, re, keys, handler, auth: opts.auth !== false, terms: opts.terms !== false, basic: opts.basic === true });
   };
   const find = (method, pathname) => {
     const r = routes.find((x) => x.method === method && x.re.test(pathname));
@@ -172,11 +198,30 @@ export function createHub({
   const key = loadOrCreateKey(join(dataDir, 'hub-signing-key.pem'));
   const ownerKeyFile = join(dataDir, 'owner.key');
   if (!existsSync(ownerKeyFile)) writeSecretFile(ownerKeyFile, randomBytes(32).toString('hex'));
-  const ownerKey = Buffer.from(readFileSync(ownerKeyFile, 'utf8').trim());
+  // The owner key is read again whenever the file changes, so `node hub/owner.mjs rotate-key` works without a restart.
+  let ownerKeyCache = { stamp: null, key: '' };
+  const ownerKeyNow = () => {
+    let st = null;
+    try { st = statSync(ownerKeyFile); } catch {}
+    const stamp = st ? `${st.mtimeMs}:${st.size}:${st.ino}` : 'none';
+    if (stamp !== ownerKeyCache.stamp) ownerKeyCache = { stamp, key: st ? readFileSync(ownerKeyFile, 'utf8').trim() : '' };
+    return ownerKeyCache.key;
+  };
+  ownerKeyNow();
+  const nonces = ownerNonces(now);
+  // TOTP secrets are kept sealed (hub/lib/totp.mjs). Ones stored before that are sealed now.
+  const totpKey = totpKeyFrom(key.privateKey);
+  for (const a of h.all('SELECT id, totp_secret FROM accounts WHERE totp_secret IS NOT NULL')) {
+    if (!isSealed(a.totp_secret)) h.run('UPDATE accounts SET totp_secret = ? WHERE id = ?', sealSecret(totpKey, a.totp_secret, a.id), a.id);
+  }
+  /** An account's TOTP secret (base32), or null. A secret that doesn't open (tampered with) counts as none. */
+  const totpSecretOf = (a) => { try { return openSecret(totpKey, a.totp_secret, a.id); } catch { return null; } };
+  const checkTotp = (a, code) => { const s = totpSecretOf(a); return s ? checkCode(s, code, now(), a.totp_last_step) : null; };
   const windows = new Windows();
   const fails = failures(h, now);
   // phone: changes to the phone number, per account per day.
-  const L = { login: [30, 10 * 60_000], register: [5, 60 * 60_000], join: [20, 10 * 60_000], answer: [240, 60_000], phone: [5, 86400_000], ...limits };
+  // joinRequest: requests to join someone else's course section, per account per day (each one notifies the section).
+  const L = { login: [30, 10 * 60_000], register: [5, 60 * 60_000], join: [20, 10 * 60_000], answer: [240, 60_000], phone: [5, 86400_000], joinRequest: [10, 86400_000], ...limits };
   // An address that can stand for many people (the tunnel's own loopback address, when the Hub can't tell clients
   // apart) gets SHARED_FACTOR times the limit, so a few bad requests can't lock everyone out of the Hub.
   const SHARED_FACTOR = 20;
@@ -186,6 +231,9 @@ export function createHub({
     const wait = windows.hit(`${kind}:${ipBucket(String(who))}`, n, ms, now());
     if (wait > 0) throw new HttpError(429, `Too many tries. Wait ${Math.ceil(wait / 1000)} seconds.`, { retryAfter: Math.ceil(wait / 1000) });
   };
+  // Names only the owner may use (hub/lib/names.mjs): Kea's own, and the owner's display name.
+  const ownerNames = () => h.all("SELECT display_name FROM accounts WHERE role = 'owner'").map((r) => r.display_name);
+  const reservedFor = (me) => ({ owner: me?.role === 'owner', ownerNames });
   const audit = (actor, action, target, detail, ip) =>
     h.run('INSERT INTO audit (at,actor,action,target,detail,ip) VALUES (?,?,?,?,?,?)', now(), actor ?? null, action, target ?? null, detail == null ? null : JSON.stringify(detail), ip ?? null);
   const getSetting = (k, fallback) => { const r = h.get('SELECT value FROM settings WHERE key = ?', k); return r ? JSON.parse(r.value) : fallback; };
@@ -264,7 +312,7 @@ export function createHub({
   const requireTotp = (a, code, nh, ipKey, ip) => {
     if (!a.totp_enabled) return;
     if (code == null || code === '') { fails.fail(nh, ipKey); throw new HttpError(401, 'Enter the 6-digit code from your authenticator app.', { totpRequired: true }); }
-    const step = checkCode(a.totp_secret, code, now(), a.totp_last_step);
+    const step = checkTotp(a, code);
     if (step == null) { fails.fail(nh, ipKey); audit(a.id, 'auth.fail_totp', null, null, ip); throw new HttpError(401, 'That code is wrong or already used.', { totpRequired: true }); }
     h.run('UPDATE accounts SET totp_last_step = ? WHERE id = ?', step, a.id);
   };
@@ -387,6 +435,11 @@ export function createHub({
     if (thisYear() - y < 13) bad('Kea accounts are for people 13 and older.');
     return y;
   };
+  // A parent's email (or Google account) that belongs to a Kea account under 18 can't sign off: that's a teen with a
+  // second account, not a parent.
+  const MINOR_PARENT = 'That email belongs to a Kea account under 18. A parent or guardian signs off with their own email.';
+  const minorParent = ({ email = null, sub = null }) => h.all('SELECT birth_year, role FROM accounts WHERE email = ? OR (google_sub IS NOT NULL AND google_sub = ?)', email, sub)
+    .some((a) => a.role !== 'owner' && isMinor(a.birth_year, thisYear(), 18));
   function approveConsent(c, method, g, ip) {
     h.tx(() => {
       h.run("UPDATE parent_consents SET status = 'approved', method = ?, parent_google_sub = ?, decided_at = ? WHERE id = ?", method, g?.sub ?? null, now(), c.id);
@@ -413,10 +466,15 @@ export function createHub({
   // ---------- membership helpers ----------
   const membership = (classId, accountId) => h.get('SELECT * FROM class_members WHERE class_id = ? AND account_id = ?', classId, accountId);
   const loadClass = (id) => h.get('SELECT * FROM classes WHERE id = ?', id) ?? notFound('Class not found.');
+  // A class that belongs to an organization works only while the owner has the organization approved (active).
+  const orgActive = (orgId) => !orgId || h.get('SELECT status FROM orgs WHERE id = ?', orgId)?.status === 'active';
+  const ORG_CLASS_OFF = 'This class belongs to an organization that isn’t active on the Kea Hub right now.';
+  const ACTIVE_ORG_SQL = "(c.org_id IS NULL OR c.org_id IN (SELECT id FROM orgs WHERE status = 'active'))";
   const asMember = (classId, me) => {
     const c = loadClass(classId);
     const m = membership(classId, me.id);
     if (!m && me.role !== 'owner') notFound('Class not found.');
+    if (!orgActive(c.org_id) && me.role !== 'owner') forbidden(ORG_CLASS_OFF);
     return { c, m: m ?? { role: 'instructor', owner: true } };
   };
   const asTeacher = (classId, me) => {
@@ -437,7 +495,7 @@ export function createHub({
       .map((x) => ({ name: x.name, verified: !!x.v || x.r === 'owner' })),
   });
   const boardName = (row) => (row.board === 'nickname' && row.nickname ? row.nickname : row.board === 'hidden' ? null : row.display_name);
-  const sessionOut = (s) => ({ id: s.id, classId: s.class_id, title: s.title, start: new Date(s.start_at).toISOString(), end: new Date(s.end_at).toISOString(), location: s.location, meetingUrl: s.meeting_url, notes: s.notes });
+  const sessionOut = (s) => ({ id: s.id, classId: s.class_id, title: s.title, start: isoOrNull(s.start_at), end: isoOrNull(s.end_at), location: s.location, meetingUrl: s.meeting_url, notes: s.notes });
 
   // ---------- supporters, and the owner's view of an account ----------
   function supporterEnded(a, note = null) {
@@ -467,6 +525,8 @@ export function createHub({
       supporterEnded(a);
     }
     h.run('DELETE FROM notifications WHERE read_at IS NOT NULL AND read_at < ?', now() - 180 * DAY_MS);
+    // Routine sign-in records (auth.*) go after the owner's setting (default 365 days); changes to accounts stay.
+    h.run("DELETE FROM audit WHERE action LIKE 'auth.%' AND at < ?", now() - auditKeepDays() * DAY_MS);
   }
   const sweepTimer = setInterval(() => { try { sweep(true); } catch (e) { console.error(e); } }, 3600_000);
   sweepTimer.unref?.();
@@ -481,12 +541,72 @@ export function createHub({
     setSetting('storageSeen', cur);
   }
 
+  // ---------- deleting an account ----------
+  // Removes the account and everything kept for it: sessions, files (and their blobs on disk), notifications, phone,
+  // parent sign-offs, study progress and points, shared-Claude jobs and requests, flags, class/section/org memberships,
+  // and its rows in organization tables. Audit rows are kept but anonymized (no account id, address or details).
+  // Refused while it would leave an organization or a class with members but no owner: hand those over first.
+  function deleteAccount(a, by, ip) {
+    const blockers = [];
+    for (const o of h.all("SELECT o.id, o.name FROM org_members m JOIN orgs o ON o.id = m.org_id WHERE m.account_id = ? AND m.role = 'owner'", a.id)) {
+      const otherOwners = h.get("SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND role = 'owner' AND account_id != ?", o.id, a.id).n;
+      const others = h.get('SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND account_id != ?', o.id, a.id).n;
+      if (!otherOwners && others) blockers.push({ kind: 'org', id: o.id, name: o.name });
+    }
+    for (const c of h.all('SELECT * FROM classes WHERE owner_id = ?', a.id)) {
+      const heir = h.get("SELECT 1 FROM class_members WHERE class_id = ? AND role = 'instructor' AND account_id != ?", c.id, a.id);
+      const others = h.get('SELECT COUNT(*) AS n FROM class_members WHERE class_id = ? AND account_id != ?', c.id, a.id).n;
+      if (!heir && others) blockers.push({ kind: 'class', id: c.id, name: c.title });
+    }
+    if (blockers.length) {
+      throw new HttpError(409, `This account can’t be deleted yet. It’s the only owner of ${blockers.map((b) => `${b.kind === 'org' ? 'the organization' : 'the class'} “${b.name}”`).join(' and ')}. Make someone else an owner (or instructor) first, or remove its members.`, { blockers });
+    }
+    const running = h.all("SELECT id FROM scan_jobs WHERE account_id = ? AND status = 'running'", a.id).map((j) => j.id);
+    h.tx(() => {
+      // Organizations they made: handed to another owner (or member), or deleted when they were its only member.
+      for (const o of h.all('SELECT id FROM orgs WHERE created_by = ?', a.id)) {
+        const heir = h.get("SELECT account_id FROM org_members WHERE org_id = ? AND account_id != ? ORDER BY CASE role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, joined_at LIMIT 1", o.id, a.id);
+        if (heir) h.run('UPDATE orgs SET created_by = ? WHERE id = ?', heir.account_id, o.id);
+        else h.run('DELETE FROM orgs WHERE id = ?', o.id);
+      }
+      // Classes they made: to another instructor, or deleted when nobody else is in them.
+      for (const c of h.all('SELECT id FROM classes WHERE owner_id = ?', a.id)) {
+        const heir = h.get("SELECT account_id FROM class_members WHERE class_id = ? AND role = 'instructor' AND account_id != ? ORDER BY joined_at LIMIT 1", c.id, a.id);
+        if (heir) h.run('UPDATE classes SET owner_id = ? WHERE id = ?', heir.account_id, c.id);
+        else h.run('DELETE FROM classes WHERE id = ?', c.id);
+      }
+      // Every table that keeps rows per account (organization tables too, some of which have no foreign key).
+      for (const { name } of h.all("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT IN ('accounts','audit') AND name NOT LIKE 'sqlite_%'")) {
+        const cols = new Set(h.db.prepare(`PRAGMA table_info("${name}")`).all().map((c) => c.name));
+        if (name === 'org_shifts' && cols.has('account_id')) { h.db.prepare('UPDATE org_shifts SET account_id = NULL WHERE account_id = ?').run(a.id); continue; }
+        for (const col of ['account_id', 'from_account', 'claimant']) if (cols.has(col)) h.db.prepare(`DELETE FROM "${name}" WHERE "${col}" = ?`).run(a.id);
+      }
+      h.run('DELETE FROM accounts WHERE id = ?', a.id);
+      h.run("UPDATE audit SET actor = 'deleted-account', ip = NULL, detail = NULL WHERE actor = ?", a.id);
+      h.run('UPDATE audit SET target = NULL, detail = NULL WHERE target = ?', a.id);
+      h.run("UPDATE audit SET detail = NULL WHERE detail LIKE '%' || ? || '%'", a.id);
+    });
+    for (const id of running) dropRelay(id, 'The account was deleted.');
+    fails.clearAll(nameHash(a.email));
+    rmSync(join(storageDir, a.id), { recursive: true, force: true });
+    audit(by === a.id ? 'deleted-account' : 'owner', 'account.delete', null, { ref: sha(`deleted:${a.id}`).slice(0, 16), by: by === a.id ? 'self' : 'owner' }, by === a.id ? null : ip);
+  }
+  const auditKeepDays = () => { const d = getSetting('auditKeepDays', 365); return Number.isInteger(d) && d >= 30 ? d : 365; };
+
   // ================= public API =================
   const api = makeRouter();
   const R = api.add;
 
   R('GET', '/v1/health', () => ({ ok: true, service: 'kea-hub', version: VERSION }), { auth: false });
   R('GET', '/v1/keys', () => ({ keys: [key.jwk] }), { auth: false });
+  // Proves this is the Hub whose signing key is in its data folder: signs the caller's random nonce. KeaS checks it
+  // against the key file before sending the owner's password to whatever answers on 127.0.0.1:4860.
+  // (The signed text starts "kea-hub-identity:", which no token's signed text can, so it can't stand in for a token.)
+  R('GET', '/v1/identity', ({ query }) => {
+    const n = String(query.nonce ?? '');
+    if (!/^[0-9a-f]{32,128}$/.test(n)) bad('Send nonce: 32 to 128 hex characters.');
+    return { kid: key.kid, sig: edSign(null, Buffer.from(`kea-hub-identity:v1:${n}`), key.privateKey).toString('base64url') };
+  }, { auth: false });
 
   // Making an account answers the same whether or not the email already has one (so it can't be used to find out who
   // has a Kea account), and never signs anyone in: the app signs in right after with the same email and password. For
@@ -495,7 +615,7 @@ export function createHub({
   R('POST', '/v1/auth/register', async ({ body, ip, client }) => {
     limit('register', ip);
     const email = V.email(body.email);
-    const displayName = V.str(body.displayName, 'Name', { min: 1, max: 60 });
+    const displayName = V.name(body.displayName, 'Name', { min: 1, max: 60, reserved: reservedFor(null) });
     if (body.age13 !== true) bad('Kea accounts are for people 13 and older.');
     const problem = passwordProblem(body.password, { email, name: displayName });
     if (problem) bad(problem, { field: 'password' });
@@ -542,7 +662,7 @@ export function createHub({
       const code = body.code;
       const hasCode = code != null && code !== '';
       const pwOk = hasCode && (await verifyPassword(password, a?.pw_hash ?? null));
-      const step = pwOk && a.totp_enabled && a.status === 'active' ? checkCode(a.totp_secret, code, now(), a.totp_last_step) : null;
+      const step = pwOk && a.totp_enabled && a.status === 'active' ? checkTotp(a, code) : null;
       if (step == null) {
         if (hasCode) { fails.fail(nh, ipKey); audit(a?.id ?? null, 'auth.fail', null, { lockedEverywhere: true }, ip); }
         throw lockedError(globalMs, true);
@@ -598,17 +718,21 @@ export function createHub({
     const problem = passwordProblem(body.password, { email: a.email, name: a.display_name });
     if (problem) bad(problem, { field: 'password' });
     const nh = nameHash(a.email);
-    if (a.totp_enabled) { const ms = fails.pairLocked(nh, ipKey); if (ms > 0) throw lockedError(ms, false); }
-    requireTotp(a, body.code, nh, ipKey, ip);
+    // An email nobody had proven before: whoever turned on two-step sign-in may not have owned it (someone can make an
+    // account with another person's email). Proving it with Google now clears that two-step sign-in; the real owner
+    // can turn their own on again.
+    const clearTotp = !!a.totp_enabled && !a.email_verified;
+    if (a.totp_enabled && !clearTotp) { const ms = fails.pairLocked(nh, ipKey); if (ms > 0) throw lockedError(ms, false); requireTotp(a, body.code, nh, ipKey, ip); }
     const pwHash = await hashPassword(body.password);
     h.tx(() => {
       h.run('UPDATE accounts SET pw_hash = ?, updated_at = ? WHERE id = ?', pwHash, now(), a.id);
+      if (clearTotp) h.run('UPDATE accounts SET totp_enabled = 0, totp_secret = NULL, totp_last_step = -1 WHERE id = ?', a.id);
       h.run('DELETE FROM sessions WHERE account_id = ?', a.id);
       markGoogleVerified(a.id, g);
     });
     // A new password: earlier guesses at the old one don't matter any more.
     fails.clearAll(nh);
-    audit(a.id, 'account.reset_google', a.id, null, ip);
+    audit(a.id, 'account.reset_google', a.id, clearTotp ? { totpCleared: true } : null, ip);
     const token = newSession(a.id, client);
     return { body: { token, account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', a.id)), terms: termsStatus(a.id) }, token };
   }, { auth: false });
@@ -635,12 +759,12 @@ export function createHub({
     const old = since ? termsRow(since) : null;
     if (since && !old) notFound('No such version.');
     return { from: since ?? null, to: cur.n, summary: cur.summary, ...diffTerms(old ? JSON.parse(old.sections) : [], cur.sections) };
-  }, { terms: false });
+  }, { terms: false, basic: true });
   R('POST', '/v1/terms/accept', ({ me, body, ip, client }) => {
     recordAgreement(me.id, body, ip, client);
     audit(me.id, 'terms.accept', String(body.termsVersion), null, ip);
     return { terms: termsStatus(me.id) };
-  }, { terms: false });
+  }, { terms: false, basic: true });
 
   // Kea storage: list (optionally under a folder prefix, or only what changed since a time, for syncing).
   R('GET', '/v1/files', ({ me, query }) => {
@@ -666,7 +790,19 @@ export function createHub({
     storage: storageOut(me),
     sharedClaude: cleanOverride(me.claude_override ? JSON.parse(me.claude_override) : null),
     notifications: h.all('SELECT * FROM notifications WHERE account_id = ? ORDER BY id', me.id).map(noteOut),
-  }), { terms: false });
+    parentSignOffs: h.all('SELECT * FROM parent_consents WHERE account_id = ? ORDER BY created_at', me.id).map(consentOut),
+    scanJobs: h.all('SELECT id, kind, course_key, chapter, status, created_at, started_at, finished_at, note FROM scan_jobs WHERE account_id = ? ORDER BY created_at', me.id),
+    scanJobsJoined: h.all('SELECT job_id, joined_at FROM scan_job_members WHERE account_id = ? ORDER BY joined_at', me.id),
+    scanRequests: h.all('SELECT kind, outcome, at FROM scan_requests WHERE account_id = ? ORDER BY id', me.id),
+    flags: h.all('SELECT reason, detail, auto_suspended, status, at, resolved_at FROM flags WHERE account_id = ? ORDER BY id', me.id),
+    hostingApplications: h.all('SELECT reason, status, created_at, decided_at FROM host_applications WHERE account_id = ? ORDER BY created_at', me.id),
+    courseSections: h.all('SELECT course_key, joined_at, target FROM course_members WHERE account_id = ? ORDER BY joined_at', me.id),
+    courseJoinRequests: h.all('SELECT course_key, label, status, created_at, decided_at FROM course_join_requests WHERE account_id = ? ORDER BY created_at', me.id),
+    // Course files that came from scans you started (shared with your section).
+    contributedCourseFiles: h.all('SELECT cf.course_key, cf.path, cf.size, cf.updated_at FROM course_files cf JOIN course_materials cm ON cm.course_key = cf.course_key JOIN scan_jobs j ON j.id = cm.first_job_id WHERE j.account_id = ? ORDER BY cf.course_key, cf.path', me.id),
+    orgs: h.all('SELECT org_id, role, status, joined_at FROM org_members WHERE account_id = ?', me.id),
+    activity: h.all('SELECT at, action, target, ip FROM audit WHERE actor = ? ORDER BY id DESC LIMIT 5000', me.id),
+  }), { terms: false, basic: true });
 
   R('POST', '/v1/auth/logout', ({ token }) => {
     if (token) h.run('DELETE FROM sessions WHERE token_hash = ?', sha(token));
@@ -694,7 +830,7 @@ export function createHub({
       account: publicAccount(me), progress: progressOf(me.id), terms: termsStatus(me.id),
       storage: storageOut(me), notifications: { unread: unreadCount(me.id), latest: h.get('SELECT MAX(id) AS n FROM notifications WHERE account_id = ?', me.id).n ?? 0 },
     };
-  }, { terms: false });
+  }, { terms: false, basic: true });
   // Notifications: newest first (or only those after an id, for polling), and marking them read. Readable before
   // agreeing to new terms, like the account itself.
   R('GET', '/v1/me/notifications', ({ me, query }) => {
@@ -706,7 +842,7 @@ export function createHub({
       notifications: h.all(`SELECT * FROM notifications WHERE account_id = ? AND id > ?${unreadOnly ? ' AND read_at IS NULL' : ''} ORDER BY id DESC LIMIT ?`, me.id, after, limit).map(noteOut),
       unread: unreadCount(me.id),
     };
-  }, { terms: false });
+  }, { terms: false, basic: true });
   R('POST', '/v1/me/notifications/read', ({ me, body }) => {
     if (body.all === true) h.run('UPDATE notifications SET read_at = ? WHERE account_id = ? AND read_at IS NULL', now(), me.id);
     else {
@@ -714,7 +850,7 @@ export function createHub({
       for (const id of body.ids) h.run('UPDATE notifications SET read_at = ? WHERE id = ? AND account_id = ? AND read_at IS NULL', now(), V.int(id, 'id', { min: 1 }), me.id);
     }
     return { unread: unreadCount(me.id) };
-  }, { terms: false });
+  }, { terms: false, basic: true });
   R('POST', '/v1/me/notifications/delete', ({ me, body }) => {
     if (body.all === true) h.run('DELETE FROM notifications WHERE account_id = ? AND read_at IS NOT NULL', me.id);
     else {
@@ -722,7 +858,7 @@ export function createHub({
       for (const id of body.ids) h.run('DELETE FROM notifications WHERE id = ? AND account_id = ?', V.int(id, 'id', { min: 1 }), me.id);
     }
     return { unread: unreadCount(me.id) };
-  }, { terms: false });
+  }, { terms: false, basic: true });
   // An optional phone number, and who sees it: classmates in my classes, coworkers in my organizations, both, or
   // nobody (the default). Never on leaderboards, never public. Changing the number is limited to a few times a day.
   R('POST', '/v1/me/phone', ({ me, body, ip }) => {
@@ -735,7 +871,7 @@ export function createHub({
     return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', me.id)) };
   });
   R('POST', '/v1/me', ({ me, body }) => {
-    const name = V.str(body.displayName, 'Name', { min: 1, max: 60 });
+    const name = V.name(body.displayName, 'Name', { min: 1, max: 60, reserved: reservedFor(me) });
     h.run('UPDATE accounts SET display_name = ?, updated_at = ? WHERE id = ?', name, now(), me.id);
     return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', me.id)) };
   });
@@ -748,7 +884,8 @@ export function createHub({
     audit(me.id, 'account.birth_year', me.id, null, ip);
     return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', me.id)) };
   });
-  const consentOut = (c) => c && ({ id: c.id, parentEmail: c.parent_email, status: c.status, method: c.method, createdAt: c.created_at, expiresAt: c.expires_at, decidedAt: c.decided_at });
+  function consentOut(c) { return c && consentOutRow(c); }
+  const consentOutRow = (c) => ({ id: c.id, parentEmail: c.parent_email, status: c.status, method: c.method, createdAt: c.created_at, expiresAt: c.expires_at, decidedAt: c.decided_at });
   R('GET', '/v1/me/consent', ({ me }) => ({
     ...consentOf(me),
     requests: h.all('SELECT * FROM parent_consents WHERE account_id = ? ORDER BY created_at DESC LIMIT 10', me.id).map(consentOut),
@@ -763,6 +900,7 @@ export function createHub({
     if (st.parentSignOff === 'approved') return { ...st, link: null };
     const parentEmail = V.email(body.parentEmail);
     if (parentEmail === me.email) bad('Use your parent’s or guardian’s own email, not yours.');
+    if (minorParent({ email: parentEmail })) bad(MINOR_PARENT);
     const token = randomBytes(24).toString('hex');
     const id = randomUUID();
     h.tx(() => {
@@ -778,6 +916,7 @@ export function createHub({
     const g = await google(body.idToken);
     if (g.email === me.email) bad('That’s your own Google account. Your parent or guardian signs in with theirs.');
     if (g.email !== c.parent_email) bad(`That Google account is ${g.email}, but the sign-off is for ${c.parent_email}.`);
+    if (minorParent(g)) bad(MINOR_PARENT);
     approveConsent(c, 'google-kea', g, ip);
     return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', me.id)) };
   });
@@ -796,6 +935,7 @@ export function createHub({
     const g = await google(body.idToken);
     if (g.email !== c.parent_email) bad(`You signed in to Google as ${g.email}, but this sign-off was sent to ${c.parent_email}. Sign in with that account.`);
     if (g.email === c.member_email) bad('A member can’t sign off for themselves.');
+    if (approve && minorParent(g)) bad(MINOR_PARENT);
     if (approve) approveConsent(c, 'google-link', g, ip);
     else {
       h.run("UPDATE parent_consents SET status = 'declined', method = 'google-link', parent_google_sub = ?, decided_at = ? WHERE id = ?", g.sub, now(), c.id);
@@ -809,7 +949,7 @@ export function createHub({
   // later, and (unless everyClass is false) it replaces each class's own choice too.
   R('POST', '/v1/me/leaderboard', ({ me, body }) => {
     const show = V.enum(body.show, 'Leaderboard name', ['name', 'nickname', 'hidden']);
-    const nickname = 'nickname' in body ? V.str(body.nickname, 'Nickname', { optional: true, max: 30 }) : me.nickname ?? null;
+    const nickname = 'nickname' in body ? V.name(body.nickname, 'Nickname', { optional: true, max: 30, reserved: reservedFor(me) }) : me.nickname ?? null;
     if (show === 'nickname' && !nickname) bad('Pick a nickname first.');
     h.tx(() => {
       h.run('UPDATE accounts SET board_default = ?, nickname = ?, updated_at = ? WHERE id = ?', show, nickname, now(), me.id);
@@ -817,46 +957,100 @@ export function createHub({
     });
     return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', me.id)) };
   });
+  // ---------- proving it's really you, again ----------
+  // Changing how you sign in (two-step sign-in, signing out your other devices) needs your password (or a fresh Google
+  // sign-in), not just a session, so a stolen session can't lock the real person out. A proof counts for this session
+  // for REAUTH_MS. Wrong passwords here count toward the same lockouts as signing in, and locks are checked first.
+  const REAUTH_MS = 10 * 60_000;
+  const WRONG_CREDS = 'Your password or two-step code is wrong.';
+  /** Checks my password (and code, when `code` is given) with the sign-in lockouts; one message for any miss. */
+  async function checkMine(me, { password, code = undefined, ipKey, ip, message = WRONG_CREDS }) {
+    const nh = nameHash(me.email);
+    const pairMs = fails.pairLocked(nh, ipKey);
+    if (pairMs > 0) throw lockedError(pairMs, false);
+    const globalMs = fails.globalLocked(nh);
+    if (globalMs > 0) throw lockedError(globalMs, true);
+    const pwOk = await verifyPassword(typeof password === 'string' ? password : '', me.pw_hash);
+    const step = code === undefined ? true : pwOk ? checkTotp(me, code) : null;
+    if (!pwOk || step == null) {
+      fails.fail(nh, ipKey);
+      audit(me.id, 'auth.fail_reauth', null, null, ip);
+      throw new HttpError(401, message);
+    }
+    if (code !== undefined) h.run('UPDATE accounts SET totp_last_step = ? WHERE id = ?', step, me.id);
+    fails.clear(nh, ipKey);
+  }
+  /** Password, a fresh Google sign-in for my email, or (when `recent`) a proof given in this session in the last minutes. */
+  async function freshAuth({ me, body, token, ipKey, ip }, { recent = false } = {}) {
+    const s = h.get('SELECT reauth_at FROM sessions WHERE token_hash = ?', sha(token));
+    if (recent && body.password == null && body.googleIdToken == null && s?.reauth_at && now() - s.reauth_at < REAUTH_MS) return;
+    if (body.googleIdToken != null) {
+      const g = await google(body.googleIdToken);
+      if (g.email !== me.email) bad(`That Google account is ${g.email}, but your Kea account is ${me.email}.`);
+    } else {
+      if (body.password == null || body.password === '') throw new HttpError(401, 'Enter your password to change this.', { passwordRequired: true });
+      await checkMine(me, { password: body.password, ipKey, ip, message: 'Your password is wrong.' });
+    }
+    h.run('UPDATE sessions SET reauth_at = ? WHERE token_hash = ?', now(), sha(token));
+  }
+
   R('POST', '/v1/me/password', async ({ me, body, token, ip, ipKey }) => {
-    if (!(await verifyPassword(body.current ?? '', me.pw_hash))) { fails.fail(nameHash(me.email), ipKey); throw new HttpError(401, 'Your current password is wrong.'); }
+    await checkMine(me, { password: body.current, ipKey, ip, message: 'Your current password is wrong.' });
     const problem = passwordProblem(body.next, { email: me.email, name: me.display_name });
     if (problem) bad(problem, { field: 'next' });
     h.run('UPDATE accounts SET pw_hash = ?, updated_at = ? WHERE id = ?', await hashPassword(body.next), now(), me.id);
     h.run('DELETE FROM sessions WHERE account_id = ? AND token_hash != ?', me.id, sha(token));
+    fails.clearAll(nameHash(me.email));
     audit(me.id, 'account.password', me.id, null, ip);
     return { ok: true, otherSessionsSignedOut: true };
-  });
+  }, { basic: true });
   R('GET', '/v1/me/sessions', ({ me, token }) => ({
     sessions: h.all('SELECT * FROM sessions WHERE account_id = ? AND expires_at > ? ORDER BY last_seen DESC', me.id, now())
       .map((s) => ({ id: s.token_hash.slice(0, 12), client: s.client, createdAt: s.created_at, lastSeen: s.last_seen, current: s.token_hash === sha(token) })),
-  }), { terms: false });
-  R('POST', '/v1/me/sessions/sign-out-others', ({ me, token }) => {
-    const r = h.run('DELETE FROM sessions WHERE account_id = ? AND token_hash != ?', me.id, sha(token));
+  }), { terms: false, basic: true });
+  R('POST', '/v1/me/sessions/sign-out-others', async (ctx) => {
+    await freshAuth(ctx);
+    const r = h.run('DELETE FROM sessions WHERE account_id = ? AND token_hash != ?', ctx.me.id, sha(ctx.token));
+    audit(ctx.me.id, 'account.sign_out_others', ctx.me.id, { count: Number(r.changes) }, ctx.ip);
     return { signedOut: Number(r.changes) };
-  }, { terms: false });
-  R('POST', '/v1/me/totp/setup', ({ me }) => {
+  }, { terms: false, basic: true });
+  R('POST', '/v1/me/totp/setup', async (ctx) => {
+    const { me } = ctx;
     if (me.totp_enabled) bad('Two-step sign-in is already on.');
+    await freshAuth(ctx);
     const secret = newSecret();
-    h.run('UPDATE accounts SET totp_secret = ?, updated_at = ? WHERE id = ?', secret, now(), me.id);
+    h.run('UPDATE accounts SET totp_secret = ?, updated_at = ? WHERE id = ?', sealSecret(totpKey, secret, me.id), now(), me.id);
     return { secret, uri: otpauthUri(secret, me.email) };
-  });
-  R('POST', '/v1/me/totp/enable', ({ me, body, ip }) => {
+  }, { basic: true });
+  R('POST', '/v1/me/totp/enable', async (ctx) => {
+    const { me, body, ip } = ctx;
+    if (me.totp_enabled) bad('Two-step sign-in is already on.');
     if (!me.totp_secret) bad('Start setup first.');
-    const step = checkCode(me.totp_secret, body.code, now(), me.totp_last_step);
+    // (Setup just proved it's you; that proof is enough for the next few minutes.)
+    await freshAuth(ctx, { recent: true });
+    const step = checkTotp(me, body.code);
     if (step == null) bad('That code is wrong. Check the time on your phone and try the newest code.');
     h.run('UPDATE accounts SET totp_enabled = 1, totp_last_step = ?, updated_at = ? WHERE id = ?', step, now(), me.id);
     audit(me.id, 'account.totp_on', me.id, null, ip);
     return { ok: true };
-  });
-  R('POST', '/v1/me/totp/disable', async ({ me, body, ip }) => {
+  }, { basic: true });
+  R('POST', '/v1/me/totp/disable', async ({ me, body, ip, ipKey }) => {
     if (!me.totp_enabled) return { ok: true };
     if (me.role === 'owner') forbidden('The owner account must keep two-step sign-in on.');
-    if (!(await verifyPassword(body.password ?? '', me.pw_hash))) throw new HttpError(401, 'Wrong password.');
-    if (checkCode(me.totp_secret, body.code, now(), me.totp_last_step) == null) throw new HttpError(401, 'That code is wrong.');
+    await checkMine(me, { password: body.password, code: body.code, ipKey, ip });
     h.run('UPDATE accounts SET totp_enabled = 0, totp_secret = NULL, totp_last_step = -1, updated_at = ? WHERE id = ?', now(), me.id);
     audit(me.id, 'account.totp_off', me.id, null, ip);
     return { ok: true };
   });
+
+  // Deleting your account: your password (and two-step code, when it's on). See deleteAccount for what goes.
+  R('POST', '/v1/me/delete', async ({ me, body, ip, ipKey }) => {
+    if (me.role === 'owner') forbidden('The Hub owner’s account can’t be deleted from the app.');
+    if (body.confirm !== 'DELETE') bad('Type DELETE to confirm.', { field: 'confirm' });
+    await checkMine(me, { password: body.password, code: me.totp_enabled ? body.code : undefined, ipKey, ip });
+    deleteAccount(me, me.id, ip);
+    return { body: { ok: true, deleted: true }, clearCookie: true };
+  }, { terms: false });
 
   // ---------- hosting ----------
   R('POST', '/v1/hosting/apply', ({ me, body, ip }) => {
@@ -883,14 +1077,14 @@ export function createHub({
     const id = randomUUID();
     h.tx(() => {
       h.run('INSERT INTO classes (id,owner_id,title,description,kind,meeting_url,created_at) VALUES (?,?,?,?,?,?,?)', id, me.id,
-        V.str(body.title, 'Title', { min: 1, max: 120 }), V.str(body.description, 'Description', { optional: true, max: 4000 }) ?? '', kind, V.url(body.meetingUrl, 'Meeting link'), now());
+        V.name(body.title, 'Title', { min: 1, max: 120 }), V.str(body.description, 'Description', { optional: true, max: 4000 }) ?? '', kind, V.url(body.meetingUrl, 'Meeting link'), now());
       h.run("INSERT INTO class_members (class_id,account_id,role,joined_at) VALUES (?,?,'instructor',?)", id, me.id, now());
     });
     audit(me.id, 'class.create', id, { kind }, ip);
     return { status: 201, body: { class: classOut(loadClass(id), membership(id, me.id)) } };
   });
   R('GET', '/v1/classes', ({ me }) => ({
-    classes: h.all("SELECT c.*, m.role AS m_role, m.board AS m_board, m.nickname AS m_nick FROM classes c JOIN class_members m ON m.class_id = c.id WHERE m.account_id = ? AND c.status = 'active' ORDER BY c.title", me.id)
+    classes: h.all(`SELECT c.*, m.role AS m_role, m.board AS m_board, m.nickname AS m_nick FROM classes c JOIN class_members m ON m.class_id = c.id WHERE m.account_id = ? AND c.status = 'active' AND ${ACTIVE_ORG_SQL} ORDER BY c.title`, me.id)
       .map((c) => classOut(c, { role: c.m_role, board: c.m_board, nickname: c.m_nick })),
   }));
   R('GET', '/v1/classes/:id', ({ me, params }) => {
@@ -900,7 +1094,7 @@ export function createHub({
   R('POST', '/v1/classes/:id', ({ me, params, body }) => {
     const { c } = asInstructor(params.id, me);
     h.run('UPDATE classes SET title = ?, description = ?, meeting_url = ?, status = ? WHERE id = ?',
-      body.title != null ? V.str(body.title, 'Title', { min: 1, max: 120 }) : c.title,
+      body.title != null ? V.name(body.title, 'Title', { min: 1, max: 120 }) : c.title,
       body.description != null ? V.str(body.description, 'Description', { optional: true, max: 4000 }) ?? '' : c.description,
       'meetingUrl' in body ? V.url(body.meetingUrl, 'Meeting link') : c.meeting_url,
       body.status != null ? V.enum(body.status, 'Status', ['active', 'archived']) : c.status, c.id);
@@ -908,8 +1102,9 @@ export function createHub({
   });
 
   R('POST', '/v1/classes/:id/invites', ({ me, params, body }) => {
-    const { c } = asTeacher(params.id, me);
+    const { c, m } = asTeacher(params.id, me);
     const role = V.enum(body.role ?? 'student', 'Role', ['student', 'ta']);
+    if (role === 'ta' && m.role !== 'instructor') forbidden('Only the class instructor can invite teaching assistants.');
     const maxUses = V.int(body.maxUses, 'Max uses', { optional: true, min: 1, max: 10000 });
     const days = V.int(body.expiresDays, 'Days', { optional: true, min: 1, max: 365 });
     const code = newCode();
@@ -934,7 +1129,7 @@ export function createHub({
     const inv = code.length === 10 ? h.get('SELECT * FROM invites WHERE code = ?', code) : null;
     const usable = inv && !inv.revoked && (inv.expires_at == null || inv.expires_at > now()) && (inv.max_uses == null || inv.uses < inv.max_uses);
     const c = usable ? loadClass(inv.class_id) : null;
-    if (!c || c.status !== 'active') notFound("That code doesn't work. Check it, or ask for a new one.");
+    if (!c || c.status !== 'active' || !orgActive(c.org_id)) notFound("That code doesn't work. Check it, or ask for a new one.");
     const out = classOut(c, membership(c.id, me.id));
     return { class: { id: out.id, title: out.title, description: out.description, members: out.members, instructors: out.instructors }, role: inv.role, alreadyMember: !!out.role };
   });
@@ -945,12 +1140,12 @@ export function createHub({
     const usable = inv && !inv.revoked && (inv.expires_at == null || inv.expires_at > now()) && (inv.max_uses == null || inv.uses < inv.max_uses);
     if (!usable) notFound("That code doesn't work. Check it, or ask for a new one.");
     const c = loadClass(inv.class_id);
-    if (c.status !== 'active') notFound("That code doesn't work. Check it, or ask for a new one.");
+    if (c.status !== 'active' || !orgActive(c.org_id)) notFound("That code doesn't work. Check it, or ask for a new one.");
     const existing = membership(c.id, me.id);
     if (!existing) {
       h.tx(() => {
         // (No choice given: the account's own leaderboard setting.)
-        const nick = 'nickname' in body ? V.str(body.nickname, 'Nickname', { optional: true, max: 30 }) : me.nickname ?? null;
+        const nick = 'nickname' in body ? V.name(body.nickname, 'Nickname', { optional: true, max: 30, reserved: reservedFor(me) }) : me.nickname ?? null;
         let board = V.enum(body.board ?? me.board_default ?? 'name', 'Leaderboard name', ['name', 'nickname', 'hidden']);
         if (board === 'nickname' && !nick) board = 'name';
         h.run('INSERT INTO class_members (class_id,account_id,role,board,nickname,joined_at) VALUES (?,?,?,?,?,?)', c.id, me.id, inv.role, board, nick, now());
@@ -964,7 +1159,7 @@ export function createHub({
     const { m } = asMember(params.id, me);
     if (m.owner) bad('You are not a member of this class.');
     const board = V.enum(body.board ?? m.board, 'Leaderboard name', ['name', 'nickname', 'hidden']);
-    const nickname = 'nickname' in body ? V.str(body.nickname, 'Nickname', { optional: true, max: 30 }) : m.nickname;
+    const nickname = 'nickname' in body ? V.name(body.nickname, 'Nickname', { optional: true, max: 30, reserved: reservedFor(me) }) : m.nickname;
     if (board === 'nickname' && !nickname) bad('Pick a nickname first.');
     h.run('UPDATE class_members SET board = ?, nickname = ? WHERE class_id = ? AND account_id = ?', board, nickname, params.id, me.id);
     return { board, nickname };
@@ -984,7 +1179,8 @@ export function createHub({
     return {
       members: rows
         .filter((r) => teacher || r.role !== 'student' || r.board !== 'hidden' || r.account_id === me.id)
-        .map((r) => ({ id: teacher ? r.account_id : undefined, name: teacher || r.role !== 'student' ? r.display_name : boardName(r), role: r.role, joinedAt: r.joined_at, you: r.account_id === me.id, ...extrasFor(r, 'classes', { phone: classmate }) })),
+        // (A phone number would say who a nickname is: next to a student who doesn't show their name, only teachers see it.)
+        .map((r) => ({ id: teacher ? r.account_id : undefined, name: teacher || r.role !== 'student' ? r.display_name : boardName(r), role: r.role, joinedAt: r.joined_at, you: r.account_id === me.id, ...extrasFor(r, 'classes', { phone: classmate && (teacher || r.role !== 'student' || r.board === 'name') }) })),
     };
   });
   R('POST', '/v1/classes/:id/members/:accountId/remove', ({ me, params, ip }) => {
@@ -1039,7 +1235,7 @@ export function createHub({
     const to = query.to ? V.time(query.to, 'to') : now() + 60 * 86400_000;
     if (to - from > 400 * 86400_000) bad('Ask for at most 400 days at a time.');
     return {
-      sessions: h.all("SELECT s.*, c.title AS class_title FROM class_sessions s JOIN class_members m ON m.class_id = s.class_id JOIN classes c ON c.id = s.class_id WHERE m.account_id = ? AND c.status = 'active' AND s.end_at >= ? AND s.start_at <= ? ORDER BY s.start_at", me.id, from, to)
+      sessions: h.all(`SELECT s.*, c.title AS class_title FROM class_sessions s JOIN class_members m ON m.class_id = s.class_id JOIN classes c ON c.id = s.class_id WHERE m.account_id = ? AND c.status = 'active' AND ${ACTIVE_ORG_SQL} AND s.end_at >= ? AND s.start_at <= ? ORDER BY s.start_at`, me.id, from, to)
         .map((s) => ({ ...sessionOut(s), classTitle: s.class_title })),
     };
   });
@@ -1113,7 +1309,8 @@ export function createHub({
       h.run('INSERT INTO review_state (account_id,question_id,box,due_at,missed,seen) VALUES (?,?,?,?,?,?) ON CONFLICT(account_id,question_id) DO UPDATE SET box=excluded.box, due_at=excluded.due_at, missed=excluded.missed, seen=excluded.seen',
         me.id, q.id, r.state.box, r.state.dueAt, r.state.missedThisWindow ? 1 : 0, r.state.seen ? 1 : 0);
       let points = 0;
-      if (s.leaderboard && r.points > 0) {
+      // (Teachers practise like anyone, but never score on their own class's leaderboard.)
+      if (s.leaderboard && r.points > 0 && !teacher) {
         const today = h.get('SELECT COALESCE(SUM(points),0) AS s FROM xp_events WHERE account_id = ? AND day = ?', me.id, dayKey(t)).s;
         points = capped(r.points, today);
         if (points > 0) h.run('INSERT INTO xp_events (account_id,class_id,question_id,points,at,day) VALUES (?,?,?,?,?,?)', me.id, s.class_id, q.id, points, t, dayKey(t));
@@ -1125,7 +1322,7 @@ export function createHub({
       if (!reveal) return { correct: false, again: true, points: 0, scoring: true, capped: false, nextDueAt: r.state.dueAt, box: r.state.box, progress: progressOf(me.id) };
       return {
         correct, answer: q.answer, why: q.why, points, scoring: r.due,
-        capped: s.leaderboard && r.points > 0 && points < r.points,
+        capped: s.leaderboard && r.points > 0 && !teacher && points < r.points,
         nextDueAt: r.state.dueAt, box: r.state.box, progress: progressOf(me.id),
       };
     });
@@ -1217,7 +1414,7 @@ export function createHub({
   // storage, under <their Kea folder>/Shared/, which their Kea takes in on its next sync.
   function targetOf(v) {
     const t = checkPath(V.str(v, 'Target', { min: 5, max: 300 }).replace(/\/+$/, ''));
-    if (!t.startsWith('kea/')) bad('Course material can only go into your Kea folder.');
+    if (!t.startsWith('kea/') || t === 'kea/Documents' || t.startsWith('kea/Documents/')) bad('Course material can only go into your Kea folder.');
     return `${t}/`;
   }
   /** Their Kea folder when their Kea didn't say: the one profile folder in their storage, if there's exactly one. */
@@ -1259,11 +1456,12 @@ export function createHub({
   // When a job finishes: what it added to the section's material, to everyone in it. A scan's requester already has
   // theirs (the worker wrote their whole folder as their primary device); a question batch goes to everyone.
   /** "BIO 1010, Chapter 4" style words for a job, from what the person's Kea said when it asked. */
+  // (Built only from the normalized course key and a cleaned chapter name: what a person types never reaches someone
+  // else's notice as is, so nobody can put a message or a link in a classmate's notifications.)
   function jobLabel(j) {
-    let d = null;
-    try { d = j.detail ? JSON.parse(j.detail) : null; } catch {}
-    const course = d?.courseCode || (j.kind === 'initial_scan' ? 'your classes' : String(j.course_key).split('|')[1] || 'your course');
-    return j.chapter ? `${course}, ${j.chapter}` : course;
+    const course = j.kind === 'initial_scan' ? 'your classes' : keyLabel(j.course_key);
+    const chapter = j.chapter ? cleanText(j.chapter).replace(/[^\p{L}\p{N} .#-]+/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 40) : '';
+    return chapter ? `${course}, ${chapter}` : course;
   }
   function deliverJob(j) {
     if (j.delivered) return 0;
@@ -1293,13 +1491,13 @@ export function createHub({
   // Until then they get no material and no course_members row.
   const isCourseMember = (key, accountId) => !!h.get('SELECT 1 FROM course_members WHERE course_key = ? AND account_id = ?', key, accountId);
   const sectionExists = (key) => !!key && !!(h.get('SELECT 1 FROM course_members WHERE course_key = ? LIMIT 1', key) || h.get('SELECT 1 FROM course_files WHERE course_key = ? LIMIT 1', key));
-  const sectionLabel = (body) => {
-    const c = body.course && typeof body.course === 'object' ? body.course : {};
-    const code = String(body.detail?.courseCode || c.code || '').trim().slice(0, 60);
-    const term = String(c.term || '').trim().slice(0, 40);
-    const sec = String(c.section || '').trim().slice(0, 20);
-    return [code || 'a course', term, sec ? `section ${sec}` : ''].filter(Boolean).join(', ');
-  };
+  /** "BIOL1010, fall 2026, section 2" from a course key ("school|code|term|section", already normalized). */
+  function keyLabel(key) {
+    const part = (v, max) => String(v ?? '').replace(/[^a-z0-9 .-]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
+    const [, code, term, section] = String(key ?? '').split('|');
+    const c = part(code, 16).toUpperCase();
+    return [c || 'a course', part(term, 20), part(section, 10) ? `section ${part(section, 10)}` : ''].filter(Boolean).join(', ');
+  }
   /** In: a member from now on, with what the section already has copied over, and in its first scan if that's still running. */
   function admit(key, accountId, target, by) {
     h.run('INSERT OR IGNORE INTO course_members (course_key,account_id,joined_at,target) VALUES (?,?,?,?)', key, accountId, now(), target ?? null);
@@ -1321,11 +1519,16 @@ export function createHub({
     // Said no recently: no new request (and no new notices for them) for a day.
     const no = h.get("SELECT * FROM course_join_requests WHERE course_key = ? AND account_id = ? AND status = 'declined' AND decided_at > ? ORDER BY decided_at DESC LIMIT 1", key, me.id, now() - DAY_MS);
     if (no) return { status: 'declined', message: 'Someone in this section said no. Ask one of them for the section code instead.', request: requestOut(no), allowance: allowance(me) };
+    // A few new requests a day per person: each one notifies everyone in the section.
+    const [perDay, dayMs] = L.joinRequest;
+    if (me.role !== 'owner' && h.get('SELECT COUNT(*) AS n FROM course_join_requests WHERE account_id = ? AND created_at > ?', me.id, now() - dayMs).n >= perDay)
+      throw new HttpError(429, `You’ve asked to join ${perDay} course sections today. Try again tomorrow, or ask someone in the section for its code.`, { code: 'join_requests_daily' });
     const id = randomUUID();
     h.run('INSERT INTO course_join_requests (id,course_key,account_id,target,label,created_at) VALUES (?,?,?,?,?,?)', id, key, me.id, target, label, now());
     audit(me.id, 'course.join_request', id, { course: key }, ip);
+    // (The asker's name goes along as data for the app to show, never inside the title.)
     for (const m of h.all('SELECT account_id FROM course_members WHERE course_key = ? ORDER BY joined_at LIMIT 50', key))
-      notify(m.account_id, 'course_join', `${me.display_name} asks to join ${label}`, 'Let them in from Kea’s shared Claude panel, or give them this section’s code. Say no if you don’t know them.', { data: { requestId: id, course: key, label, name: me.display_name } });
+      notify(m.account_id, 'course_join', `Someone asks to join ${label}`, 'Let them in from Kea’s shared Claude panel, or give them this section’s code. Say no if you don’t know them.', { data: { requestId: id, course: key, label, name: cleanText(me.display_name).slice(0, 60) } });
     return { status: 'pending', message: PENDING, request: requestOut(h.get('SELECT * FROM course_join_requests WHERE id = ?', id)), allowance: allowance(me) };
   }
   const sectionKeyOf = (v) => (typeof v === 'string' ? V.str(v, 'Course', { min: 3, max: 400 }) : courseKey(V.obj(v))) ?? bad('Say which course.');
@@ -1406,7 +1609,7 @@ export function createHub({
         // (Asking for something else, like more questions: carry on with that now they're in.)
       } else {
         // (Whatever they asked for: once someone lets them in, they get the section's material and can ask again.)
-        return askToJoin(me, key, target, sectionLabel(body), ip);
+        return askToJoin(me, key, target, keyLabel(key), ip);
       }
     }
     // The first person in a section (by asking for anything on it) is its first member, and can let others in.
@@ -1579,28 +1782,39 @@ export function createHub({
     const r = relays.get(j.id);
     return { connected: !!r && now() - (r.seenAt || 0) < 30_000, waiting: r?.waiters.length ?? 0, queued: r?.queue.length ?? 0 };
   });
-  // The person's Kea folder (kea/...) while their job runs: the worker is their primary device for it.
+  // The person's Kea profile folder for this job (kea/Kea/<profile>/) while their job runs: the worker is their primary
+  // device for it. Nothing else in their storage: not their other profiles, and never their Kea Cloud documents
+  // (kea/Documents/).
+  const PROFILE_DIR = /^kea\/Kea\/[^/]+\/$/;
+  function jobScope(j) {
+    const t = PROFILE_DIR.test(j.target || '') ? j.target : guessTarget(j.account_id);
+    if (!t || !PROFILE_DIR.test(t)) forbidden('This job has no Kea profile folder to work in.');
+    return t;
+  }
+  function inScope(j, p) {
+    const scope = jobScope(j);
+    if (!p.startsWith(scope) || p === scope || p.startsWith('kea/Documents/')) forbidden('Only the job’s Kea profile folder.');
+    return p;
+  }
   O('GET', '/owner/scan/:id/kea-files', ({ params, query }) => {
     const j = runningJob(params.id);
-    return { files: spaceList(spaces.user(j.account_id), 'kea/', Number(query.since) || 0), now: now() };
+    const scope = jobScope(j);
+    return { files: spaceList(spaces.user(j.account_id), scope, Number(query.since) || 0), scope, now: now() };
   });
   O('GET', '/owner/scan/:id/kea-file', ({ params, query }) => {
     const j = runningJob(params.id);
-    const p = String(query.path ?? '');
-    if (!p.startsWith('kea/')) forbidden('Only their Kea folder.');
+    const p = inScope(j, String(query.path ?? ''));
     const sp = spaces.user(j.account_id);
     return rawOut(spaceRead(sp, spaceRow(sp, p) ?? notFound()));
   });
   O('PUT', '/owner/scan/:id/kea-file', ({ params, query, raw }) => {
     const j = runningJob(params.id);
-    const p = checkPath(String(query.path ?? ''));
-    if (!p.startsWith('kea/')) forbidden('Only their Kea folder.');
+    const p = inScope(j, checkPath(String(query.path ?? '')));
     return spaceWrite(spaces.user(j.account_id), p, raw);
   });
   O('DELETE', '/owner/scan/:id/kea-file', ({ params, query }) => {
     const j = runningJob(params.id);
-    const p = String(query.path ?? '');
-    if (!p.startsWith('kea/') || p === 'kea/') forbidden('Only files in their Kea folder.');
+    const p = inScope(j, String(query.path ?? ''));
     const sp = spaces.user(j.account_id);
     const row = spaceRow(sp, p);
     if (row) { h.run('DELETE FROM files WHERE account_id = ? AND path = ?', j.account_id, p); rmSync(join(sp.dir, row.blob), { force: true }); }
@@ -1641,7 +1855,7 @@ export function createHub({
     const emails = new Map(h.all('SELECT id, email FROM accounts').map((a) => [a.id, a.email]));
     return { paused: (getSetting('pausedUntil', 0) || 0) > now(), avgMinutes: Math.round(avgMinutes()), jobs: order.map((j) => ({ ...jobOut(j, order), email: emails.get(j.account_id), joined: h.get('SELECT COUNT(*) AS n FROM scan_job_members WHERE job_id = ?', j.id).n })) };
   });
-  const settingsOut = () => ({ limits: limitsNow(), donate: getSetting('donate', { url: null, message: null }), storage: storageSettings() });
+  const settingsOut = () => ({ limits: limitsNow(), donate: getSetting('donate', { url: null, message: null }), storage: storageSettings(), audit: { keepDays: auditKeepDays() } });
   O('GET', '/owner/settings', () => settingsOut());
   O('POST', '/owner/settings', ({ body }) => {
     // Storage sizes, in bytes or GB: the standard size for everyone, and a supporter's.
@@ -1670,6 +1884,10 @@ export function createHub({
         else next[k] = V.int(v, k, { min: 0, max: 100_000 });
       }
       setSetting('limits', next);
+    }
+    if (body.audit) {
+      const a = V.obj(body.audit);
+      if (a.keepDays != null) { setSetting('auditKeepDays', V.int(a.keepDays, 'keepDays', { min: 30, max: 3650 })); audit('owner', 'owner.audit_settings', null, { keepDays: a.keepDays }, 'local'); sweep(true); }
     }
     if (body.donate) {
       const d = V.obj(body.donate);
@@ -1700,6 +1918,8 @@ export function createHub({
     failedSignInsToday: h.get("SELECT COUNT(*) AS n FROM audit WHERE action LIKE 'auth.fail%' AND at > ?", now() - 86400_000).n,
     // How the Hub tells visitors apart (the header it trusts), and any setup problem with it.
     clientAddress: { header: ipHeader || null, warnings: [...ipWarnings].map((code) => ({ code, text: IP_WARN[code] })) },
+    // Owner powers (here and in the apps) wait until the owner account's two-step sign-in is on.
+    ownerTotp: { ok: !ownerTotpOff(), message: ownerTotpOff() ? OWNER_TOTP_MESSAGE : null },
   }));
   O('GET', '/owner/accounts', ({ query }) => {
     const q = `%${String(query.q ?? '').toLowerCase()}%`;
@@ -1809,7 +2029,9 @@ export function createHub({
   // Parent sign-offs: see them all, and approve or withdraw one by hand (for example after a parent emailed).
   O('GET', '/owner/consents', ({ query }) => ({
     consents: h.all(`SELECT c.*, a.email, a.display_name, a.birth_year FROM parent_consents c JOIN accounts a ON a.id = c.account_id ${query.status ? 'WHERE c.status = ?' : ''} ORDER BY c.created_at DESC LIMIT 500`, ...(query.status ? [String(query.status)] : []))
-      .map((c) => ({ id: c.id, accountId: c.account_id, email: c.email, name: c.display_name, birthYear: c.birth_year, parentEmail: c.parent_email, status: c.status, method: c.method, note: c.note, createdAt: c.created_at, decidedAt: c.decided_at })),
+      .map((c) => ({ id: c.id, accountId: c.account_id, email: c.email, name: c.display_name, birthYear: c.birth_year, parentEmail: c.parent_email, status: c.status, method: c.method, note: c.note, createdAt: c.created_at, decidedAt: c.decided_at, concerns: consentConcerns(c) }))
+      // review=1: only sign-offs with something to look at (a teen may have signed off for themselves).
+      .filter((c) => query.review !== '1' || c.concerns.length),
     waiting: h.all("SELECT id, email, display_name, birth_year FROM accounts WHERE birth_year IS NOT NULL AND role != 'owner' AND id NOT IN (SELECT account_id FROM parent_consents WHERE status = 'approved')")
       .filter((a) => isMinor(a.birth_year, thisYear(), limitsNow().parentConsentUnder))
       .map((a) => ({ accountId: a.id, email: a.email, name: a.display_name, birthYear: a.birth_year })),
@@ -1827,6 +2049,78 @@ export function createHub({
     if (approved) notify(a.id, 'parent_signoff', 'Your parent’s or guardian’s sign-off is recorded', 'Kea’s shared Claude works for you now.', { data: { status: 'approved' } });
     else notify(a.id, 'parent_signoff', 'Your parent’s or guardian’s sign-off was withdrawn', 'Kea’s shared Claude is off for you until a parent or guardian signs off again. Everything else in Kea works as before.', { data: { status: 'revoked' } });
     return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', a.id)) };
+  });
+  /** What makes a sign-off worth a look: the parent's email has a Kea account (under 18 even), or signed off for many. */
+  function consentConcerns(c) {
+    const out = [];
+    const acct = h.get('SELECT birth_year, role FROM accounts WHERE email = ?', c.parent_email);
+    if (acct) {
+      out.push('parent_email_has_kea_account');
+      if (acct.role !== 'owner' && isMinor(acct.birth_year, thisYear(), 18)) out.push('parent_account_under_18');
+    }
+    const others = h.get("SELECT COUNT(DISTINCT account_id) AS n FROM parent_consents WHERE status = 'approved' AND account_id != ? AND (parent_email = ? OR (parent_google_sub IS NOT NULL AND parent_google_sub = ?))", c.account_id, c.parent_email, c.parent_google_sub ?? null).n;
+    if (others >= 3) out.push('parent_signed_for_many');
+    return out;
+  }
+  // Two-step sign-in off for someone who lost their phone (after checking it's really them). Signs them out everywhere
+  // and tells them, so a person who didn't ask for it finds out.
+  O('POST', '/owner/accounts/:id/totp-reset', ({ params, body }) => {
+    const a = getAccount(params.id);
+    const note = V.str(body.note, 'note', { optional: true, max: 2000 });
+    h.tx(() => {
+      h.run('UPDATE accounts SET totp_enabled = 0, totp_secret = NULL, totp_last_step = -1, updated_at = ? WHERE id = ?', now(), a.id);
+      h.run('DELETE FROM sessions WHERE account_id = ?', a.id);
+    });
+    audit('owner', 'owner.totp_reset', a.id, { note, wasOn: !!a.totp_enabled }, 'local');
+    notify(a.id, 'account', 'Two-step sign-in was turned off for your account', 'Kea support turned it off and signed you out everywhere. Sign in with your password and turn two-step sign-in on again under Settings > Security. If you didn’t ask for this, change your password now and contact Kea support.', { note });
+    return { account: ownerView(h.get('SELECT * FROM accounts WHERE id = ?', a.id)) };
+  });
+  // Delete an account (after the person asked, by email for example). Same rules as deleting it yourself.
+  O('POST', '/owner/accounts/:id/delete', ({ params, body }) => {
+    const a = getAccount(params.id);
+    if (a.role === 'owner') forbidden('The Hub owner’s account can’t be deleted here.');
+    if (body.confirm !== a.email) bad('Send confirm: the account’s email address.');
+    deleteAccount(a, 'owner', 'local');
+    return { ok: true, deleted: true };
+  });
+  // Course sections: who's in each one, and taking someone out (or everyone, so the section starts over). A section's
+  // key is easy to guess, so the first person in becomes its gatekeeper; this is how the owner undoes squatting.
+  O('GET', '/owner/course-sections', ({ query }) => {
+    const q = `%${String(query.q ?? '').toLowerCase()}%`;
+    return {
+      sections: h.all('SELECT course_key, COUNT(*) AS n, MIN(joined_at) AS since FROM course_members WHERE course_key LIKE ? GROUP BY course_key ORDER BY since DESC LIMIT 200', q).map((k) => ({
+        course: k.course_key, label: keyLabel(k.course_key), since: k.since,
+        members: h.all('SELECT a.id, a.email, a.display_name, m.joined_at FROM course_members m JOIN accounts a ON a.id = m.account_id WHERE m.course_key = ? ORDER BY m.joined_at', k.course_key)
+          .map((m) => ({ accountId: m.id, email: m.email, name: m.display_name, joinedAt: m.joined_at })),
+        hasCode: !!h.get('SELECT 1 FROM course_codes WHERE course_key = ?', k.course_key),
+        pendingRequests: h.get("SELECT COUNT(*) AS n FROM course_join_requests WHERE course_key = ? AND status = 'pending'", k.course_key).n,
+        hasMaterial: !!h.get('SELECT 1 FROM course_files WHERE course_key = ? LIMIT 1', k.course_key),
+      })),
+    };
+  });
+  O('POST', '/owner/course-sections/remove', ({ body }) => {
+    const key = V.str(body.course, 'course', { min: 3, max: 400 });
+    const a = getAccount(V.str(body.account, 'account', { min: 1, max: 254 }));
+    const r = h.run('DELETE FROM course_members WHERE course_key = ? AND account_id = ?', key, a.id);
+    audit('owner', 'owner.course_remove', a.id, { course: key }, 'local');
+    return { removed: Number(r.changes) };
+  });
+  // Everyone out except `keep` (account ids or emails); the join code stops working and open requests are cancelled.
+  O('POST', '/owner/course-sections/reset', ({ body }) => {
+    const key = V.str(body.course, 'course', { min: 3, max: 400 });
+    const keep = new Set((Array.isArray(body.keep) ? body.keep : []).slice(0, 100).map((x) => getAccount(String(x)).id));
+    let removed = 0;
+    h.tx(() => {
+      for (const m of h.all('SELECT account_id FROM course_members WHERE course_key = ?', key)) {
+        if (keep.has(m.account_id)) continue;
+        h.run('DELETE FROM course_members WHERE course_key = ? AND account_id = ?', key, m.account_id);
+        removed++;
+      }
+      h.run('DELETE FROM course_codes WHERE course_key = ?', key);
+      h.run("UPDATE course_join_requests SET status = 'cancelled', decided_by = 'owner', decided_at = ? WHERE course_key = ? AND status = 'pending'", now(), key);
+    });
+    audit('owner', 'owner.course_reset', null, { course: key, removed, kept: keep.size }, 'local');
+    return { removed, kept: keep.size };
   });
   O('POST', '/owner/accounts/:id/unlock', ({ params }) => {
     const a = getAccount(params.id);
@@ -1948,6 +2242,9 @@ export function createHub({
         if (!me || me.status !== 'active') throw new HttpError(401, 'Sign in again.');
         if (now() - s.last_seen > 3600_000) h.run('UPDATE sessions SET last_seen = ? WHERE token_hash = ?', now(), s.token_hash);
         ctx.me = me;
+        // The Hub owner's account has powers over everyone's: none of them work until its two-step sign-in is on. Only
+        // what's needed to turn it on (and to read the account and terms) works before that.
+        if (me.role === 'owner' && !me.totp_enabled && !r.basic) throw new HttpError(403, OWNER_TOTP_MESSAGE, { ownerTotpRequired: true });
         // Nothing else works until the current terms are agreed to (reading them, exporting data and signing out still do).
         if (r.terms) {
           const ts = termsStatus(me.id);
@@ -2133,21 +2430,29 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
     return done(row ? 200 : 201, { path, version, size: data.length, sha256: hash }, { etag: `"${version}"` });
   }
 
+  // Owner-console routes that work while the owner account's two-step sign-in is off: the status page only.
+  const OWNER_OPEN = new Set(['GET /owner/stats']);
+  const ownerTotpOff = () => !!h.get("SELECT 1 FROM accounts WHERE role = 'owner' AND totp_enabled = 0");
   async function handleOwner(req, res) {
     let status = 200, payload;
     try {
-      // Belt and braces: the listener is bound to 127.0.0.1, and the key must match too.
+      // Belt and braces: the listener is bound to 127.0.0.1, and every call answers a fresh challenge too.
       const addr = req.socket.remoteAddress;
       if (addr !== '127.0.0.1' && addr !== '::1' && addr !== '::ffff:127.0.0.1') forbidden();
       if (req.headers.origin || req.headers['sec-fetch-site']) forbidden('The owner console takes no browser requests.');
-      const given = Buffer.from(String(req.headers['x-kea-owner-key'] || ''));
-      if (given.length !== ownerKey.length || !timingSafeEqual(given, ownerKey)) throw new HttpError(401, 'Owner key required.');
       const url = new URL(req.url, 'http://localhost');
+      // The challenge (hub/lib/ownerauth.mjs): a nonce, answered with an HMAC made with the owner key.
+      if (req.method === 'GET' && url.pathname === '/owner/nonce') { send(res, 200, { nonce: nonces.issue() }); return; }
+      if (req.headers['x-kea-owner-key'] != null) throw new HttpError(401, 'The owner console no longer takes the owner key itself. Update KeaS and Kea on this PC.');
+      const taken = nonces.take(req.headers[OWNER_AUTH_HEADER]);
+      if (!taken) throw new HttpError(401, 'Owner sign-in required: answer a fresh challenge from /owner/nonce.');
+      const raw = req.method === 'POST' || req.method === 'PUT' ? await readRaw(req, req.method === 'PUT' ? maxFileBytes : MAX_BODY) : Buffer.alloc(0);
+      if (!nonces.check(ownerKeyNow(), taken, req.method, req.url, raw)) throw new HttpError(401, 'Owner sign-in failed.');
       const { r, params } = own.find(req.method, url.pathname);
-      let body = {}, raw = null;
-      if (req.method === 'POST') { const text = await readBody(req); if (text.trim()) { try { body = JSON.parse(text); } catch { bad('Invalid JSON.'); } } body = V.obj(body); }
-      if (req.method === 'PUT') raw = await readFileBody(req, maxFileBytes);
-      payload = await r.handler({ params, body, raw, query: Object.fromEntries(url.searchParams) });
+      if (!OWNER_OPEN.has(`${req.method} ${url.pathname}`) && ownerTotpOff()) throw new HttpError(403, OWNER_TOTP_MESSAGE, { ownerTotpRequired: true });
+      let body = {};
+      if (req.method === 'POST') { const text = raw.toString('utf8'); if (text.trim()) { try { body = JSON.parse(text); } catch { bad('Invalid JSON.'); } } body = V.obj(body); }
+      payload = await r.handler({ params, body, raw: req.method === 'PUT' ? raw : null, query: Object.fromEntries(url.searchParams) });
       if (payload && payload.__raw) {
         res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': payload.__raw.length, 'cache-control': 'no-store', ...payload.headers });
         res.end(payload.__raw);
@@ -2167,16 +2472,35 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
   // The owner console is local only, but a stuck or slow client still shouldn't hold it open. (Large worker uploads
   // are 64 MB at most over loopback, so two minutes is plenty.)
   ownerServer.headersTimeout = 15_000; ownerServer.requestTimeout = 120_000;
-  const listenOn = (srv, port) => new Promise((resolve) => srv.listen(port, HOST, () => {
-    const a = srv.address();
-    if (srv === apiServer && !ipHeader && !isLoopback(a.address)) warnIp('exposed', IP_WARN.exposed);
-    resolve(a.port);
-  }));
+  // A port another program already holds (maybe another Windows account's program pretending to be the Hub) is a clear
+  // error, never a crash and never a silent second Hub.
+  const listenOn = (srv, port) => new Promise((resolve, reject) => {
+    const onError = (e) => {
+      srv.off('listening', onListening);
+      reject(e.code === 'EADDRINUSE'
+        ? Object.assign(new Error(`Port ${port} on ${HOST} is already in use by another program, so the Kea Hub can’t start. Close the other Kea Hub (or whatever holds that port; check with: netstat -ano | findstr :${port}) and start it again.`), { code: 'EADDRINUSE', port })
+        : e);
+    };
+    const onListening = () => {
+      srv.off('error', onError);
+      srv.on('error', (e) => console.error(`Kea Hub listener on port ${port}: ${e.message}`));
+      const a = srv.address();
+      if (srv === apiServer && !ipHeader && !isLoopback(a.address)) warnIp('exposed', IP_WARN.exposed);
+      resolve(a.port);
+    };
+    srv.once('error', onError);
+    srv.once('listening', onListening);
+    srv.listen(port, HOST);
+  });
 
   return {
-    h, key, ownerKey: ownerKey.toString(),
+    h, key,
+    /** The owner key now (it can be rotated: `node hub/owner.mjs rotate-key`). */
+    get ownerKey() { return ownerKeyNow(); },
     async listen({ port = Number(process.env.KEA_HUB_PORT) || 4860, ownerPort = Number(process.env.KEA_HUB_OWNER_PORT) || 4861 } = {}) {
-      return { port: await listenOn(apiServer, port), ownerPort: await listenOn(ownerServer, ownerPort) };
+      const p = await listenOn(apiServer, port);
+      try { return { port: p, ownerPort: await listenOn(ownerServer, ownerPort) }; }
+      catch (e) { await new Promise((r) => apiServer.close(() => r())); throw e; }
     },
     close() {
       clearInterval(sweepTimer);
@@ -2187,6 +2511,8 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const hub = createHub();
-  const { port, ownerPort } = await hub.listen();
+  let ports;
+  try { ports = await hub.listen(); } catch (e) { console.error(e.message); await hub.close().catch(() => {}); process.exit(1); }
+  const { port, ownerPort } = ports;
   console.log(`Kea Hub ${VERSION} on http://${HOST}:${port} (tunnel this one). Owner console on http://${HOST}:${ownerPort} (never tunnel this).`);
 }

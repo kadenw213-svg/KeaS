@@ -46,17 +46,28 @@ function readCookie(header, name) {
   }
   return null;
 }
-/** True unless the browser tells us the request came from another site. Non-browser clients send neither header. */
-function sameOrigin(req, secure) {
+/**
+ * True unless the browser tells us the request came from another site. Non-browser clients send neither header. The
+ * Origin is compared with the server's own addresses (`origins`), never with the request's Host header, which a page
+ * using DNS rebinding controls.
+ */
+function sameOrigin(req, origins) {
   const site = req.headers['sec-fetch-site'];
   if (site && site !== 'same-origin' && site !== 'none') return false;
   const origin = req.headers.origin;
   if (origin == null) return true;
-  return origin === `${secure ? 'https' : 'http'}://${req.headers.host}`;
+  return origins.has(String(origin).toLowerCase());
 }
 
 // ---------- server ----------
 /**
+ * demo: true (or KEAS_DEV_DEMO=1) is for development and tests only: it fills an empty database with the sample
+ * workplace and turns on the pick-a-person sign-in (/v1/auth/demo-users, /v1/auth/demo-login). Never in the KeaS app:
+ * anyone who can reach that server would sign in as anybody.
+ * publicHosts: host names the server is also reached at (the KeaS app's Tailscale Funnel address). Every request must
+ * name this server's own address in its Host header (127.0.0.1, localhost or [::1] with its port, or a public host),
+ * so a web page can't reach it by pointing its own domain name at 127.0.0.1 (DNS rebinding).
+ *
  * vault: true runs the payroll vault (the payroll admin's own PC): it starts locked and empty, and payroll admins sign
  * in with their Kea Hub account plus the vault passphrase. Otherwise the workforce server runs with its vault opened by
  * `passphrase` (the KeaS app keeps it protected by Windows), and fills an empty database with the sample workplace.
@@ -67,14 +78,18 @@ function sameOrigin(req, secure) {
  */
 export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = process.env.KEAS_WEB_DIR || DEFAULT_WEB_DIR, log = true, now = () => Date.now(),
   vault: vaultMode = process.env.KEAS_VAULT === '1', hubUrl = process.env.KEAS_HUB_URL || null, sharedDir = SHARED, passphrase = process.env.KEAS_VAULT_PASSPHRASE || null, fetchImpl = globalThis.fetch,
-  localSignIn = false, devKeyFile = dbFile === DEFAULT_DB || dbFile === ':memory:' || process.env.KEAS_DEV_KEYFILE === '1' } = {}) {
+  localSignIn = false, devKeyFile = dbFile === DEFAULT_DB || dbFile === ':memory:' || process.env.KEAS_DEV_KEYFILE === '1',
+  demo = process.env.KEAS_DEV_DEMO === '1', publicHosts = [] } = {}) {
+  const demoOn = !!demo && !vaultMode;
+  const extraHosts = (Array.isArray(publicHosts) ? publicHosts : [publicHosts]).filter(Boolean).map((x) => String(x).toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, ''));
   const fixedHubUrl = checkHubUrl(hubUrl);
   const h = openDb(dbFile);
   const vault = makeVault(h);
   if (vaultMode) h.run('DELETE FROM sessions');
   else {
     try { openDevVault(vault, dbFile, passphrase, { keyFile: devKeyFile }); } catch (e) { h.close(); throw e; }
-    if (h.isEmpty()) seed(h, { now: now(), vault });
+    // (The sample workplace only for development and tests, never in a real organization's database.)
+    if (demoOn && h.isEmpty()) seed(h, { now: now(), vault });
   }
   const us = readJson(join(sharedDir, 'labor', 'US.json'));
   const tablesFor = makeTables(sharedDir);
@@ -172,10 +187,10 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     return { token, expiresAt, person: publicPerson(p, p, loadOrg(p.orgId)), cookies: [sessionCookie(token, SESSION_HOURS * 3600, secure)] };
   };
 
-  // Development sign-in (pick a person). Not available in the payroll vault.
-  if (!vaultMode) route('GET', '/v1/auth/demo-users', () => h.all(`SELECT * FROM people ORDER BY id`).map(rowToPerson).map((p) => ({ id: p.id, name: p.name, roles: p.roles, positions: p.positions, status: p.status })), { auth: false });
+  // Development sign-in (pick a person): only with demo on (development and tests), never in the vault or the app.
+  if (demoOn) route('GET', '/v1/auth/demo-users', () => h.all(`SELECT * FROM people ORDER BY id`).map(rowToPerson).map((p) => ({ id: p.id, name: p.name, roles: p.roles, positions: p.positions, status: p.status })), { auth: false });
 
-  if (!vaultMode) route('POST', '/v1/auth/demo-login', ({ body, secure }) => {
+  if (demoOn) route('POST', '/v1/auth/demo-login', ({ body, secure }) => {
     const personId = V.id(body.personId, 'personId');
     const row = h.get('SELECT * FROM people WHERE id = ?', personId);
     if (!row) throw new HttpError(404, 'person not found');
@@ -504,15 +519,19 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     let cookies = [];
     const url = new URL(req.url, 'http://localhost');
     const secure = !!req.socket.encrypted || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+    // Only requests to this server's own address (DNS rebinding): every mode, the web app's files too.
+    if (!ownHost(req.headers.host)) {
+      res.writeHead(421, { ...securityHeaders(), 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ error: vaultMode ? 'This payroll vault only answers at its own address on this computer.' : 'This KeaS server only answers at its own address.' }));
+      if (log) console.log(`${new Date().toISOString()} ${req.method} ${url.pathname} 421 ${Date.now() - t0}ms`);
+      return;
+    }
     if (url.pathname !== '/v1' && !url.pathname.startsWith('/v1/')) {
       serveStatic(req, res, webDir);
       if (log) console.log(`${new Date().toISOString()} ${req.method} ${url.pathname} ${res.statusCode} ${Date.now() - t0}ms`);
       return;
     }
     try {
-      // The payroll vault answers only to its own address on this computer, so a web page that points its own domain
-      // name at 127.0.0.1 (DNS rebinding) can't reach it.
-      if (vaultMode && !ownHost(req.headers.host)) throw new HttpError(421, 'This payroll vault only answers at its own address on this computer.');
       const r = routes.find((x) => x.method === req.method && x.re.test(url.pathname));
       if (!r) throw new HttpError(routes.some((x) => x.re.test(url.pathname)) ? 405 : 404, 'not found');
       const params = {}; const m = url.pathname.match(r.re); r.keys.forEach((k, i) => (params[k] = decodeURIComponent(m[i + 1])));
@@ -532,7 +551,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
       const viaCookie = !bearer && !!cookieToken;
       // CSRF: anything a browser could send cross-site must prove it came from our own page.
       if (req.method !== 'GET' && req.method !== 'HEAD' && !bearer) {
-        if (!sameOrigin(req, secure)) throw new HttpError(403, 'cross-site request refused');
+        if (!sameOrigin(req, ownOrigins())) throw new HttpError(403, 'cross-site request refused');
         if (viaCookie && req.headers['x-keas'] !== '1') throw new HttpError(403, 'missing X-KeaS header');
       }
       ctx.token = bearer || cookieToken;
@@ -573,10 +592,12 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
   }
 
   const server = http.createServer((req, res) => { handle(req, res).catch((e) => { console.error(e); try { res.writeHead(500); res.end('{"error":"internal error"}'); } catch {} }); });
+  const localHosts = () => { const port = server.address()?.port; return [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]; };
   function ownHost(host) {
-    const port = server.address()?.port;
-    return [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`].includes(String(host || '').toLowerCase());
+    const h0 = String(host || '').toLowerCase();
+    return localHosts().includes(h0) || extraHosts.some((x) => h0 === x || h0 === `${x}:443`);
   }
+  const ownOrigins = () => new Set([...localHosts().map((x) => `http://${x}`), ...extraHosts.map((x) => `https://${x}`)]);
   return {
     server, h, vault,
     /**
@@ -597,7 +618,8 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  const app = createApp();
+  // (--demo: the sample workplace and pick-a-person sign-in, for development; `npm run server:dev` and `npm run dev`.)
+  const app = createApp({ demo: process.argv.includes('--demo') || process.env.KEAS_DEV_DEMO === '1' });
   const port = await app.listen();
   console.log(`KeaS workforce server ${VERSION} on http://${HOST}:${port}`);
 }

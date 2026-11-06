@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { createHub } from '../../hub/index.mjs';
+import { ownerFetch } from '../../hub/lib/ownerauth.mjs';
 import { codeAt, stepOf } from '../../hub/lib/totp.mjs';
 import { verifyToken } from '../../hub/lib/tokens.mjs';
 import { POINTS } from '../../hub/lib/study.mjs';
@@ -41,7 +42,7 @@ async function call(method, path, token, body, headers = {}) {
   return { status: r.status, body: await r.json(), headers: r.headers };
 }
 async function owner(method, path, body, key = hub.ownerKey) {
-  const r = await fetch(ownerBase + path, { method, headers: { 'content-type': 'application/json', 'x-kea-owner-key': key }, body: body && JSON.stringify(body) });
+  const r = await ownerFetch(ownerBase, key, method, path, body);
   return { status: r.status, body: await r.json() };
 }
 let ipN = 0;
@@ -141,7 +142,7 @@ test('guessing one password from many addresses is still bounded; Google and two
   // With two-step sign-in on, a correct password and a correct code still get in during the lock.
   const t = await call('POST', '/v1/auth/login', null, { email: 'target@example.com', password: 'lantern velvet orbit' }, freshIp());
   assert.equal(t.status, 200);
-  const s = await call('POST', '/v1/me/totp/setup', t.body.token);
+  const s = await call('POST', '/v1/me/totp/setup', t.body.token, { password: 'lantern velvet orbit' });
   await call('POST', '/v1/me/totp/enable', t.body.token, { code: codeAt(s.body.secret, stepOf(clock)) });
   clock += 30_000;
   assert.equal((await guess('198.19.203.1')).status, 401); // (and locked again)
@@ -156,7 +157,7 @@ test('guessing one password from many addresses is still bounded; Google and two
 
 test('two-step: a right password without a code counts toward the lock like a wrong one', async () => {
   const t = await register('oracle@example.com');
-  const s = await call('POST', '/v1/me/totp/setup', t);
+  const s = await call('POST', '/v1/me/totp/setup', t, { password: 'lantern velvet orbit' });
   await call('POST', '/v1/me/totp/enable', t, { code: codeAt(s.body.secret, stepOf(clock)) });
   const ip = { 'x-test-ip': '198.18.5.5' };
   for (let i = 0; i < 5; i++) {
@@ -197,7 +198,7 @@ test('cookie sessions need same-origin + X-Kea header for POST; logout ends the 
 
 test('two-step sign-in: setup, enable, login needs code, replay refused', async () => {
   const t = await register('totp@example.com');
-  const s = await call('POST', '/v1/me/totp/setup', t);
+  const s = await call('POST', '/v1/me/totp/setup', t, { password: 'lantern velvet orbit' });
   assert.match(s.body.uri, /^otpauth:\/\/totp\/Kea:/);
   assert.equal((await call('POST', '/v1/me/totp/enable', t, { code: '000000' })).status, 400);
   const code = codeAt(s.body.secret, stepOf(clock));
@@ -234,7 +235,7 @@ test('owner console: needs the key, and only exists on its own port', async () =
   assert.equal((await owner('GET', '/owner/stats', undefined, 'wrong')).status, 401);
   assert.equal((await owner('GET', '/owner/stats')).status, 200);
   assert.equal((await call('GET', '/owner/stats')).status, 404, 'not on the public API');
-  const browserish = await fetch(ownerBase + '/owner/stats', { headers: { 'x-kea-owner-key': hub.ownerKey, origin: 'https://evil.example' } });
+  const browserish = await ownerFetch(ownerBase, hub.ownerKey, 'GET', '/owner/stats', undefined, { headers: { origin: 'https://evil.example' } });
   assert.equal(browserish.status, 403);
 });
 
@@ -459,10 +460,10 @@ test('shared Claude: verified only, classmates share one scan, batches of 25, li
   assert.equal((await owner('POST', '/owner/scan/next')).body.job, null, 'one at a time');
   const inbox = await owner('GET', `/owner/scan/${jobId}/inbox`);
   assert.deepEqual(inbox.body.files.map((f) => f.path), [`scan-inbox/${jobId}/content.md`]);
-  const got = await fetch(`${ownerBase}/owner/scan/${jobId}/inbox-file?path=${encodeURIComponent(`scan-inbox/${jobId}/content.md`)}`, { headers: { 'x-kea-owner-key': hub.ownerKey } });
+  const got = await ownerFetch(ownerBase, hub.ownerKey, 'GET', `/owner/scan/${jobId}/inbox-file?path=${encodeURIComponent(`scan-inbox/${jobId}/content.md`)}`);
   assert.equal(await got.text(), '# CHEM 1110\nWeek 1: atoms');
   // Results: a shared textbook chapter for the section, and a private file for one member.
-  const putOwner = (p, data) => fetch(`${ownerBase}${p}`, { method: 'PUT', headers: { 'x-kea-owner-key': hub.ownerKey }, body: data });
+  const putOwner = (p, data) => ownerFetch(ownerBase, hub.ownerKey, 'PUT', p, data);
   assert.equal((await putOwner(`/owner/scan/${jobId}/course-file?path=textbook/ch01.md`, '# Atoms')).status, 200);
   const bId = next.body.job.members.find((m) => m.email === 'scan-b@example.com').id;
   assert.equal((await putOwner(`/owner/scan/${jobId}/member-file?account=${bId}&path=guides.json`, '{"private":true}')).status, 200);
@@ -543,7 +544,7 @@ test('relay: the worker browses through the person’s own Kea; their Kea folder
   await owner('POST', `/owner/accounts/${email}`, { emailVerified: true });
   const other = await register('relay-other@example.com');
   const course = { school: 'Relay U', code: 'HIS 101', term: 'Fall 2027' };
-  const q = await call('POST', '/v1/scan', t, { kind: 'initial_scan', course });
+  const q = await call('POST', '/v1/scan', t, { kind: 'initial_scan', course, target: 'kea/Kea/School/' });
   const jobId = q.body.job.id;
   await fetch(`${base}/v1/files/scan-inbox/${jobId}/school.json`, { method: 'PUT', headers: { authorization: `Bearer ${t}` }, body: '{"home":"https://d2l.relay.edu"}' });
   await call('POST', `/v1/scan/${jobId}/ready`, t);
@@ -576,18 +577,28 @@ test('relay: the worker browses through the person’s own Kea; their Kea folder
   assert.deepEqual((await asked2).body, { ok: false, result: null, error: 'Not signed in' });
   assert.equal((await owner('POST', `/owner/scan/${jobId}/call`, { op: 'postForm' })).status, 400, 'only read operations exist');
 
-  // The worker acts as their primary device: read and write their kea/ folder, nothing else.
-  const putK = (p, data) => fetch(`${ownerBase}/owner/scan/${jobId}/kea-file?path=${encodeURIComponent(p)}`, { method: 'PUT', headers: { 'x-kea-owner-key': hub.ownerKey }, body: data });
-  assert.equal((await putK('kea/School/Devices/primary.json', '{"id":"worker"}')).status, 200);
+  // The worker acts as their primary device for the job's profile folder (kea/Kea/School/), nothing else: not their
+  // Kea Cloud documents, not another profile.
+  const putMineFile = (p, data) => fetch(`${base}/v1/files/${p}`, { method: 'PUT', headers: { authorization: `Bearer ${t}` }, body: data });
+  assert.equal((await putMineFile('kea/Documents/diary.docx', 'private')).status, 201);
+  assert.equal((await putMineFile('kea/Kea/Work/notes.json', '{}')).status, 201);
+  const putK = (p, data) => ownerFetch(ownerBase, hub.ownerKey, 'PUT', `/owner/scan/${jobId}/kea-file?path=${encodeURIComponent(p)}`, data);
+  const getK = (p) => owner('GET', `/owner/scan/${jobId}/kea-file?path=${encodeURIComponent(p)}`);
+  assert.equal((await putK('kea/Kea/School/Devices/primary.json', '{"id":"worker"}')).status, 200);
   assert.equal((await putK('scan-inbox/x', 'x')).status, 403);
+  assert.equal((await putK('kea/Documents/diary.docx', 'x')).status, 403, 'never Kea Cloud documents');
+  assert.equal((await putK('kea/Kea/Work/notes.json', '{}')).status, 403, 'never another profile');
+  assert.equal((await getK('kea/Documents/diary.docx')).status, 403);
+  assert.equal((await getK('kea/Kea/Work/notes.json')).status, 403);
+  assert.equal((await owner('DELETE', `/owner/scan/${jobId}/kea-file?path=${encodeURIComponent('kea/Documents/diary.docx')}`)).status, 403);
   const kf = await owner('GET', `/owner/scan/${jobId}/kea-files`);
-  assert.deepEqual(kf.body.files.map((f) => f.path), ['kea/School/Devices/primary.json']);
-  const theirs = await call('GET', '/v1/files?prefix=kea/', t);
-  assert.equal(theirs.body.files[0].path, 'kea/School/Devices/primary.json', 'it lands in their own storage, so their Kea follows it');
+  assert.deepEqual(kf.body.files.map((f) => f.path), ['kea/Kea/School/Devices/primary.json']);
+  const theirs = await call('GET', '/v1/files?prefix=kea/Kea/School/', t);
+  assert.equal(theirs.body.files[0].path, 'kea/Kea/School/Devices/primary.json', 'it lands in their own storage, so their Kea follows it');
 
   // Finished: the relay closes and the folder is theirs alone again.
   await owner('POST', `/owner/scan/${jobId}/finish`, { ok: true });
-  assert.equal((await putK('kea/School/x.json', '{}')).status, 404);
+  assert.equal((await putK('kea/Kea/School/x.json', '{}')).status, 404);
   assert.equal((await call('GET', `/v1/scan/${jobId}/calls`, t)).status, 404);
 });
 
@@ -613,7 +624,7 @@ async function runUntil(jobId) {
   for (const j of (await owner('GET', '/owner/scan/queue')).body.jobs.filter((x) => x.status === 'running' && x.id !== jobId)) await owner('POST', `/owner/scan/${j.id}/finish`, { ok: false, note: 'test' });
   for (let n = await owner('POST', '/owner/scan/next'); n.body.job && n.body.job.id !== jobId; n = await owner('POST', '/owner/scan/next')) await owner('POST', `/owner/scan/${n.body.job.id}/finish`, { ok: false, note: 'test' });
 }
-const putOwnerFile = (p, data) => fetch(ownerBase + p, { method: 'PUT', headers: { 'x-kea-owner-key': hub.ownerKey }, body: data });
+const putOwnerFile = (p, data) => ownerFetch(ownerBase, hub.ownerKey, 'PUT', p, data);
 const putMine = (t, p, data) => fetch(`${base}/v1/files/${p}`, { method: 'PUT', headers: { authorization: `Bearer ${t}` }, body: data });
 const readMine = async (t, p) => (await fetch(`${base}/v1/files/${p.split('/').map(encodeURIComponent).join('/')}`, { headers: { authorization: `Bearer ${t}` } })).text();
 

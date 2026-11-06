@@ -130,12 +130,12 @@ test('CSV: Google-Sheets shape (one column per weekday block, dates listed), and
   const [head, line] = csv.trim().split('\r\n');
   assert.ok(head.startsWith('Timestamp,Email Address,Name,Monday 4:45am-9am,Monday 9am-1pm,Monday 3:45pm-8:45pm,Tuesday 4:45am-9am'), head);
   assert.ok(head.includes('12/12 Swim meet 5pm-9pm'));
-  assert.ok(head.endsWith('Desired hours per week,Days off needed,Can you teach lessons?,Notes by date,Notes'));
+  assert.ok(head.endsWith('Desired hours per week,Days off needed,Can you teach lessons?,Notes by date,Notes,Email verified'));
   assert.ok(line.startsWith('11/20/2026 14:05:33,ana@example.com,Ana Ruiz,'), line);
   assert.ok(line.includes('"12/1, 12/8, 12/15 (if needed)"'));
   assert.ok(line.includes(',15-20,12/24-12/26,Yes,12/3: dentist,Prefer opening'));
   const long = longExport({ slots: s, rows }).split('\r\n');
-  assert.equal(long[0], 'Name,Email,Date,Weekday,Block,Start,End,Answer,Note for the date');
+  assert.equal(long[0], 'Name,Email,Date,Weekday,Block,Start,End,Answer,Note for the date,Email verified');
   assert.equal(long.length, s.length + 2);
   // Spreadsheet formulas are never passed through.
   assert.equal(toCsv([['=HYPERLINK("x")']]), `"'=HYPERLINK(""x"")"\r\n`);

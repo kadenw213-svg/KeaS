@@ -7,6 +7,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHub } from '../../hub/index.mjs';
+import { ownerFetch } from '../../hub/lib/ownerauth.mjs';
 import { clientAddress, cleanIp, ipBucket } from '../../hub/lib/clientip.mjs';
 import { failures, globalLockFor, GLOBAL_FREE, GLOBAL_IPS, GLOBAL_MAX_LOCK_MS } from '../../hub/lib/limiter.mjs';
 import { payrollKey, payrollValue, checkNoPayroll, MAX_NODES } from '../../hub/org/payroll.mjs';
@@ -31,7 +32,7 @@ async function call(method, path, token, body, headers = {}) {
   return { status: r.status, body: await r.json() };
 }
 const owner = async (method, path, body) => {
-  const r = await fetch(ownerBase + path, { method, headers: { 'content-type': 'application/json', 'x-kea-owner-key': hub.ownerKey }, body: body && JSON.stringify(body) });
+  const r = await ownerFetch(ownerBase, hub.ownerKey, method, path, body);
   return { status: r.status, body: await r.json() };
 };
 async function person(email, name = 'Pat') {
@@ -133,7 +134,13 @@ test('stored names that Kea would decode into "..", a separator, a drive or a de
 });
 
 test('client address: only the last X-Forwarded-For entry, only when configured, malformed values ignored', () => {
-  const h = (v) => ({ 'x-forwarded-for': v });
+  // (X-Forwarded-For counts only on requests Tailscale Funnel marked as its own.)
+  const h = (v) => ({ 'x-forwarded-for': v, 'tailscale-funnel-request': '?1' });
+  const local = clientAddress({ 'x-forwarded-for': '1.2.3.4' }, '127.0.0.1', 'x-forwarded-for');
+  assert.deepEqual(local, { ip: '127.0.0.1', shared: true, forwardedUntrusted: false }, 'a local program can’t pick its own address');
+  assert.equal(clientAddress({ 'x-forwarded-for': '1.2.3.4', 'tailscale-funnel-request': '?0' }, '127.0.0.1', 'x-forwarded-for').ip, '127.0.0.1');
+  // Another proxy's header, configured on purpose, is trusted as configured.
+  assert.equal(clientAddress({ 'cf-connecting-ip': '9.9.9.9' }, '127.0.0.1', 'cf-connecting-ip').ip, '9.9.9.9');
   assert.deepEqual(clientAddress(h('1.2.3.4'), '127.0.0.1', 'x-forwarded-for'), { ip: '1.2.3.4', shared: false, forwardedUntrusted: false });
   assert.equal(clientAddress(h('6.6.6.6, 203.0.113.9'), '127.0.0.1', 'x-forwarded-for').ip, '203.0.113.9', 'earlier entries can be faked');
   assert.equal(clientAddress(h('203.0.113.9, garbage'), '127.0.0.1', 'x-forwarded-for').ip, '127.0.0.1', 'a malformed last entry is not used');
@@ -143,7 +150,7 @@ test('client address: only the last X-Forwarded-For entry, only when configured,
   assert.equal(clientAddress(h('::ffff:198.51.100.2'), '127.0.0.1', 'x-forwarded-for').ip, '198.51.100.2');
   assert.equal(clientAddress({}, '::ffff:127.0.0.1', 'x-forwarded-for').ip, '127.0.0.1');
   // Not configured: the header is never trusted, and its presence is a setup warning.
-  const u = clientAddress(h('1.2.3.4'), '127.0.0.1', null);
+  const u = clientAddress({ 'x-forwarded-for': '1.2.3.4' }, '127.0.0.1', null);
   assert.deepEqual(u, { ip: '127.0.0.1', shared: true, forwardedUntrusted: true });
   assert.deepEqual(clientAddress({}, '127.0.0.1', null), { ip: '127.0.0.1', shared: false, forwardedUntrusted: false });
   assert.equal(clientAddress({ 'tailscale-funnel-request': '?1' }, '127.0.0.1', null).forwardedUntrusted, true);
@@ -163,7 +170,7 @@ test('a Hub behind a proxy with no address header set warns in /owner/stats, and
   const h2 = createHub({ dataDir: d, log: false, ipHeader: null, minFreeBytes: 0 });
   try {
     const p = await h2.listen({ port: 0, ownerPort: 0 });
-    const stats = async () => (await (await fetch(`http://127.0.0.1:${p.ownerPort}/owner/stats`, { headers: { 'x-kea-owner-key': h2.ownerKey } })).json()).clientAddress;
+    const stats = async () => (await (await ownerFetch(`http://127.0.0.1:${p.ownerPort}`, h2.ownerKey, 'GET', '/owner/stats')).json()).clientAddress;
     assert.deepEqual(await stats(), { header: null, warnings: [] });
     // 31 sign-in tries through "the proxy": everyone looks like 127.0.0.1, so the 30-per-address limit is raised for it.
     let last;

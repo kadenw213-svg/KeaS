@@ -7,7 +7,7 @@
   "license": "MIT",
   "scripts": {
     "dev": "node scripts/dev.mjs",
-    "server:dev": "node server/index.mjs",
+    "server:dev": "node server/index.mjs --demo",
     "web:dev": "vite web",
     "web:build": "vite build web",
     "typecheck": "tsc -p web",

@@ -207,6 +207,10 @@ const COLUMNS = [
   // Optional phone number, and who may see it: 'nobody', 'classes', 'orgs' or 'both'.
   ['accounts', 'phone', 'TEXT'],
   ['accounts', 'phone_visibility', "TEXT NOT NULL DEFAULT 'nobody'"],
+  // When this session last proved it's the person (password or Google again), for changes to how they sign in.
+  ['sessions', 'reauth_at', 'INTEGER'],
+  // The organization a class belongs to (org classes): it works only while that organization is active.
+  ['classes', 'org_id', 'TEXT'],
 ];
 
 export function openDb(file) {
