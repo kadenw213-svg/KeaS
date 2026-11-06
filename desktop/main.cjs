@@ -316,8 +316,11 @@ function registerIpc() {
     const db = await hubDb();
     let token;
     const existing = db.get('SELECT id FROM accounts WHERE email = ?', String(email).trim().toLowerCase());
-    if (existing) token = (await local('/v1/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) })).token;
-    else token = (await local('/v1/auth/register', { method: 'POST', body: JSON.stringify({ email, password, displayName: name, age13: true, termsVersion, termsSections }) })).token;
+    // Registering never returns a session (the Hub answers the same for new and existing emails), so a new account
+    // is made first and then signed in like an existing one. A brand-new account has no two-step sign-in yet.
+    if (!existing) await local('/v1/auth/register', { method: 'POST', body: JSON.stringify({ email, password, displayName: name, age13: true, termsVersion, termsSections }) });
+    token = (await local('/v1/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) })).token;
+    if (!token) throw new Error('The Hub didn’t sign the owner account in. Check the password and try again.');
     const a = db.get('SELECT * FROM accounts WHERE email = ?', String(email).trim().toLowerCase());
     db.run("UPDATE accounts SET role = 'owner', can_host = 1, email_verified = 1, verified_by = 'owner', identity_verified = 1, updated_at = ? WHERE id = ?", Date.now(), a.id);
     db.run('INSERT INTO audit (at,actor,action,target,ip) VALUES (?,?,?,?,?)', Date.now(), 'keas-setup', 'owner.make_owner', a.id, 'local');
