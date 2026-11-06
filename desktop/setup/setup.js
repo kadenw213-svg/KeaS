@@ -221,6 +221,11 @@ function status() {
       h('p', null, 'Data: ', h('span', { class: 'url' }, c.dataDir), ' ', h('button', { class: 'btn', onclick: () => k.openFolder({ dir: c.dataDir }) }, 'Open folder')),
       c.role === 'hub' && h('p', { class: 'muted small' }, `Each account gets ${c.quotaGb || 25} GB of Kea storage. Owner: ${c.ownerEmail || 'not set'}.`)),
     c.role === 'hub' && c.publicUrl && h('p', null, h('button', { class: 'btn', onclick: () => k.openExternal({ url: `${c.publicUrl}/terms` }) }, 'Open the terms page')),
+    h('h2', { style: 'margin-top:22px' }, 'Payroll'),
+    h('div', { class: 'panel' },
+      h('p', null, 'Pay runs, tax forms and HR records for your organization. Payroll runs only on this computer: SSNs and bank details are encrypted with a passphrase you choose and never go to the Hub.'),
+      h('p', null, h('button', { class: 'btn primary', onclick: async () => { try { await call(k.openPayroll); } catch (e) { fail(e); } } }, 'Open Payroll'))),
+    S.error && h('div', { class: 'err' }, S.error),
     h('p', { class: 'muted small' }, 'Closing this window keeps the server running in the tray. Quit from the tray icon to stop it.'),
   ];
 }

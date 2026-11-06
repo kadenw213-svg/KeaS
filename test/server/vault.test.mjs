@@ -157,3 +157,22 @@ test('the vault works with real data: an employee’s SSN and bank are sealed; c
   assert.ok(pr.tables.some((t) => t.key === 'tax:TX' && t.missing));
   assert.equal(pr.canFinalize, false);
 });
+
+test('hours imported into the vault become timecards and pay', async () => {
+  const ok = await call('POST', '/v1/vault/signin', null, { email: ACCOUNT.email, password: ACCOUNT.password, passphrase: 'a brand new vault passphrase' });
+  const t = ok.body.token;
+  const me = (await call('GET', '/v1/me', t)).body;
+  const ps = me.period.lastCompleted.start;
+  const d = (n) => new Date(Date.parse(ps + 'T12:00:00Z') + n * 86400000).toISOString().slice(0, 10);
+  const csv = `Employee,Date,In,Out,Position\r\nJamie Cruz,${d(1)},8:00 AM,4:30 PM,Counselor\r\nJamie Cruz,${d(2)},08:00,18:00,Counselor\r\n`;
+  const pv = await call('POST', '/v1/import/preview', t, { kind: 'hours', csv });
+  assert.equal(pv.body.matched, 2);
+  const r = await call('POST', '/v1/import/commit', t, { kind: 'hours', csv });
+  assert.equal(r.body.updated, 2);
+  assert.equal((await call('POST', '/v1/import/commit', t, { kind: 'hours', csv })).body.skipped, 2, 'importing twice adds nothing');
+  const pid = app.h.get(`SELECT id FROM people WHERE name = 'Jamie Cruz'`).id;
+  const tc = (await call('GET', `/v1/timecards?personId=${pid}&periodStart=${ps}`, t)).body;
+  assert.equal(tc.totals.workedMin, 8.5 * 60 + 10 * 60);
+  const pr = (await call('GET', `/v1/payrun/preview?periodStart=${ps}`, t)).body;
+  assert.equal(pr.lines.find((l) => l.personId === pid).gross, Math.round(18.5 * 1600));
+});

@@ -5,6 +5,7 @@ import { csvObjects } from '../lib/csv.mjs';
 import { isValidRouting } from '../lib/nacha.mjs';
 import { validSsn } from './paystructure.mjs';
 import { balance } from './leave.mjs';
+import { zonedToUtc } from '../lib/time.mjs';
 
 export const SOURCES = ['gusto', 'adp', 'paychex', 'quickbooks', 'other'];
 const n = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -45,6 +46,15 @@ const MATCH = {
     state_famli: ['famli', 'statefamli', 'paidfamilyleave', 'familyleave', 'pfml', 'fli'],
     net: ['netpay', 'net', 'ytdnet', 'netpayytd'],
   },
+  hours: {
+    name: ['name', 'employeename', 'fullname', 'employee'], firstName: ['firstname', 'first'], lastName: ['lastname', 'last'],
+    email: ['email', 'workemail'], employeeNumber: ['employeeid', 'employeenumber', 'empid', 'fileno', 'id'],
+    date: ['date', 'workdate', 'day', 'shiftdate', 'punchdate'],
+    hours: ['hours', 'totalhours', 'hoursworked', 'regularhours', 'duration', 'total'],
+    start: ['in', 'start', 'starttime', 'clockin', 'timein', 'punchin'],
+    end: ['out', 'end', 'endtime', 'clockout', 'timeout', 'punchout'],
+    position: ['position', 'job', 'role', 'jobtitle', 'jobcode'],
+  },
   pto: {
     name: ['name', 'employeename', 'fullname', 'employee'], firstName: ['firstname', 'first'], lastName: ['lastname', 'last'],
     email: ['email', 'workemail'], employeeNumber: ['employeeid', 'employeenumber', 'empid', 'fileno', 'id'],
@@ -75,6 +85,14 @@ export function parseMoney(v) {
   return Number.isFinite(x) ? Math.round((neg ? -x : x) * 100) : NaN;
 }
 /** 2026-03-01, 3/1/2026, 03/01/26 -> YYYY-MM-DD (or null). */
+/** "9:00", "17:30", "5:30 PM" -> "HH:MM" (or null). */
+export function parseTime(v) {
+  const m = /^(\d{1,2}):(\d{2})(?::\d{2})?\s*([ap]\.?m\.?)?$/i.exec(String(v ?? '').trim());
+  if (!m) return null;
+  let hh = Number(m[1]);
+  if (m[3]) { const pm = /p/i.test(m[3]); if (hh === 12) hh = pm ? 12 : 0; else if (pm) hh += 12; }
+  return hh < 24 && Number(m[2]) < 60 ? `${String(hh).padStart(2, '0')}:${m[2]}` : null;
+}
 export function parseDate(v) {
   const s = String(v ?? '').trim();
   if (!s) return null;
@@ -108,6 +126,16 @@ function readRow(kind, row, mapping) {
       if (Number.isNaN(v)) problems.push(`${f} isn’t a number`); else if (v != null) out.amounts[f] = v;
     }
     if (out.amounts.gross == null) problems.push('no gross amount');
+  } else if (kind === 'hours') {
+    out.date = parseDate(get('date'));
+    if (!out.date || Number.isNaN(out.date)) { problems.push('no date'); out.date = null; }
+    out.start = parseTime(get('start'));
+    out.end = parseTime(get('end'));
+    const hrs = get('hours') === '' ? null : Number(String(get('hours')).replace(/[^\d.]/g, ''));
+    out.hours = hrs;
+    if (out.start == null && out.hours == null) problems.push('give hours, or in and out times');
+    if (out.hours != null && !(out.hours > 0 && out.hours <= 24)) problems.push('hours must be between 0 and 24');
+    out.position = get('position') || null;
   } else if (kind === 'pto') {
     out.policy = get('policy');
     out.hours = Number(String(get('hours')).replace(/[^\d.-]/g, ''));
@@ -182,6 +210,21 @@ export function registerImport(c) {
           const st = org.state.toLowerCase();
           for (const [code, cents] of Object.entries(r.amounts)) h.run('INSERT INTO ytd_imports (person_id,year,as_of,code,cents,source,created_at) VALUES (?,?,?,?,?,?,?)', person.id, year, asOf, code === 'state_income' ? `${st}_income` : code === 'state_famli' ? `${st}_famli` : code, cents, p.source, iso(now()));
           h.run('UPDATE people SET ytd_wages_cents = ?, ytd_year = ? WHERE id = ?', r.amounts.gross, year, person.id);
+          result.updated++;
+        } else if (p.kind === 'hours') {
+          // Hours worked become a shift and an in/out punch pair (source "import"), so they go through timecards,
+          // overtime, differentials and approvals like clocked time.
+          const pos = r.position ? h.get('SELECT id FROM positions WHERE org_id = ? AND (lower(name) = lower(?) OR id = ?)', org.id, r.position, r.position)?.id : null;
+          let positionId = pos || (!r.position && (JSON.parse(person.positions || '[]')[0] || h.get('SELECT id FROM positions WHERE org_id = ? ORDER BY name LIMIT 1', org.id)?.id));
+          if (!positionId) { positionId = uid('pos'); h.run(`INSERT INTO positions (id,org_id,name,tags) VALUES (?,?,?,'[]')`, positionId, org.id, r.position || 'Staff'); }
+          const startMs = zonedToUtc(r.date, r.start || '09:00', org.tz);
+          let endMs = r.end ? zonedToUtc(r.date, r.end, org.tz) : startMs + Math.round(r.hours * 60) * 60000;
+          if (endMs <= startMs) endMs += 86400000;
+          const key = `import:${person.id}:${new Date(startMs).toISOString()}`;
+          if (h.get('SELECT 1 FROM punches WHERE source = ?', key)) { result.skipped++; return; }
+          const sid = uid('s');
+          h.run(`INSERT INTO shifts (id,org_id,position_id,person_id,start,"end",status,note) VALUES (?,?,?,?,?,?,'published',?)`, sid, org.id, positionId, person.id, new Date(startMs).toISOString(), new Date(endMs).toISOString(), `Hours imported from ${p.source}`);
+          for (const [type, ms] of [['in', startMs], ['out', endMs]]) h.run('INSERT INTO punches (id,person_id,shift_id,type,at,source,rest_attested,created_at) VALUES (?,?,?,?,?,?,?,?)', uid('pu'), person.id, sid, type, new Date(ms).toISOString(), key, 1, iso(now()));
           result.updated++;
         } else if (p.kind === 'pto') {
           const pol = h.get('SELECT * FROM pto_policies WHERE org_id = ? AND lower(name) = lower(?)', org.id, r.policy);

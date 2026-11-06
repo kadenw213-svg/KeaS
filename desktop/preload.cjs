@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld('keas', {
   setTheme: call('setTheme'),
   openExternal: call('openExternal'),
   openFolder: call('openFolder'),
+  openPayroll: call('payroll:open'),
   onProgress: (cb) => {
     const fn = (_e, line) => cb(line);
     ipcRenderer.on('progress', fn);
