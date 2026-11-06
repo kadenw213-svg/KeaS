@@ -5,8 +5,15 @@
 // has no Argon2, so there it's scrypt at OWASP's recommended strength (N=2^17, r=8, p=1: 128 MiB per hash). Both
 // formats verify wherever their algorithm exists, and a hash weaker than today's settings is upgraded on the next
 // successful sign-in (needsRehash).
-import { argon2, argon2Sync, scrypt, randomBytes, timingSafeEqual } from 'node:crypto';
+import { argon2Sync, randomBytes, timingSafeEqual } from 'node:crypto';
 import { COMMON } from './common-passwords.mjs';
+import { createHashPool } from './hashpool.mjs';
+
+// Every hash runs in the worker pool (./hashpool.mjs), never on the Hub's main thread.
+let pool = null;
+const hashPool = () => (pool ??= createHashPool({ size: 2, maxQueue: 32 }));
+/** How busy hashing is (for the owner's stats). */
+export const hashStats = () => (pool ? pool.stats() : { running: 0, queued: 0, workers: 0, size: 2, maxQueue: 32, done: 0, refused: 0, failed: 0, peakQueue: 0 });
 
 export const PARAMS = { memory: 19456, passes: 2, parallelism: 1, tagLength: 32 };
 export const SCRYPT = { N: 2 ** 17, r: 8, p: 1, keylen: 32 };
@@ -16,14 +23,8 @@ export const HAS_ARGON2 = (() => {
 })();
 
 const b64 = (b) => Buffer.from(b).toString('base64url');
-const deriveArgon = (password, salt, p) =>
-  new Promise((resolve, reject) =>
-    argon2('argon2id', { message: Buffer.from(password, 'utf8'), nonce: salt, parallelism: p.parallelism, tagLength: p.tagLength, memory: p.memory, passes: p.passes }, (err, out) => (err ? reject(err) : resolve(out))),
-  );
-const deriveScrypt = (password, salt, p) =>
-  new Promise((resolve, reject) =>
-    scrypt(Buffer.from(password, 'utf8'), salt, p.keylen, { N: p.N, r: p.r, p: p.p, maxmem: 160 * p.N * p.r + 1024 * 1024 }, (err, out) => (err ? reject(err) : resolve(out))),
-  );
+const deriveArgon = (password, salt, p) => hashPool().run({ alg: 'argon2id', password, salt, p: { parallelism: p.parallelism, tagLength: p.tagLength, memory: p.memory, passes: p.passes } });
+const deriveScrypt = (password, salt, p) => hashPool().run({ alg: 'scrypt', password, salt, p: { N: p.N, r: p.r, p: p.p, keylen: p.keylen } });
 
 /** `argon2id$m=19456,t=2,p=1$<salt>$<hash>` or `scrypt$n=17,r=8,p=1$<salt>$<hash>` (n is log2 N). */
 export async function hashPassword(password, { algorithm = HAS_ARGON2 ? 'argon2id' : 'scrypt' } = {}) {
@@ -46,8 +47,9 @@ function parse(stored) {
 }
 
 // A real hash of a random password: checking an unknown email costs the same time as checking a real one.
+// (Kept as a promise, so many first sign-ins at once make it only once.)
 let dummy = null;
-const dummyHash = async () => (dummy ??= await hashPassword(randomBytes(18).toString('base64url')));
+const dummyHash = () => (dummy ??= hashPassword(randomBytes(18).toString('base64url')).catch((e) => { dummy = null; throw e; }));
 
 /** Constant-time check. A missing or malformed hash still does the full work and returns false. */
 export async function verifyPassword(password, stored) {

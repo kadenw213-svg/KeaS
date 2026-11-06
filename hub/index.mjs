@@ -7,7 +7,10 @@
 //     (`node hub/owner.mjs make-owner <email>`), never through the API.
 import http from 'node:http';
 import { createHash, randomBytes, randomUUID, sign as edSign } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, statfsSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, statfsSync, statSync, createReadStream, createWriteStream } from 'node:fs';
+import { mkdir as mkdirP, readFile as readFileP, rename as renameP, rm as rmP } from 'node:fs/promises';
+import { Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkTerms, diffTerms, sameSections, termsPage } from './lib/terms.mjs';
@@ -22,7 +25,10 @@ import { ownerNonces, OWNER_AUTH_HEADER } from './lib/ownerauth.mjs';
 import { cleanText, isReservedName } from './lib/names.mjs';
 import { loadOrCreateKey, signToken } from './lib/tokens.mjs';
 import { writeSecretFile } from './lib/secureFile.mjs';
-import { Windows, failures } from './lib/limiter.mjs';
+import { Windows, Buckets, failures } from './lib/limiter.mjs';
+import { Busy } from './lib/hashpool.mjs';
+import { hashStats } from './lib/passwords.mjs';
+import { createHubLog } from './lib/hublog.mjs';
 import { clientAddress, ipBucket, isLoopback } from './lib/clientip.mjs';
 import { scoreAnswer, capped, levelOf, weekStart, dayKey, streak } from './lib/study.mjs';
 import { mountOrgs } from './org/routes.mjs';
@@ -176,8 +182,17 @@ export function createHub({
   storageDir = process.env.KEA_HUB_STORAGE || join(dataDir, 'storage'),
   defaultQuotaBytes = (Number(process.env.KEA_HUB_QUOTA_GB) || 5) * 1024 ** 3,
   supporterQuotaBytes = (Number(process.env.KEA_HUB_SUPPORTER_QUOTA_GB) || 25) * 1024 ** 3,
-  minFreeBytes = 5 * 1024 ** 3,
+  // Free space always left on the storage and data drives: null = the bigger of 5 GB and 2% of the drive.
+  minFreeBytes = null,
   maxFileBytes = 64 * 1024 ** 2,
+  // Each file also counts this much toward the limit (so millions of empty files aren't free), and there's a cap on
+  // how many one account can keep.
+  fileOverheadBytes = 4096,
+  maxFilesPerAccount = 50_000,
+  // An account whose email nobody has proven yet gets this much storage at most (until verified with Google).
+  unverifiedQuotaBytes = 250 * 1024 ** 2,
+  // The request log: a size-limited file of its own (hub/lib/hublog.mjs); `log` also prints it.
+  logFile = null,
   // Verify with Google: the Kea OAuth client IDs whose tokens are accepted, and how to get Google's keys.
   googleClientIds = String(process.env.KEA_GOOGLE_CLIENT_IDS || '').split(',').map((s) => s.trim()).filter(Boolean),
   googleKeyFn = null,
@@ -221,7 +236,15 @@ export function createHub({
   const fails = failures(h, now);
   // phone: changes to the phone number, per account per day.
   // joinRequest: requests to join someone else's course section, per account per day (each one notifies the section).
-  const L = { login: [30, 10 * 60_000], register: [5, 60 * 60_000], join: [20, 10 * 60_000], answer: [240, 60_000], phone: [5, 86400_000], joinRequest: [10, 86400_000], ...limits };
+  // pwcheck: password checks with a session (changing it, two-step changes), per account. google: verifying with Google
+  // while signed in, per account. Buckets (rate a second, burst): rps per address and rpsAll for everyone, before
+  // anything else; authAll for all sign-ins and sign-ups together (each costs a password hash); writes per account.
+  const L = {
+    login: [30, 10 * 60_000], register: [5, 60 * 60_000], join: [20, 10 * 60_000], answer: [240, 60_000], phone: [5, 86400_000], joinRequest: [10, 86400_000],
+    pwcheck: [10, 10 * 60_000], google: [10, 10 * 60_000],
+    rps: [20, 60], rpsAll: [2000, 4000], authAll: [20, 200], writes: [20, 100],
+    ...limits,
+  };
   // An address that can stand for many people (the tunnel's own loopback address, when the Hub can't tell clients
   // apart) gets SHARED_FACTOR times the limit, so a few bad requests can't lock everyone out of the Hub.
   const SHARED_FACTOR = 20;
@@ -234,6 +257,32 @@ export function createHub({
   // Names only the owner may use (hub/lib/names.mjs): Kea's own, and the owner's display name.
   const ownerNames = () => h.all("SELECT display_name FROM accounts WHERE role = 'owner'").map((r) => r.display_name);
   const reservedFor = (me) => ({ owner: me?.role === 'owner', ownerNames });
+  // ---------- load: cheap checks before anything else, and what's busy (shown in /owner/stats) ----------
+  const buckets = new Buckets();
+  const busy = { rejected: 0, shed: 0, lagMs: 0, maxLagMs: 0, downloads: 0, uploads: 0, connections: 0, refusedConnections: 0 };
+  let lagAt = Date.now();
+  const lagTimer = setInterval(() => { const t = Date.now(); busy.lagMs = Math.max(0, t - lagAt - 100); busy.maxLagMs = Math.max(busy.maxLagMs, busy.lagMs); lagAt = t; }, 100);
+  lagTimer.unref?.();
+  /** Every sign-in and sign-up together (each costs a password hash): past the budget, "busy" at once. */
+  const authBudget = () => { const [rate, burst] = L.authAll; if (buckets.take('auth:all', rate, burst, Date.now()) > 0) throw new Busy('Many people are signing in right now. Try again in a few seconds.'); };
+  // Concurrency slots: downloads and uploads per account, per address and in all.
+  const slots = new Map();
+  function takeSlots(list) {
+    for (const [k, max] of list) if ((slots.get(k) || 0) >= max) return null;
+    for (const [k] of list) slots.set(k, (slots.get(k) || 0) + 1);
+    let released = false;
+    return () => { if (released) return; released = true; for (const [k] of list) { const n = (slots.get(k) || 1) - 1; if (n) slots.set(k, n); else slots.delete(k); } };
+  }
+  // Bytes in and out per day (per account and for everyone), for the owner's daily budgets. In memory: a restart
+  // starts the day's count again.
+  const daily = new Map();
+  const dayCount = (key) => daily.get(`${dayKey(now())}|${key}`) || 0;
+  const dayAdd = (key, n) => {
+    const today = dayKey(now()), k = `${today}|${key}`;
+    daily.set(k, (daily.get(k) || 0) + n);
+    if (daily.size > 20_000) for (const kk of daily.keys()) if (!kk.startsWith(today)) daily.delete(kk);
+  };
+  const hlog = createHubLog({ file: logFile, toConsole: !!log });
   const audit = (actor, action, target, detail, ip) =>
     h.run('INSERT INTO audit (at,actor,action,target,detail,ip) VALUES (?,?,?,?,?,?)', now(), actor ?? null, action, target ?? null, detail == null ? null : JSON.stringify(detail), ip ?? null);
   const getSetting = (k, fallback) => { const r = h.get('SELECT value FROM settings WHERE key = ?', k); return r ? JSON.parse(r.value) : fallback; };
@@ -324,21 +373,51 @@ export function createHub({
   // Everyone gets the default; a supporter gets at least the supporter size; the owner can set any size for one
   // person (accounts.quota_bytes), and a supporter keeps the bigger of that and the supporter size. Nothing is ever
   // deleted when a limit drops below what someone uses: they just can't add more until they're under it again.
+  // The owner's limits for everyone together (null = none): all storage, and new bytes per day per account and in all.
+  // An account whose email isn't verified gets at most unverifiedQuotaBytes, so throwaway accounts can't fill the drive.
   const storageSettings = () => {
     const s = getSetting('storage', {});
     const ok = (v) => Number.isFinite(v) && v >= 0;
-    return { defaultQuotaBytes: ok(s.defaultQuotaBytes) ? s.defaultQuotaBytes : defaultQuotaBytes, supporterQuotaBytes: ok(s.supporterQuotaBytes) ? s.supporterQuotaBytes : supporterQuotaBytes };
+    const or = (v, d) => (ok(v) ? v : d);
+    return {
+      defaultQuotaBytes: or(s.defaultQuotaBytes, defaultQuotaBytes), supporterQuotaBytes: or(s.supporterQuotaBytes, supporterQuotaBytes),
+      unverifiedQuotaBytes: or(s.unverifiedQuotaBytes, unverifiedQuotaBytes),
+      globalBytes: ok(s.globalBytes) ? s.globalBytes : null,
+      dailyAccountBytes: or(s.dailyAccountBytes, 5 * 1024 ** 3), dailyGlobalBytes: or(s.dailyGlobalBytes, 100 * 1024 ** 3),
+      dailyEgressBytes: or(s.dailyEgressBytes, 50 * 1024 ** 3),
+    };
   };
   const supporterActive = (a) => a.supporter_until != null && a.supporter_until > now();
   const quotaOf = (a, S = storageSettings()) => {
-    const base = a.quota_bytes == null ? S.defaultQuotaBytes : a.quota_bytes;
+    let base = a.quota_bytes == null ? S.defaultQuotaBytes : a.quota_bytes;
+    if (a.quota_bytes == null && !a.email_verified && a.role !== 'owner') base = Math.min(base, S.unverifiedQuotaBytes);
     return supporterActive(a) ? Math.max(base, S.supporterQuotaBytes) : base;
   };
-  const usedBy = (accountId) => h.get('SELECT COALESCE(SUM(size),0) AS s FROM files WHERE account_id = ?', accountId).s;
+  // What an account uses: kept in accounts.used_bytes and file_count by triggers on the files table (hub/db.mjs), so
+  // checking it is one row, not a sum over every file. Each file also counts fileOverheadBytes.
+  const usage = (accountId) => h.get('SELECT used_bytes, file_count FROM accounts WHERE id = ?', accountId) ?? { used_bytes: 0, file_count: 0 };
+  const usedBy = (accountId) => { const u = usage(accountId); return u.used_bytes + u.file_count * fileOverheadBytes; };
   const storageOut = (a) => {
     const used = usedBy(a.id), quota = quotaOf(a), S = storageSettings();
-    return { used, quota, over: used > quota, custom: a.quota_bytes != null, supporter: supporterActive(a), standard: S.defaultQuotaBytes, supporterQuota: S.supporterQuotaBytes };
+    return { used, quota, over: used > quota, custom: a.quota_bytes != null, supporter: supporterActive(a), standard: S.defaultQuotaBytes, supporterQuota: S.supporterQuotaBytes,
+      files: usage(a.id).file_count, maxFiles: maxFilesPerAccount, unverifiedLimit: a.quota_bytes == null && !a.email_verified && a.role !== 'owner' ? S.unverifiedQuotaBytes : null };
   };
+  /** Refuses a write that would leave less free space than the minimum on the storage drive or the data drive. */
+  function checkDisk(size) {
+    for (const d of new Set([storageDir, dataDir])) {
+      let fs;
+      try { fs = statfsSync(d); } catch { continue; }
+      const keep = minFreeBytes != null ? minFreeBytes : Math.max(5 * 1024 ** 3, Math.floor(fs.blocks * fs.bsize * 0.02));
+      if (fs.bavail * fs.bsize - size < keep) throw new HttpError(507, "The Kea Hub's drive is nearly full. Try again later.", { storageFull: true });
+    }
+  }
+  /** The owner's storage budgets: all storage together, and new bytes today (this account's and everyone's). */
+  function checkBudgets(me, size) {
+    const S = storageSettings();
+    if (S.globalBytes != null && h.get('SELECT COALESCE(SUM(used_bytes),0) AS s FROM accounts').s + size > S.globalBytes) throw new HttpError(507, 'The Kea Hub’s storage is full right now. Nothing of yours was deleted; try again later.', { storageFull: true });
+    if (me.role !== 'owner' && dayCount(`in:${me.id}`) + size > S.dailyAccountBytes) throw new HttpError(429, `You’ve uploaded ${fmtBytes(dayCount(`in:${me.id}`))} today, the most for one day. The rest can go up tomorrow.`, { retryAfter: 3600 });
+    if (me.role !== 'owner' && dayCount('in:*') + size > S.dailyGlobalBytes) throw new HttpError(503, 'The Kea Hub has taken in all it can for today. Try again tomorrow.', { retryAfter: 3600 });
+  }
   /** Says plainly what a smaller limit means for someone already over it. */
   /** After the standard or supporter size changed: a notice to everyone whose storage changed because of it. */
   function noticeStorageChange(before, after) {
@@ -364,6 +443,7 @@ export function createHub({
       .map((f) => ({ path: f.path, size: f.size, version: f.version, sha256: f.sha256, updatedAt: f.updated_at }));
   const spaceRead = (sp, row) => readFileSync(join(sp.dir, row.blob));
   function spaceWrite(sp, p, data) {
+    checkDisk(data.length);
     const row = spaceRow(sp, p);
     const blob = randomUUID();
     mkdirSync(sp.dir, { recursive: true });
@@ -381,24 +461,44 @@ export function createHub({
     h.run(`DELETE FROM ${sp.table} WHERE ${sp.col} = ? AND substr(path, 1, length(?)) = ?`, sp.id, prefix, prefix);
   }
   const rawOut = (data, headers = {}) => ({ __raw: data, headers });
-  // Pacing what the Hub sends, so big downloads never fill the owner's home upload: every large response shares one
-  // budget of maxSendMbps. Small files (under 256 KB: sync data, cards, requests) go straight out.
-  const SMALL = 256 * 1024, CHUNK = 64 * 1024;
-  let paceAt = Date.now();
-  async function sendPaced(res, data) {
-    if (data.length <= SMALL) return void res.end(data);
-    for (let o = 0; o < data.length; o += CHUNK) {
-      const part = data.subarray(o, o + CHUNK);
-      const bytesPerMs = (Math.max(1, limitsNow().maxSendMbps) * 1e6) / 8 / 1000;
-      // Reserve this chunk's time on the shared clock; wait until it comes round.
-      const t = Date.now();
-      paceAt = Math.max(paceAt, t) + part.length / bytesPerMs;
-      const wait = paceAt - t - part.length / bytesPerMs;
-      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-      if (res.destroyed) return;
-      if (!res.write(part)) await new Promise((r) => res.once('drain', r));
+  // Pacing what the Hub sends, so big downloads never fill the owner's home upload: everything over 16 KB (files and
+  // big JSON answers alike) shares one budget of maxSendMbps, and each account gets a fair share of it while several
+  // download at once. Files are streamed from disk, never read whole into memory. A client that stops reading for
+  // DRAIN_MS is cut off.
+  const SMALL = 16 * 1024, CHUNK = 64 * 1024, DRAIN_MS = 30_000;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const activeSenders = new Map();
+  const drained = (res) => new Promise((resolve, reject) => {
+    const t = setTimeout(() => { res.destroy(); reject(new Error('The client stopped reading.')); }, DRAIN_MS);
+    const done = () => { clearTimeout(t); res.off('drain', done); res.off('close', done); resolve(); };
+    res.once('drain', done);
+    res.once('close', done);
+  });
+  /** Sends a Buffer or a readable stream (headers already written), paced; `who` is the account it counts for. */
+  async function sendPaced(res, src, who = null) {
+    if (Buffer.isBuffer(src) && src.length <= SMALL) { if (who) dayAdd(`out:${who}`, src.length); res.end(src); return; }
+    if (who) activeSenders.set(who, (activeSenders.get(who) || 0) + 1);
+    try {
+      const chunks = Buffer.isBuffer(src) ? (function* () { for (let o = 0; o < src.length; o += CHUNK) yield src.subarray(o, o + CHUNK); })() : src;
+      for await (const part of chunks) {
+        const rate = (Math.max(1, limitsNow().maxSendMbps) * 1e6) / 8;
+        let wait = buckets.spend('egress:all', rate, CHUNK * 2, Date.now(), part.length);
+        if (who) {
+          const share = rate / Math.max(1, activeSenders.size);
+          wait = Math.max(wait, buckets.spend(`egress:${who}`, share, CHUNK * 2, Date.now(), part.length));
+          dayAdd(`out:${who}`, part.length);
+        }
+        if (wait > 0) await sleep(Math.min(wait, 10_000));
+        if (res.destroyed) return;
+        if (!res.write(part)) await drained(res);
+      }
+      res.end();
+    } catch {
+      res.destroy();
+    } finally {
+      if (who) { const n = (activeSenders.get(who) || 1) - 1; if (n) activeSenders.set(who, n); else activeSenders.delete(who); }
+      if (!Buffer.isBuffer(src)) src.destroy?.();
     }
-    res.end();
   }
 
   const publicAccount = (a) => ({
@@ -527,6 +627,17 @@ export function createHub({
     h.run('DELETE FROM notifications WHERE read_at IS NOT NULL AND read_at < ?', now() - 180 * DAY_MS);
     // Routine sign-in records (auth.*) go after the owner's setting (default 365 days); changes to accounts stay.
     h.run("DELETE FROM audit WHERE action LIKE 'auth.%' AND at < ?", now() - auditKeepDays() * DAY_MS);
+    // Once a day: what's only kept for a while.
+    if (force || now() - (getSetting('prunedAt', 0) || 0) > DAY_MS) prune();
+  }
+  function prune() {
+    setSetting('prunedAt', now());
+    h.run('DELETE FROM sessions WHERE expires_at < ?', now());
+    h.run('DELETE FROM login_failures WHERE last_at < ?', now() - DAY_MS);
+    h.run('DELETE FROM login_fail_pairs WHERE last_at < ?', now() - DAY_MS);
+    h.run('DELETE FROM scan_requests WHERE at < ?', now() - 30 * DAY_MS);
+    h.run("DELETE FROM course_join_requests WHERE status != 'pending' AND COALESCE(decided_at, created_at) < ?", now() - 30 * DAY_MS);
+    h.run('DELETE FROM google_tokens_used WHERE at < ?', now() - DAY_MS);
   }
   const sweepTimer = setInterval(() => { try { sweep(true); } catch (e) { console.error(e); } }, 3600_000);
   sweepTimer.unref?.();
@@ -614,6 +725,7 @@ export function createHub({
   const REGISTERED = 'If this email isn’t registered yet, your account is ready. If it is, sign in with your password.';
   R('POST', '/v1/auth/register', async ({ body, ip, client }) => {
     limit('register', ip);
+    authBudget();
     const email = V.email(body.email);
     const displayName = V.name(body.displayName, 'Name', { min: 1, max: 60, reserved: reservedFor(null) });
     if (body.age13 !== true) bad('Kea accounts are for people 13 and older.');
@@ -647,6 +759,7 @@ export function createHub({
 
   R('POST', '/v1/auth/login', async ({ body, ip, ipKey, client }) => {
     limit('login', ipKey);
+    authBudget();
     const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
     const password = typeof body.password === 'string' ? body.password : '';
     if (!email || !password) bad('Enter your email and password.');
@@ -711,6 +824,7 @@ export function createHub({
   // Forgot your password: prove the email with Google, then set a new one. Every other session is signed out.
   R('POST', '/v1/auth/reset/google', async ({ body, ip, ipKey, client }) => {
     limit('login', ipKey);
+    authBudget();
     const g = await google(body.idToken);
     const a = h.get('SELECT * FROM accounts WHERE email = ?', g.email);
     if (!a) throw new HttpError(404, `There's no Kea account for ${g.email}.`);
@@ -738,6 +852,7 @@ export function createHub({
   }, { auth: false });
 
   R('POST', '/v1/me/verify/google', async ({ me, body, ip }) => {
+    limit('google', me.id);
     const g = await google(body.idToken);
     if (g.email !== me.email) bad(`That Google account is ${g.email}, but your Kea account is ${me.email}. Sign in to Google with ${me.email}.`);
     markGoogleVerified(me.id, g);
@@ -767,13 +882,22 @@ export function createHub({
   }, { terms: false, basic: true });
 
   // Kea storage: list (optionally under a folder prefix, or only what changed since a time, for syncing).
+  // With `limit` (at most 5000), one page at a time: `after` is the last path of the page before, and `next` says where
+  // the next page starts (null at the end). Without it, everything at once, as before (an account holds at most
+  // maxFilesPerAccount files).
   R('GET', '/v1/files', ({ me, query }) => {
     const prefix = String(query.prefix ?? '');
     const since = Number(query.since) || 0;
+    const paged = query.limit != null;
+    const n = paged ? Math.min(5000, Math.max(1, Number(query.limit) || 1000)) : -1;
+    const after = String(query.after ?? '');
+    const rows = h.all("SELECT path, size, version, sha256, updated_at FROM files WHERE account_id = ? AND substr(path, 1, length(?)) = ? AND updated_at > ? AND path > ? ORDER BY path LIMIT ?", me.id, prefix, prefix, since, after, paged ? n + 1 : -1);
+    const more = paged && rows.length > n;
+    if (more) rows.length = n;
     return {
       used: usedBy(me.id), quota: quotaOf(me), now: now(),
-      files: h.all("SELECT path, size, version, sha256, updated_at FROM files WHERE account_id = ? AND substr(path, 1, length(?)) = ? AND updated_at > ? ORDER BY path", me.id, prefix, prefix, since)
-        .map((f) => ({ path: f.path, size: f.size, version: f.version, sha256: f.sha256, updatedAt: f.updated_at })),
+      files: rows.map((f) => ({ path: f.path, size: f.size, version: f.version, sha256: f.sha256, updatedAt: f.updated_at })),
+      ...(paged ? { next: more ? rows[rows.length - 1].path : null } : {}),
     };
   });
 
@@ -912,6 +1036,7 @@ export function createHub({
   });
   // The parent, at the member's computer: Kea opens Google sign-in for the parent's email.
   R('POST', '/v1/me/consent/google', async ({ me, body, ip }) => {
+    limit('google', me.id);
     const c = h.get("SELECT * FROM parent_consents WHERE account_id = ? AND status = 'pending' AND expires_at > ? ORDER BY created_at DESC LIMIT 1", me.id, now()) ?? bad('Ask for a sign-off first: enter your parent’s or guardian’s email.');
     const g = await google(body.idToken);
     if (g.email === me.email) bad('That’s your own Google account. Your parent or guardian signs in with theirs.');
@@ -965,6 +1090,7 @@ export function createHub({
   const WRONG_CREDS = 'Your password or two-step code is wrong.';
   /** Checks my password (and code, when `code` is given) with the sign-in lockouts; one message for any miss. */
   async function checkMine(me, { password, code = undefined, ipKey, ip, message = WRONG_CREDS }) {
+    limit('pwcheck', me.id);
     const nh = nameHash(me.email);
     const pairMs = fails.pairLocked(nh, ipKey);
     if (pairMs > 0) throw lockedError(pairMs, false);
@@ -1526,8 +1652,10 @@ export function createHub({
     const id = randomUUID();
     h.run('INSERT INTO course_join_requests (id,course_key,account_id,target,label,created_at) VALUES (?,?,?,?,?,?)', id, key, me.id, target, label, now());
     audit(me.id, 'course.join_request', id, { course: key }, ip);
-    // (The asker's name goes along as data for the app to show, never inside the title.)
-    for (const m of h.all('SELECT account_id FROM course_members WHERE course_key = ? ORDER BY joined_at LIMIT 50', key))
+    // (The asker's name goes along as data for the app to show, never inside the title.) A section that got a lot of
+    // requests today stops getting notices for new ones; the requests still wait in Kea's list.
+    const todays = h.get('SELECT COUNT(*) AS n FROM course_join_requests WHERE course_key = ? AND created_at > ?', key, now() - DAY_MS).n;
+    if (todays <= 20) for (const m of h.all('SELECT account_id FROM course_members WHERE course_key = ? ORDER BY joined_at LIMIT 50', key))
       notify(m.account_id, 'course_join', `Someone asks to join ${label}`, 'Let them in from Kea’s shared Claude panel, or give them this section’s code. Say no if you don’t know them.', { data: { requestId: id, course: key, label, name: cleanText(me.display_name).slice(0, 60) } });
     return { status: 'pending', message: PENDING, request: requestOut(h.get('SELECT * FROM course_join_requests WHERE id = ?', id)), allowance: allowance(me) };
   }
@@ -1630,6 +1758,9 @@ export function createHub({
     // Scans need what the person's Kea collected from their class site: they upload it to
     // scan-inbox/<job id>/ in their own Kea storage, then say it's ready. Question batches work from the course's
     // shared material, so they're ready at once.
+    // The whole line has a cap, so a crowd of new accounts can't queue thousands of jobs.
+    if (me.role !== 'owner' && h.get("SELECT COUNT(*) AS n FROM scan_jobs WHERE status = 'queued'").n >= (limitsNow().maxQueuedJobs ?? 100))
+      throw new HttpError(503, 'Kea’s shared Claude has a long line right now. Try again later.', { code: 'queue_full', retryAfter: 600, allowance: allowance(me) });
     const ready = kind === 'more_questions' ? 1 : 0;
     const detail = body.detail == null ? null : JSON.stringify(body.detail);
     if (detail && detail.length > 4000) bad('The request’s details are too long.');
@@ -1880,6 +2011,9 @@ export function createHub({
       const d = size('defaultQuotaBytes', 'defaultGb'), sp = size('supporterQuotaBytes', 'supporterGb');
       if (d !== undefined) next.defaultQuotaBytes = d;
       if (sp !== undefined) next.supporterQuotaBytes = sp;
+      // The limits for everyone together (bytes; globalBytes: null for none).
+      for (const k of ['unverifiedQuotaBytes', 'dailyAccountBytes', 'dailyGlobalBytes', 'dailyEgressBytes']) if (st[k] != null) next[k] = V.int(st[k], k, { min: 0, max: 1024 ** 5 });
+      if ('globalBytes' in st) next.globalBytes = st.globalBytes == null ? null : V.int(st.globalBytes, 'globalBytes', { min: 0, max: 1024 ** 5 });
       setSetting('storage', next);
       setSetting('storageSeen', storageSettings());
       audit('owner', 'owner.storage_settings', null, next, 'local');
@@ -1927,6 +2061,8 @@ export function createHub({
     failedSignInsToday: h.get("SELECT COUNT(*) AS n FROM audit WHERE action LIKE 'auth.fail%' AND at > ?", now() - 86400_000).n,
     // How the Hub tells visitors apart (the header it trusts), and any setup problem with it.
     clientAddress: { header: ipHeader || null, warnings: [...ipWarnings].map((code) => ({ code, text: IP_WARN[code] })) },
+    // How loaded the Hub is: event-loop lag, password hashing, transfers, refused and shed requests, the log.
+    busy: { ...busy, hashing: hashStats(), slots: Object.fromEntries(slots), log: hlog.stats() },
     // Owner powers (here and in the apps) wait until the owner account's two-step sign-in is on.
     ownerTotp: { ok: !ownerTotpOff(), message: ownerTotpOff() ? OWNER_TOTP_MESSAGE : null },
   }));
@@ -2214,9 +2350,28 @@ export function createHub({
   const RELAY_RESULT_BODY = 48 * 1024 * 1024;
   const RELAY_RESULT = /^\/v1\/scan\/([^/]+)\/calls\/[^/]+\/result$/;
 
+  const quick = (res, status, retryAfter, error) => {
+    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'retry-after': String(retryAfter), 'x-content-type-options': 'nosniff' });
+    res.end(JSON.stringify({ error, retryAfter }));
+  };
   async function handleApi(req, res) {
     const t0 = Date.now();
+    // Before anything else (routing, the database, the log): requests per address and for everyone, from token buckets,
+    // and load shedding while the Hub is stalled. Refused here costs almost nothing and writes no log line.
+    const from = clientOf(req);
+    const f = from.shared || isLoopback(from.ip) ? SHARED_FACTOR : 1;
+    if (buckets.take(`rps:${ipBucket(from.ip)}`, L.rps[0] * f, L.rps[1] * f, t0) > 0 || buckets.take('rps:*', L.rpsAll[0], L.rpsAll[1], t0) > 0) {
+      busy.rejected++;
+      return quick(res, 429, 1, 'Too many requests. Slow down.');
+    }
     const url = new URL(req.url, 'http://localhost');
+    if (busy.lagMs > 500 && url.pathname !== '/v1/health') { busy.shed++; return quick(res, 503, 5, 'The Kea Hub is busy. Try again in a few seconds.'); }
+    // Everything but uploads (files and relay answers) must arrive within 30 seconds.
+    if (req.method !== 'PUT' && !RELAY_RESULT.test(url.pathname)) {
+      const tm = setTimeout(() => { if (!req.complete) req.socket.destroy(); }, 30_000);
+      tm.unref?.();
+      res.once('close', () => clearTimeout(tm));
+    }
     const secure = !!req.socket.encrypted || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
     let status = 200, payload, cookies = [];
     // The readable terms page (Kea opens it in a window; anyone can read it).
@@ -2237,7 +2392,6 @@ export function createHub({
         if (!sameOrigin(req, secure)) forbidden('Cross-site request refused.');
         if (cookieToken && req.headers['x-kea'] !== '1') forbidden('Missing X-Kea header.');
       }
-      const from = clientOf(req);
       const ctx = { params, body: {}, query: Object.fromEntries(url.searchParams), ip: from.ip, ipKey: ipBucket(from.ip), client: String(req.headers['x-kea-client'] || req.headers['user-agent'] || '').slice(0, 120), token: bearer || cookieToken, origin: `${secure ? 'https' : 'http'}://${String(req.headers.host || 'localhost').replace(/[^\w.:[\]-]/g, '')}` };
       // Who it is comes first: nothing is read from a request body until the sign-in checks out.
       if (r.auth) {
@@ -2272,8 +2426,14 @@ export function createHub({
       if (fileRoute) return await handleFile(req, res, ctx, decodeURIComponent(fileMatch[1]), t0);
       let out = await r.handler(ctx);
       if (out && out.__raw) {
-        res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': out.__raw.length, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...out.headers });
-        await sendPaced(res, out.__raw);
+        const big = out.__raw.length > SMALL;
+        const release = big ? takeSlots(downloadSlots(ctx)) : () => {};
+        if (!release) throw new HttpError(429, 'Too many downloads at once. Wait for one to finish.', { retryAfter: 5 });
+        try {
+          res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': out.__raw.length, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...out.headers });
+          await sendPaced(res, out.__raw, ctx.me?.id ?? null);
+        } finally { release(); }
+        hlog.request(req.method, url.pathname, 200, Date.now() - t0);
         return;
       }
       if (out && 'body' in out && (typeof out.status === 'number' || 'token' in out || 'clearCookie' in out)) {
@@ -2285,14 +2445,23 @@ export function createHub({
       payload = out;
     } catch (e) {
       if (e instanceof HttpError) { status = e.status; payload = { error: e.message, ...(e.extra || {}) }; }
+      else if (e?.busy) { status = 503; payload = { error: e.message, retryAfter: e.retryAfter }; }
       else { status = 500; payload = { error: 'Something went wrong on the Hub.' }; console.error(e); }
     }
-    if (status === 429 && payload?.retryAfter) res.setHeader('retry-after', String(payload.retryAfter));
+    if (res.headersSent) { if (!res.writableEnded) res.destroy(); return; }
+    if ((status === 429 || status === 503) && payload?.retryAfter) res.setHeader('retry-after', String(payload.retryAfter));
     // Refused before its body was read (or while reading it): answer and close, rather than taking in the rest.
     if (!req.complete) res.setHeader('connection', 'close');
-    send(res, status, payload, cookies);
-    if (log) console.log(`${new Date().toISOString()} ${req.method} ${url.pathname} ${status} ${Date.now() - t0}ms`);
+    // A big answer (a long list) goes out paced like a download; small ones at once.
+    const text = JSON.stringify(payload ?? {});
+    if (text.length > SMALL) {
+      res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'x-frame-options': 'DENY', ...(cookies.length ? { 'set-cookie': cookies } : {}) });
+      await sendPaced(res, Buffer.from(text), null);
+    } else send(res, status, payload, cookies);
+    hlog.request(req.method, url.pathname, status, Date.now() - t0);
   }
+  /** Download slots: 2 at a time per account, 3 per address (more for the tunnel's shared address), 16 in all. */
+  const downloadSlots = (ctx) => [...(ctx.me ? [[`dl:${ctx.me.id}`, 2]] : []), [`dlip:${ctx.ipKey}`, isLoopback(ctx.ip) ? 3 * SHARED_FACTOR : 3], ['dl:*', 16]];
 
   // An invite link (https://<hub>/join/<code>) opened in a browser: how to use it in Kea. It doesn't look the code up,
   // so the page says nothing about the class to someone who only has the link.
@@ -2369,22 +2538,36 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
   }
   const etagVersion = (v) => { const m = /^"?(\d+)"?$/.exec(String(v ?? '').trim()); return m ? Number(m[1]) : null; };
 
+  // Uploads in flight, per account: counted toward the limit while they arrive, so parallel uploads can't all fit.
+  const reserved = new Map();
   async function handleFile(req, res, ctx, rawPath, t0) {
     const me = ctx.me;
     const done = (status, payload, headers = {}) => {
       for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
       send(res, status, payload);
-      if (log) console.log(`${new Date().toISOString()} ${req.method} /v1/files/… ${status} ${Date.now() - t0}ms`);
+      hlog.request(req.method, '/v1/files/…', status, Date.now() - t0);
     };
     // GET /v1/files/ (empty path) is handled by the list route; here the path is a file.
     const path = checkPath(rawPath);
+    if (req.method !== 'GET') {
+      const wait = buckets.take(`wr:${me.id}`, L.writes[0], L.writes[1], Date.now());
+      if (wait > 0) throw new HttpError(429, 'Too many file changes at once. Slow down a little.', { retryAfter: Math.ceil(wait / 1000) });
+    }
     const row = h.get('SELECT * FROM files WHERE account_id = ? AND path = ?', me.id, path);
     if (req.method === 'GET') {
       if (!row) notFound('No such file.');
       if (etagVersion(req.headers['if-none-match']) === row.version) { res.writeHead(304, { etag: `"${row.version}"` }); res.end(); return; }
-      const data = readFileSync(blobPath(me.id, row.blob));
-      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': data.length, etag: `"${row.version}"`, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'x-kea-sha256': row.sha256 });
-      await sendPaced(res, data);
+      if (dayCount(`out:${me.id}`) > storageSettings().dailyEgressBytes && me.role !== 'owner') throw new HttpError(429, 'You’ve downloaded the most for one day. Try again tomorrow.', { retryAfter: 3600 });
+      const big = row.size > SMALL;
+      const release = big ? takeSlots(downloadSlots(ctx)) : () => {};
+      if (!release) throw new HttpError(429, 'Too many downloads at once. Wait for one to finish.', { retryAfter: 5 });
+      busy.downloads++;
+      try {
+        const src = big ? createReadStream(blobPath(me.id, row.blob), { highWaterMark: CHUNK }) : await readFileP(blobPath(me.id, row.blob));
+        res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': row.size, etag: `"${row.version}"`, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'x-kea-sha256': row.sha256 });
+        await sendPaced(res, src, me.id);
+      } finally { busy.downloads--; release(); }
+      hlog.request(req.method, '/v1/files/…', 200, Date.now() - t0);
       return;
     }
     const ifMatch = req.headers['if-match'];
@@ -2396,47 +2579,83 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
     if (req.method === 'DELETE') {
       if (!row) notFound('No such file.');
       h.run('DELETE FROM files WHERE account_id = ? AND path = ?', me.id, path);
-      rmSync(blobPath(me.id, row.blob), { force: true });
+      await rmP(blobPath(me.id, row.blob), { force: true });
       return done(200, { ok: true });
     }
     // PUT
     const quota = quotaOf(me);
+    const tooBig = `Files can be at most ${Math.round(maxFileBytes / 1024 ** 2)} MB.`;
+    const declared = Number(req.headers['content-length']);
+    const known = Number.isFinite(declared) && declared >= 0;
+    if (known && declared > maxFileBytes) throw new HttpError(413, tooBig);
+    if (!row && usage(me.id).file_count >= maxFilesPerAccount) throw new HttpError(507, `Your Kea storage holds the most files it can (${maxFilesPerAccount.toLocaleString('en-US')}). Delete some to add more.`, { storageFull: true, tooManyFiles: true });
     // Full (or over, after a limit went down): nothing is deleted, and a file can still be replaced by one no bigger.
-    // `before` is the size of the file being replaced (0 for a new one). Checked once before writing anything, and
-    // again inside the database transaction, so uploads running at the same time can't all fit under one limit.
+    // `before` is the size of the file being replaced (0 for a new one). Checked before anything is read (with the
+    // announced size), after it arrived, and again inside the database transaction; uploads of the same account still
+    // arriving count too (`reserved`), so uploads running at the same time can't all fit under one limit.
+    const mine = known ? declared : 0;
     const checkRoom = (size, before) => {
-      const used = usedBy(me.id) - before;
+      const used = usedBy(me.id) - before + (row ? 0 : fileOverheadBytes) + ((reserved.get(me.id) || 0) - mine);
       if (used + size > quota && size > before) {
-        const all = used + before;
+        const all = usedBy(me.id);
         throw new HttpError(507, all > quota
           ? `Your Kea storage is over its limit: ${fmtBytes(all)} of ${fmtBytes(quota)}. Nothing has been deleted, but new files wait until you’re under the limit. Delete some files to make room.`
           : `Your Kea storage is full (${fmtBytes(quota)}). Delete some files to make room.`, { used: all, quota, storageFull: true });
       }
     };
-    const declared = Number(req.headers['content-length']);
-    if (Number.isFinite(declared) && declared <= maxFileBytes) checkRoom(declared, row?.size ?? 0);
-    const data = await readFileBody(req, maxFileBytes);
-    checkRoom(data.length, row?.size ?? 0);
-    try { const fs = statfsSync(storageDir); if (fs.bavail * fs.bsize - data.length < minFreeBytes) throw new HttpError(507, "The Kea Hub's drive is nearly full. Try again later."); } catch (e) { if (e instanceof HttpError) throw e; }
-    const blob = randomUUID();
+    checkRoom(mine, row?.size ?? 0);
+    checkBudgets(me, mine);
+    checkDisk(mine);
+    const release = takeSlots([[`up:${me.id}`, 2], ['up:*', 16]]);
+    if (!release) throw new HttpError(429, 'Too many uploads at once. Wait for one to finish.', { retryAfter: 5 });
+    reserved.set(me.id, (reserved.get(me.id) || 0) + mine);
+    busy.uploads++;
     const dir = join(storageDir, me.id);
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, `${blob}.tmp`), data);
-    renameSync(join(dir, `${blob}.tmp`), join(dir, blob));
-    const version = (row?.version ?? 0) + 1;
-    const hash = createHash('sha256').update(data).digest('hex');
+    const blob = randomUUID();
+    const tmp = join(dir, `${blob}.tmp`);
     try {
-      h.tx(() => {
-        // Re-check inside the transaction so two simultaneous writes can't both win.
-        const cur = h.get('SELECT version, size FROM files WHERE account_id = ? AND path = ?', me.id, path);
-        if ((cur?.version ?? 0) !== (row?.version ?? 0)) conflict();
-        checkRoom(data.length, cur?.size ?? 0);
-        h.run('INSERT INTO files (account_id,path,blob,size,version,sha256,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(account_id,path) DO UPDATE SET blob=excluded.blob, size=excluded.size, version=excluded.version, sha256=excluded.sha256, updated_at=excluded.updated_at',
-          me.id, path, blob, data.length, version, hash, now());
+      // Streamed to a temporary file, hashed on the way, never held whole in memory.
+      await mkdirP(dir, { recursive: true });
+      const hasher = createHash('sha256');
+      let size = 0;
+      const meter = new Transform({
+        transform(chunk, _enc, cb) {
+          size += chunk.length;
+          if (size > maxFileBytes) return cb(new HttpError(413, tooBig));
+          hasher.update(chunk);
+          cb(null, chunk);
+        },
       });
-    } catch (e) { rmSync(join(dir, blob), { force: true }); throw e; }
-    if (row) rmSync(blobPath(me.id, row.blob), { force: true });
-    return done(row ? 200 : 201, { path, version, size: data.length, sha256: hash }, { etag: `"${version}"` });
+      await pipeline(req, meter, createWriteStream(tmp));
+      checkRoom(size, row?.size ?? 0);
+      checkBudgets(me, size);
+      checkDisk(size);
+      await renameP(tmp, join(dir, blob));
+      const version = (row?.version ?? 0) + 1;
+      const hash = hasher.digest('hex');
+      try {
+        h.tx(() => {
+          // Re-check inside the transaction so two simultaneous writes can't both win.
+          const cur = h.get('SELECT version, size FROM files WHERE account_id = ? AND path = ?', me.id, path);
+          if ((cur?.version ?? 0) !== (row?.version ?? 0)) conflict();
+          checkRoom(size, cur?.size ?? 0);
+          h.run('INSERT INTO files (account_id,path,blob,size,version,sha256,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(account_id,path) DO UPDATE SET blob=excluded.blob, size=excluded.size, version=excluded.version, sha256=excluded.sha256, updated_at=excluded.updated_at',
+            me.id, path, blob, size, version, hash, now());
+        });
+      } catch (e) { await rmP(join(dir, blob), { force: true }); throw e; }
+      dayAdd(`in:${me.id}`, size);
+      dayAdd('in:*', size);
+      if (row) await rmP(blobPath(me.id, row.blob), { force: true });
+      return done(row ? 200 : 201, { path, version, size, sha256: hash }, { etag: `"${version}"` });
+    } catch (e) {
+      await rmP(tmp, { force: true }).catch(() => {});
+      throw e;
+    } finally {
+      release();
+      busy.uploads--;
+      const left = (reserved.get(me.id) || 0) - mine;
+      if (left > 0) reserved.set(me.id, left); else reserved.delete(me.id);
+    }
   }
 
   // Owner-console routes that work while the owner account's two-step sign-in is off: the status page only.
@@ -2475,9 +2694,29 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
   }
 
   const wrap = (fn) => (req, res) => fn(req, res).catch((e) => { console.error(e); try { send(res, 500, { error: 'internal error' }); } catch {} });
-  const apiServer = http.createServer(wrap(handleApi));
+  // Limits on connections themselves: 2000 at once, 50 per address (not the tunnel's own loopback, which carries
+  // everyone), small headers, and idle sockets closed.
+  const apiServer = http.createServer({ maxHeaderSize: 16 * 1024, connectionsCheckingInterval: 5000 }, wrap(handleApi));
+  apiServer.maxConnections = 2000;
+  apiServer.maxHeadersCount = 100;
+  apiServer.timeout = 60_000;
+  const perAddress = new Map();
+  apiServer.on('connection', (sock) => {
+    const a = String(sock.remoteAddress || '');
+    if (!isLoopback(a)) {
+      const n = (perAddress.get(a) || 0) + 1;
+      if (n > 50) { busy.refusedConnections++; sock.destroy(); return; }
+      perAddress.set(a, n);
+    }
+    busy.connections++;
+    sock.once('close', () => {
+      busy.connections--;
+      if (!isLoopback(a)) { const n = (perAddress.get(a) || 1) - 1; if (n) perAddress.set(a, n); else perAddress.delete(a); }
+    });
+  });
   const ownerServer = http.createServer(wrap(handleOwner));
-  apiServer.headersTimeout = 15_000; apiServer.requestTimeout = 120_000;
+  // (Uploads of up to 64 MB get five minutes in all; everything else is cut at 30 seconds in handleApi.)
+  apiServer.headersTimeout = 15_000; apiServer.requestTimeout = 300_000;
   // The owner console is local only, but a stuck or slow client still shouldn't hold it open. (Large worker uploads
   // are 64 MB at most over loopback, so two minutes is plenty.)
   ownerServer.headersTimeout = 15_000; ownerServer.requestTimeout = 120_000;
@@ -2511,15 +2750,22 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
       try { return { port: p, ownerPort: await listenOn(ownerServer, ownerPort) }; }
       catch (e) { await new Promise((r) => apiServer.close(() => r())); throw e; }
     },
+    /** The request log (the Hub run by itself sends its errors here too). */
+    log: hlog,
     close() {
       clearInterval(sweepTimer);
+      clearInterval(lagTimer);
+      hlog.close();
       return Promise.all([apiServer, ownerServer].map((s) => new Promise((r) => (s.listening ? s.close(() => r()) : r())))).then(() => h.close());
     },
   };
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  const hub = createHub();
+  // Run by itself (the Hub started before sign-in): its log is a size-limited file in its data folder, and its errors
+  // go there too, never to an ever-growing output file.
+  const hub = createHub({ logFile: join(DATA_DIR, 'logs', 'hub.log'), log: false });
+  for (const level of ['error', 'warn']) console[level] = (...a) => hub.log.line(`${new Date().toISOString()} ${level.toUpperCase()} ${a.map((x) => (x instanceof Error ? x.stack : String(x))).join(' ')}`);
   let ports;
   try { ports = await hub.listen(); } catch (e) { console.error(e.message); await hub.close().catch(() => {}); process.exit(1); }
   const { port, ownerPort } = ports;

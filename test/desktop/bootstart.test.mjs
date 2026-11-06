@@ -83,7 +83,8 @@ test('launcher: clears Node/Electron/libuv/OpenSSL/Kea variables, then sets only
   assert.ok(cmd.indexOf('set NODE_ 2^>nul') < cmd.indexOf('set "KEA_HUB_DATA='));
   assert.ok(cmd.indexOf('set ELECTRON_ 2^>nul') < cmd.lastIndexOf('set "ELECTRON_RUN_AS_NODE=1"'));
   assert.ok(cmd.includes('set "KEA_HUB_DATA=E:\\Kea & Co 100%%"'));
-  assert.ok(cmd.includes(`"C:\\Program Files\\KeaS\\KeaS.exe" "${SVC}\\hub\\index.mjs" >>"${SVC}\\hub-service.log" 2>&1`));
+  // (The Hub keeps its own size-limited log; its output never piles up in the service folder.)
+  assert.ok(cmd.includes(`"C:\\Program Files\\KeaS\\KeaS.exe" "${SVC}\\hub\\index.mjs" >NUL 2>&1`));
   assert.ok(cmd.includes(`cd /d "${SVC}\\hub"`));
   const ok = { exe: 'C:\\K\\KeaS.exe', entry: 'C:\\K\\hub\\index.mjs', env: {}, logFile: 'C:\\K\\l.log' };
   assert.throws(() => b.launcherCmd({ ...ok, exe: 'a"b.exe' }));

@@ -26,7 +26,7 @@ function googleToken(claims = {}, key = google.privateKey) {
 
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), 'kea-hub-test-'));
-  hub = createHub({ dataDir: dir, now: () => clock, log: false, ipHeader: 'x-test-ip', googleClientIds: ['kea-test-client'], googleKeyFn: async () => [googleJwk], defaultQuotaBytes: 1000, minFreeBytes: 0 });
+  hub = createHub({ dataDir: dir, now: () => clock, log: false, ipHeader: 'x-test-ip', googleClientIds: ['kea-test-client'], googleKeyFn: async () => [googleJwk], defaultQuotaBytes: 1000, minFreeBytes: 0, fileOverheadBytes: 0 });
   const p = await hub.listen({ port: 0, ownerPort: 0 });
   base = `http://127.0.0.1:${p.port}`;
   ownerBase = `http://127.0.0.1:${p.ownerPort}`;

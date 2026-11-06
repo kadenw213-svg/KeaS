@@ -183,7 +183,8 @@ function launcherCmd({ exe, entry, env, logFile, sysRoot = systemRoot() }) {
     'set "ELECTRON_RUN_AS_NODE=1"',
     `cd /d ${cmdQuoted(path.win32.dirname(entry))}`,
     `echo [%date% %time%] Starting the Kea Hub>>${cmdQuoted(logFile)}`,
-    `${cmdQuoted(exe)} ${cmdQuoted(entry)} >>${cmdQuoted(logFile)} 2>&1`,
+    // (The Hub writes its own size-limited log in its data folder (logs\hub.log); its output here would grow forever.)
+    `${cmdQuoted(exe)} ${cmdQuoted(entry)} >NUL 2>&1`,
     `echo [%date% %time%] The Kea Hub stopped (code %errorlevel%)>>${cmdQuoted(logFile)}`,
     'exit /b %errorlevel%',
   ];

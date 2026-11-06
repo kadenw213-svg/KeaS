@@ -18,7 +18,7 @@ let clock = Date.UTC(2026, 10, 6, 15);
 
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), 'kea-hub-sec-'));
-  hub = createHub({ dataDir: dir, now: () => clock, log: false, ipHeader: 'x-test-ip', defaultQuotaBytes: 1000, minFreeBytes: 0 });
+  hub = createHub({ dataDir: dir, now: () => clock, log: false, ipHeader: 'x-test-ip', defaultQuotaBytes: 1000, minFreeBytes: 0, fileOverheadBytes: 0 });
   const p = await hub.listen({ port: 0, ownerPort: 0 });
   base = `http://127.0.0.1:${p.port}`;
   ownerBase = `http://127.0.0.1:${p.ownerPort}`;
@@ -118,7 +118,8 @@ test('uploads at the same time cannot squeeze past the storage limit together', 
   const results = await Promise.all(Array.from({ length: 8 }, (_, i) => fetch(`${base}/v1/files/race-${i}.bin`, { method: 'PUT', headers: { authorization: `Bearer ${t}` }, body: Buffer.alloc(300, i) })));
   const ok = results.filter((r) => r.status === 201).length;
   assert.ok(ok <= 3, `${ok} uploads went through`);
-  assert.ok(results.every((r) => r.status === 201 || r.status === 507));
+  // (507: full; 429: more than two uploads at once for one account.)
+  assert.ok(results.every((r) => [201, 507, 429].includes(r.status)), results.map((r) => r.status).join(','));
   const list = await call('GET', '/v1/files', t);
   assert.ok(list.body.used <= 1000, `used ${list.body.used}`);
 });

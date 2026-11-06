@@ -211,7 +211,18 @@ const COLUMNS = [
   ['sessions', 'reauth_at', 'INTEGER'],
   // The organization a class belongs to (org classes): it works only while that organization is active.
   ['classes', 'org_id', 'TEXT'],
+  // What each account stores (bytes and files), kept up to date by the triggers below.
+  ['accounts', 'used_bytes', 'INTEGER NOT NULL DEFAULT 0'],
+  ['accounts', 'file_count', 'INTEGER NOT NULL DEFAULT 0'],
 ];
+
+// accounts.used_bytes and file_count follow every change to files, in the same transaction, so the storage check is
+// one row instead of a sum over all of someone's files.
+const USAGE_TRIGGERS = `
+CREATE TRIGGER files_usage_ins AFTER INSERT ON files BEGIN UPDATE accounts SET used_bytes = used_bytes + NEW.size, file_count = file_count + 1 WHERE id = NEW.account_id; END;
+CREATE TRIGGER files_usage_del AFTER DELETE ON files BEGIN UPDATE accounts SET used_bytes = used_bytes - OLD.size, file_count = file_count - 1 WHERE id = OLD.account_id; END;
+CREATE TRIGGER files_usage_upd AFTER UPDATE OF size ON files BEGIN UPDATE accounts SET used_bytes = used_bytes - OLD.size + NEW.size WHERE id = NEW.account_id; END;
+`;
 
 export function openDb(file) {
   mkdirSync(dirname(file), { recursive: true });
@@ -220,6 +231,15 @@ export function openDb(file) {
   db.exec(SCHEMA);
   for (const [table, col, type] of COLUMNS) {
     if (!db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+  }
+  // First run with the usage columns: count what's there, then keep it up to date.
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'files_usage_ins'").get()) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.exec('UPDATE accounts SET used_bytes = (SELECT COALESCE(SUM(size),0) FROM files WHERE account_id = accounts.id), file_count = (SELECT COUNT(*) FROM files WHERE account_id = accounts.id)');
+      db.exec(USAGE_TRIGGERS);
+      db.exec('COMMIT');
+    } catch (e) { db.exec('ROLLBACK'); throw e; }
   }
   const cache = new Map();
   const st = (sql) => { let s = cache.get(sql); if (!s) { s = db.prepare(sql); cache.set(sql, s); } return s; };

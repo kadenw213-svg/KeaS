@@ -322,7 +322,8 @@ test('M1: the organization server never writes its vault key next to the databas
     const file = join(d, 'org.db');
     // Without a passphrase from the KeaS app it refuses to start, rather than writing a key file.
     assert.throws(() => createApp({ dbFile: file, log: false, devKeyFile: false }), /passphrase/);
-    const a = createApp({ dbFile: file, log: false, devKeyFile: false, passphrase: 'a passphrase from DPAPI-protected settings' });
+    // (demo: the sample people, so there's data to find again; the app itself never seeds.)
+    const a = createApp({ dbFile: file, log: false, devKeyFile: false, passphrase: 'a passphrase from DPAPI-protected settings', demo: true });
     await a.close();
     assert.ok(!existsSync(file + '.vaultkey'));
     // Reopened with the same passphrase: the data is there; with none, it doesn't open.

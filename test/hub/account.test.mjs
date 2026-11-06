@@ -15,7 +15,7 @@ let clock = Date.UTC(2026, 10, 5, 15);
 
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), 'kea-account-test-'));
-  hub = createHub({ dataDir: dir, now: () => clock, log: false, ipHeader: 'x-test-ip', defaultQuotaBytes: 1000, supporterQuotaBytes: 5000, minFreeBytes: 0, limits: { phone: [3, DAY] } });
+  hub = createHub({ dataDir: dir, now: () => clock, log: false, ipHeader: 'x-test-ip', defaultQuotaBytes: 1000, supporterQuotaBytes: 5000, minFreeBytes: 0, fileOverheadBytes: 0, limits: { phone: [3, DAY] } });
   const p = await hub.listen({ port: 0, ownerPort: 0 });
   base = `http://127.0.0.1:${p.port}`;
   ownerBase = `http://127.0.0.1:${p.ownerPort}`;
@@ -152,6 +152,8 @@ test('the standard size is 5 GB, and a Hub that ran with 25 GB tells people when
     const t = (await (await fetch(`http://127.0.0.1:${p.port}/v1/terms`)).json()).terms;
     await fetch(`http://127.0.0.1:${p.port}/v1/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: 'old@example.com', password: 'lantern velvet orbit', displayName: 'Old', age13: true, termsVersion: t.version, termsSections: t.sections.map((s) => s.id) }) });
     const reg = await (await fetch(`http://127.0.0.1:${p.port}/v1/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: 'old@example.com', password: 'lantern velvet orbit' }) })).json();
+    // (A verified account: an unverified one gets the small unverified size.)
+    h2.h.run("UPDATE accounts SET email_verified = 1 WHERE email = 'old@example.com'");
     const me = await (await fetch(`http://127.0.0.1:${p.port}/v1/me`, { headers: { authorization: `Bearer ${reg.token}` } })).json();
     assert.equal(me.storage.quota, 5 * GB);
     assert.equal(me.storage.standard, 5 * GB);
