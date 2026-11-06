@@ -183,6 +183,7 @@ function refreshTray() {
   };
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: 'Open KeaS', click: showWindow },
+    { label: 'Payroll', click: () => openPayroll().catch(() => {}) },
     ...(isHub ? [
       { type: 'separator' },
       { label: 'Start the Hub before sign-in', type: 'checkbox', checked: installed, click: toggle },
@@ -192,6 +193,12 @@ function refreshTray() {
     { label: hubExternal ? 'Quit KeaS (the Hub keeps running)' : 'Quit KeaS (stops the server)', click: () => { app.isQuitting = true; app.quit(); } },
   ]));
 }
+
+// ---------- Payroll (the payroll vault, on this PC only; see payroll.cjs) ----------
+let payrollApi = null;
+const payroll = () => (payrollApi ||= require('./payroll.cjs').createPayroll({ getConfig: () => config, userData: app.getPath('userData'), root: ROOT, hubPort: HUB_PORT, log }));
+const openPayroll = () => payroll().open().catch((e) => { log('payroll', e.message); throw e; });
+app.on('before-quit', () => { payrollApi?.stop(); });
 
 // ---------- drives ----------
 function drives() {
@@ -287,6 +294,7 @@ function registerIpc() {
   handle('setTheme', ({ theme }) => { config = writeConfig({ ...config, theme }); nativeTheme.themeSource = theme === 'light' || theme === 'dark' ? theme : 'system'; return theme; });
   handle('openExternal', ({ url }) => { if (/^https?:\/\//.test(url)) shell.openExternal(url); return true; });
   handle('openFolder', ({ dir }) => shell.openPath(dir));
+  handle('payroll:open', () => openPayroll());
 }
 
 function defaultFolder(name) {

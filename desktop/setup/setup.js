@@ -332,6 +332,11 @@ function status() {
         c.boot?.powerApplied ? ' This PC stays awake on AC power.' : '', S.hubExternal ? ' The Hub running now was started before sign-in.' : ''),
       h('button', { class: 'btn', onclick: () => { S.bs = null; S.bo = null; S.bootScript = null; S.bootResult = null; go('settings'); } }, 'Change…')),
     c.role === 'hub' && c.publicUrl && h('p', null, h('button', { class: 'btn', onclick: () => k.openExternal({ url: `${c.publicUrl}/terms` }) }, 'Open the terms page')),
+    h('h2', { style: 'margin-top:22px' }, 'Payroll'),
+    h('div', { class: 'panel' },
+      h('p', null, 'Pay runs, tax forms and HR records for your organization. Payroll runs only on this computer: SSNs and bank details are encrypted with a passphrase you choose and never go to the Hub.'),
+      h('p', null, h('button', { class: 'btn primary', onclick: async () => { try { await call(k.openPayroll); } catch (e) { fail(e); } } }, 'Open Payroll'))),
+    S.error && h('div', { class: 'err' }, S.error),
     h('p', { class: 'muted small' }, 'Closing this window keeps the server running in the tray. Quit from the tray icon to stop it.'),
   ];
 }
@@ -339,7 +344,7 @@ function status() {
 const VIEWS = { welcome, storage, reach, owner, boot, done, status, settings };
 function render() {
   renderProgress();
-  app.replaceChildren(...VIEWS[S.step]());
+  app.replaceChildren(...VIEWS[S.step]().filter((x) => x != null && x !== false && x !== ''));
 }
 
 async function load() {

@@ -1,8 +1,10 @@
 import { create } from 'zustand';
 import { api, onSessionEvents } from './api';
 
-export type WorkView = 'today' | 'schedule' | 'timecards' | 'people' | 'pay';
-export const VIEWS: WorkView[] = ['today', 'schedule', 'timecards', 'people', 'pay'];
+export type WorkView =
+  | 'today' | 'schedule' | 'timecards' | 'people' | 'pay'
+  | 'employees' | 'org' | 'timeoff' | 'approvals' | 'onboarding' | 'expenses' | 'documents' | 'reports' | 'import' | 'yearend' | 'hiring' | 'performance' | 'settings';
+export const VIEWS: WorkView[] = ['today', 'schedule', 'timecards', 'people', 'pay', 'employees', 'org', 'timeoff', 'approvals', 'onboarding', 'expenses', 'documents', 'reports', 'import', 'yearend', 'hiring', 'performance', 'settings'];
 
 export interface Person {
   id: string;
@@ -55,14 +57,18 @@ interface WorkState {
   certTypes: CertType[];
   /** null = not checked yet; 'offline' = the server can't be reached; 'signedOut' = no session. */
   status: null | 'ready' | 'offline' | 'signedOut';
+  /** 'vault' = the payroll vault on the payroll admin's PC; 'org' = the workforce server. */
+  mode: 'vault' | 'org' | null;
+  vault: { initialized: boolean; locked: boolean; hubUrl: string | null; org: string | null; localAccounts: boolean } | null;
   error: string | null;
   tick: number;
   set(p: Partial<WorkState>): void;
 }
 
 const viewFromPath = (): WorkView => {
-  const v = location.pathname.replace(/^\/+|\/+$/g, '') as WorkView;
-  return VIEWS.includes(v) ? v : 'today';
+  const v = location.pathname.replace(/^\/+|\/+$/g, '');
+  if (v === 'payroll') return 'pay';
+  return VIEWS.includes(v as WorkView) ? (v as WorkView) : 'today';
 };
 
 export const useWork = create<WorkState>((set) => ({
@@ -73,6 +79,8 @@ export const useWork = create<WorkState>((set) => ({
   positions: [],
   certTypes: [],
   status: null,
+  mode: null,
+  vault: null,
   error: null,
   tick: 0,
   set: (p) => set(p)
@@ -93,6 +101,16 @@ window.addEventListener('popstate', () => useWork.getState().set({ view: viewFro
 /** Load who I am and my workplace (a 401 means there's no session yet). */
 export async function loadWork() {
   const st = useWork.getState();
+  try {
+    const v = await api<any>('GET', '/v1/vault/status');
+    st.set({ mode: v.mode, vault: v });
+    if (v.mode === 'vault' && (!v.initialized || v.locked)) {
+      st.set({ status: 'signedOut' });
+      return;
+    }
+  } catch {
+    if (useWork.getState().status === 'offline') return;
+  }
   try {
     const me = await api<{ person: Person; org: Org }>('GET', '/v1/me');
     const o = await api<{ org: Org; positions: Position[]; certTypes: CertType[]; people: Person[] }>('GET', '/v1/org');

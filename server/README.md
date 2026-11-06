@@ -61,3 +61,11 @@ No dependencies: `node:http`, `node:sqlite`, `node:test` (Node 24).
 - `server/lib/nacha.mjs` — sample PPD file builder.
 
 Punches are append-only (SQLite triggers reject UPDATE/DELETE); corrections are new punches from approved requests.
+
+## Payroll and HR (`server/payroll/`)
+
+Each module registers its routes on the shared context: `vaultauth` (vault setup and sign-in), `approvals` (chains and requests), `orgstructure` (entities, departments, cost centers, allocations, budgets), `paystructure` (profiles, rates, differentials, grades, raises and retro pay), `leave` (policies, ledger, requests, holidays, FMLA and state leave), `run` (pay run, finalize, NACHA, stubs, GL), `onboarding` (offers, e-signed forms, I-9, policies, new-hire report, offboarding), `documents` (file cabinet, retention, expenses), `reports`, `importer`, `yearend` (W-2, 1099-NEC, 1095-C) and `talent` (hiring, performance).
+
+- `createApp({ vault: true, hubUrl })` runs the payroll vault: no sample data, no development sign-in, and every route except `/v1/health`, `/v1/vault/status|setup|signin` and logout answers 423 until the vault is unlocked.
+- `POST /v1/payrun/finalize {periodStart}` answers 409 unless that year's tax and labor tables are verified (`verified` + `year`, `verifiedFor`), every timecard with hours is approved, and a configured pay-run approval chain has finished.
+- Files (CSV, PDF, NACHA, documents) come back with `content-disposition: attachment`.

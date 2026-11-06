@@ -54,6 +54,17 @@ password never leaves their own computer: the scan reads their class site throug
 reaches the Hub. Daily and weekly limits, one shared scan per course section, and batches of new questions in place
 of regenerating keep the queue fair and the owner's plan usable.
 
+## Payroll
+
+**Payroll** in the tray menu (or on the KeaS window) runs payroll and HR for an organization on the payroll
+admin's own computer: pay runs from approved timecards, several pay rates per person, shift differentials, overtime,
+paid time off and holidays, raises with approvals and automatic retro pay, departments and cost centers with labor
+splits, onboarding with e-signed W-4 and state forms, the I-9 checklist, offboarding with each state's final-pay
+deadline, expenses, documents, reports, and W-2, 1099 and ACA data at year end. SSNs, bank details and documents
+are encrypted with a passphrase only you know and never leave that computer. Admins sign in with their Kea account
+plus the passphrase. KeaS prepares the direct-deposit file for your own bank; it never holds or moves money. A pay
+run can be finalized only once that year's tax and labor tables have been checked against official sources.
+
 ## Install
 
 **Windows 10 or 11 (64-bit):** download `KeaS-Setup-….exe` from the

@@ -6,11 +6,13 @@ import { fileURLToPath } from 'node:url';
 import { openDb, DEFAULT_DB } from './db.mjs';
 import { localDate, weekStartOf, addDays, zonedToUtc, iso, ageOn } from './lib/time.mjs';
 import { abaCheckDigit } from './lib/nacha.mjs';
+import { makeVault, openDevVault } from './payroll/vaultstate.mjs';
 
 const TZ = 'America/Denver';
-const fakeRouting = (p8) => p8 + abaCheckDigit(p8);
+const routingFor = (p8) => p8 + abaCheckDigit(p8);
 
-export function seed(h, { now = Date.now() } = {}) {
+export function seed(h, { now = Date.now(), vault } = {}) {
+  const sealJson = (v) => (vault ? vault.sealJson(v) : JSON.stringify(v));
   const today = localDate(now, TZ);
   const thisWeek = weekStartOf(today, 0);
   const anchor = addDays(thisWeek, -14); // completed period = the two weeks before this one
@@ -21,7 +23,7 @@ export function seed(h, { now = Date.now() } = {}) {
   h.tx(() => {
     h.run(`INSERT INTO orgs (id,name,state,tz,late_threshold_min,workweek_start,pay_frequency,pay_period_anchor,futa_exempt,suta_rate,rule_overrides,bank)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, 'org-demo', 'Demo Aquatics', 'CO', TZ, 5, 0, 'biweekly', anchor, 1, 0.0305, '{}',
-      JSON.stringify({ name: 'DEMO AQUATICS', companyId: '1999999999', originRouting: fakeRouting('99000001'), destinationRouting: fakeRouting('99000002'), destinationName: 'SAMPLE BANK (FAKE)' }));
+      sealJson({ name: 'DEMO AQUATICS', companyId: '1999999999', originRouting: routingFor('99000001'), destinationRouting: routingFor('99000002'), destinationName: 'EXAMPLE BANK' }));
     const pos = [['pos-lg', 'Lifeguard', ['lifeguard']], ['pos-si', 'Swim Instructor', ['instructor']], ['pos-hg', 'Head Guard', ['lifeguard', 'lead']]];
     for (const [id, name, tags] of pos) h.run('INSERT INTO positions (id,org_id,name,tags) VALUES (?,?,?,?)', id, 'org-demo', name, JSON.stringify(tags));
     const ct = [
@@ -47,10 +49,10 @@ export function seed(h, { now = Date.now() } = {}) {
       ['p12', 'Mia Chen', ['member'], ['pos-lg'], birth(14, 150), 1500, w4s.s, 0],
     ];
     people.forEach(([id, name, roles, positions, bd, rate, w4, ytd], i) => {
-      const deposit = { routing: fakeRouting('99' + String(100000 + i * 37).padStart(6, '0')), account: String(100200300 + i * 1111), accountType: i % 4 === 3 ? 'savings' : 'checking' };
+      const deposit = { routing: routingFor('99' + String(100000 + i * 37).padStart(6, '0')), account: String(100200300 + i * 1111), accountType: i % 4 === 3 ? 'savings' : 'checking' };
       h.run(`INSERT INTO people (id,org_id,name,email,roles,positions,status,birthdate,pay_rate_cents,w4,co_allowance,ytd_wages_cents,deposit)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, 'org-demo', name, name.toLowerCase().replace(/[^a-z]+/g, '.') + '@demo-aquatics.example',
-        JSON.stringify(roles), JSON.stringify(positions), id === 'p12' ? 'applicant' : 'active', bd, rate, JSON.stringify(w4), null, ytd, JSON.stringify(deposit));
+        JSON.stringify(roles), JSON.stringify(positions), id === 'p12' ? 'applicant' : 'active', bd, rate, JSON.stringify(w4), null, ytd, sealJson(deposit));
     });
 
     const cert = (pid, type, days) => h.run('INSERT INTO certs (person_id,type_id,expires) VALUES (?,?,?)', pid, type, addDays(today, days));
@@ -144,15 +146,18 @@ export function seed(h, { now = Date.now() } = {}) {
     shift(addDays(WN, 0), '10:00', '16:00', 'pos-lg', 'p10', 'published');
     h.run('INSERT INTO swaps (id,shift_id,from_person,claimant,status,created_at) VALUES (?,?,?,?,?,?)', 'sw-demo-1', swapShift.id, 'p11', null, 'offered', nowIso);
 
+    seedPayroll(h, { today, anchor, nowIso, sealJson, people: people.map((x) => x[0]) });
     h.run('INSERT INTO audit_log (org_id,actor,action,target,detail,at) VALUES (?,?,?,?,?,?)', 'org-demo', 'system', 'seed', 'org-demo', JSON.stringify({ anchor, today }), nowIso);
   });
   return { anchor };
 }
 
 export function resetDb(file = DEFAULT_DB) {
-  for (const f of [file, file + '-wal', file + '-shm']) rmSync(f, { force: true });
+  for (const f of [file, file + '-wal', file + '-shm', file + '.vaultkey']) rmSync(f, { force: true });
   const h = openDb(file);
-  const r = seed(h);
+  const vault = makeVault(h);
+  openDevVault(vault, file, process.env.KEAS_VAULT_PASSPHRASE || null);
+  const r = seed(h, { vault });
   h.close();
   return r;
 }
@@ -160,10 +165,45 @@ export function resetDb(file = DEFAULT_DB) {
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   if (process.argv.includes('--reset')) {
     const r = resetDb(process.env.KEA_DB || DEFAULT_DB);
-    console.log(`Demo db reset and seeded (pay periods anchored on ${r.anchor}).`);
+    console.log(`Database reset and seeded (pay periods anchored on ${r.anchor}).`);
   } else {
     const h = openDb(process.env.KEA_DB || DEFAULT_DB);
-    if (h.isEmpty()) { const r = seed(h); console.log(`Seeded (anchor ${r.anchor}).`); } else console.log('Database already has data; use --reset to wipe and reseed.');
+    const vault = makeVault(h);
+    openDevVault(vault, process.env.KEA_DB || DEFAULT_DB, process.env.KEAS_VAULT_PASSPHRASE || null);
+    if (h.isEmpty()) { const r = seed(h, { vault }); console.log(`Seeded (anchor ${r.anchor}).`); } else console.log('Database already has data; use --reset to wipe and reseed.');
     h.close();
   }
+}
+
+/** Payroll setup for the sample workplace: an entity, departments, cost centers, time-off policies and holidays. */
+function seedPayroll(h, { today, anchor, nowIso, sealJson, people }) {
+  const year = Number(today.slice(0, 4));
+  h.run(`INSERT INTO legal_entities (id,org_id,name,ein,state,address,is_default) VALUES (?,?,?,?,?,?,1)`, 'le-main', 'org-demo', 'Demo Aquatics', '12-3456789', 'CO', JSON.stringify({ line1: '100 Pool Lane', city: 'Denver', state: 'CO', zip: '80202' }));
+  for (const [id, code, name] of [['cc-100', '100', 'Pool operations'], ['cc-200', '200', 'Swim school'], ['cc-900', '900', 'Administration']]) h.run('INSERT INTO cost_centers (id,org_id,code,name) VALUES (?,?,?,?)', id, 'org-demo', code, name);
+  for (const [id, parent, name, code, cc, head] of [['dp-aq', null, 'Aquatics', 'AQ', 'cc-100', 'p02'], ['dp-guard', 'dp-aq', 'Lifeguarding', 'AQ-G', 'cc-100', 'p02'], ['dp-lessons', 'dp-aq', 'Swim lessons', 'AQ-L', 'cc-200', 'p03'], ['dp-admin', null, 'Administration', 'ADM', 'cc-900', 'p01']])
+    h.run('INSERT INTO departments (id,org_id,parent_id,name,code,cost_center_id,entity_id,head_person_id) VALUES (?,?,?,?,?,?,?,?)', id, 'org-demo', parent, name, code, cc, 'le-main', head);
+  const dept = { p01: 'dp-admin', p02: 'dp-guard', p03: 'dp-lessons', p08: 'dp-lessons', p11: 'dp-lessons' };
+  people.forEach((pid, i) => {
+    const hire = addDays(anchor, -400 - i * 61);
+    h.run(`UPDATE people SET hire_date = ?, department_id = ?, entity_id = 'le-main', manager_id = ?, ytd_year = ?, employee_number = ?, pii_enc = ? WHERE id = ?`,
+      pid === 'p12' ? null : hire, dept[pid] || 'dp-guard', pid === 'p01' ? null : pid === 'p02' || pid === 'p03' ? 'p01' : dept[pid] === 'dp-lessons' ? 'p03' : 'p02', year, String(1001 + i),
+      sealJson({ ssn: `98765432${i % 10}`, address: { line1: `${200 + i * 7} Example St`, city: 'Denver', state: 'CO', zip: '80203' } }), pid);
+  });
+  // Jordan splits time between guarding and lessons by default.
+  h.run('UPDATE people SET default_allocations = ? WHERE id = ?', JSON.stringify([{ departmentId: 'dp-guard', costCenterId: 'cc-100', program: null, pct: 60 }, { departmentId: 'dp-lessons', costCenterId: 'cc-200', program: null, pct: 40 }]), 'p07');
+  h.run(`INSERT INTO pto_policies (id,org_id,name,kind,method,accrue_hours,per_hours,cap_hours,annual_max_hours,carryover_max,protected,payout_on_term) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, 'pol-sick', 'org-demo', 'Paid sick leave', 'sick', 'per_hour_worked', 1, 30, null, 48, 48, 1, 'never');
+  h.run(`INSERT INTO pto_policies (id,org_id,name,kind,method,per_period_hours,cap_hours,payout_on_term) VALUES (?,?,?,?,?,?,?,?)`, 'pol-vac', 'org-demo', 'Vacation', 'vacation', 'per_period', 3.08, 120, 'state_rule');
+  for (const pid of people) if (pid !== 'p12') {
+    h.run('INSERT INTO pto_enrollments (person_id, policy_id, start_date) VALUES (?,?,?)', pid, 'pol-sick', addDays(anchor, -400));
+    h.run('INSERT INTO pto_enrollments (person_id, policy_id, start_date) VALUES (?,?,?)', pid, 'pol-vac', addDays(anchor, -400));
+    h.run(`INSERT INTO pto_ledger (person_id,policy_id,date,hours,kind,note,created_by,created_at) VALUES (?,?,?,?,?,?,?,?)`, pid, 'pol-vac', addDays(anchor, -1), 24, 'adjust', 'Opening balance', 'system', nowIso);
+    h.run(`INSERT INTO pto_ledger (person_id,policy_id,date,hours,kind,note,created_by,created_at) VALUES (?,?,?,?,?,?,?,?)`, pid, 'pol-sick', addDays(anchor, -1), 12, 'adjust', 'Opening balance', 'system', nowIso);
+  }
+  h.run(`INSERT INTO holiday_calendars (id,org_id,name,is_default) VALUES ('hc-main','org-demo','Holidays',1)`);
+  for (const [d, n] of [[`${year}-01-01`, 'New Year’s Day'], [`${year}-07-04`, 'Independence Day'], [`${year}-12-25`, 'Christmas Day']]) h.run('INSERT INTO holidays (id,calendar_id,date,name,paid_hours,premium_multiplier) VALUES (?,?,?,?,?,?)', `hd-${d}`, 'hc-main', d, n, 8, 1.5);
+  h.run(`INSERT INTO differentials (id,org_id,name,kind,amount,days,start_min,end_min,position_ids) VALUES (?,?,?,?,?,?,?,?,?)`, 'df-night', 'org-demo', 'Overnight', 'per_hour', 150, '[0,1,2,3,4,5,6]', 22 * 60, 6 * 60, '[]');
+  h.run(`INSERT INTO pay_grades (id,org_id,code,name,kind,min_cents,mid_cents,max_cents) VALUES (?,?,?,?,?,?,?,?)`, 'gr-g1', 'org-demo', 'G1', 'Guard', 'hourly', 1500, 1800, 2200);
+  h.run(`INSERT INTO pay_grades (id,org_id,code,name,kind,min_cents,mid_cents,max_cents) VALUES (?,?,?,?,?,?,?,?)`, 'gr-g2', 'org-demo', 'G2', 'Lead and instructor', 'hourly', 1900, 2300, 2800);
+  for (const [pid, g] of [['p04', 'gr-g1'], ['p05', 'gr-g2'], ['p06', 'gr-g1'], ['p07', 'gr-g1'], ['p08', 'gr-g2'], ['p09', 'gr-g1'], ['p10', 'gr-g1'], ['p11', 'gr-g1']]) h.run('UPDATE people SET grade_id = ? WHERE id = ?', g, pid);
+  h.run(`INSERT INTO policies (id,org_id,title,body,version,required,updated_at) VALUES (?,?,?,?,1,1,?)`, 'po-handbook', 'org-demo', 'Employee handbook', 'Read the handbook, then sign to say you have.', nowIso);
 }

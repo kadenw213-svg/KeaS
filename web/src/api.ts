@@ -42,7 +42,7 @@ export async function api<T = any>(method: 'GET' | 'POST', path: string, body?: 
   } catch {
     data = null;
   }
-  if (r.status === 401 && !opts.quiet401) onSignedOut();
+  if ((r.status === 401 || r.status === 423) && !opts.quiet401) onSignedOut();
   if (!r.ok) throw new ApiError(data?.error || `The server said no (${r.status}).`, r.status, data?.problems || []);
   return data as T;
 }

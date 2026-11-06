@@ -1,6 +1,8 @@
 {
   "year": 2026,
   "jurisdiction": "US",
+  "label": "Federal",
+  "form1099": { "necThresholdCents": 200000, "note": "1099-NEC reporting threshold for payments made in 2026 (raised from $600 by the 2025 budget law), entered from memory; not verified." },
   "verified": false,
   "note": "Not yet verified for 2026. Annual percentage-method tables (IRS Pub 15-T Worksheet 1A, automated payroll systems, 2020-or-later Form W-4) were DERIVED, not copied: rows = 2026 standard deductions and tax brackets as best recalled from Rev. Proc. 2025-32 (post-OBBBA), shifted by the Worksheet 1A line 1g amounts (12,900 married / 8,600 other, unchanged since 2020). The Step-2-checked tables use half the standard deduction and half the bracket widths with no line 1g adjustment. Values could not be checked offline; compare every row with the published 2026 Pub 15-T before any real use.",
   "source": [
