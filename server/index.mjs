@@ -9,7 +9,7 @@ import { openDb, DEFAULT_DB, rowToPerson, rowToOrg, rowToShift, rowToPosition, r
 import { seed } from './seed.mjs';
 import { mergeRules, checkAssignment, timecard, unforceable, isBlocked } from './lib/rules.mjs';
 import { makeVault, openDevVault, VaultLocked, VaultDamaged, SealError } from './payroll/vaultstate.mjs';
-import { makeHubClient, checkHubUrl } from './payroll/hub.mjs';
+import { makeHubClient, checkHubUrl, keyFingerprint, KEY_CHANGE_REASONS, KEY_CHANGE_WARNING } from './payroll/hub.mjs';
 import { makeTables } from './payroll/run.mjs';
 import { makeApprovals } from './payroll/approvals.mjs';
 import { registerPayroll } from './payroll/index.mjs';
@@ -588,15 +588,31 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
   return {
     server, h, vault,
     /**
-     * The owner (in the KeaS app, never over HTTP) accepts the Kea Hub's current signing key, after the Hub was moved
-     * or reinstalled. Returns the pinned key ids.
+     * The Kea Hub's current signing key next to the one payroll trusts: fingerprints to compare, and why a key changes.
+     * The KeaS app shows this before the owner accepts a new key (repinHub).
      */
-    async repinHub() {
+    async hubKeyStatus() {
       if (!vaultMode || !vault.initialized()) throw new Error('Set up payroll first.');
       if (!fixedHubUrl) throw new Error('No Kea Hub is set for payroll on this computer.');
       const keys = await ctx.hub.fetchKeys(fixedHubUrl);
+      const pin = vault.setting('hubPin', null);
+      const current = keyFingerprint(keys), pinned = pin ? keyFingerprint(pin.keys) : null;
+      return { url: fixedHubUrl, current: { fingerprint: current, kids: keys.map((k) => k.kid) }, pinned: pin ? { fingerprint: pinned, kids: pin.keys.map((k) => k.kid), at: pin.at, url: pin.url } : null, changed: !!pin && pinned !== current, reasons: KEY_CHANGE_REASONS, warning: KEY_CHANGE_WARNING };
+    },
+    /**
+     * The owner (in the KeaS app, never over HTTP) accepts the Kea Hub's current signing key, after the Hub was moved
+     * or reinstalled: only the key whose fingerprint they were shown and confirmed. Returns the pinned key ids.
+     */
+    async repinHub({ fingerprint } = {}) {
+      if (!vaultMode || !vault.initialized()) throw new Error('Set up payroll first.');
+      if (!fixedHubUrl) throw new Error('No Kea Hub is set for payroll on this computer.');
+      if (!fingerprint) throw new Error('Check the new key’s fingerprint and confirm it first.');
+      const keys = await ctx.hub.fetchKeys(fixedHubUrl);
+      const fp = keyFingerprint(keys);
+      if (fp !== String(fingerprint).toUpperCase().trim()) throw new Error('The Kea Hub is now offering a different key from the one you confirmed. Nothing was changed; check the fingerprint again.');
+      const before = vault.setting('hubPin', null);
       vault.setSetting('hubPin', { url: fixedHubUrl, iss: 'kea-hub', keys, at: iso(now()) });
-      audit(h.get('SELECT id FROM orgs LIMIT 1')?.id ?? null, 'keas-app', 'vault_hub_key_pinned', null, { kids: keys.map((k) => k.kid) });
+      audit(h.get('SELECT id FROM orgs LIMIT 1')?.id ?? null, 'keas-app', 'vault_hub_key_pinned', null, { kids: keys.map((k) => k.kid), fingerprint: fp, before: before ? keyFingerprint(before.keys) : null });
       return keys.map((k) => k.kid);
     },
     listen(port = Number(process.env.KEA_PORT) || 4850) { return new Promise((resolve) => server.listen(port, HOST, () => resolve(server.address().port))); },

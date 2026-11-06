@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld('keas', {
   openPayroll: call('payroll:open'),
   payrollSettings: call('payroll:settings'),
   payrollLocalSignIn: call('payroll:localSignIn'),
+  payrollHubKey: call('payroll:hubKey'),
   payrollRepinHub: call('payroll:repinHub'),
   state: call('state'),
   drives: call('drives'),

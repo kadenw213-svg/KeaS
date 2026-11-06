@@ -6,8 +6,8 @@
 //     whoever sends a request. The password is relayed to that address only, for that one request, and never stored
 //     or logged here.
 //   - The Hub's signing key (and issuer) is pinned when the vault is set up. Later tokens must be signed by that key:
-//     a different key is refused until the owner accepts it in the KeaS app (repinHub).
-import { createPublicKey } from 'node:crypto';
+//     a different key is refused until the owner accepts it in the KeaS app (repinHub), after seeing its fingerprint.
+import { createPublicKey, createHash } from 'node:crypto';
 import { verifyToken } from '../../hub/lib/tokens.mjs';
 
 export const AUDIENCE = 'keas-payroll';
@@ -17,6 +17,22 @@ const MAX_LIFETIME_S = 60 * 60; // the Hub issues 15-minute tokens; anything far
 
 export class HubUnreachable extends Error { constructor(m) { super(m || 'Can’t reach the Kea Hub.'); } }
 export class HubRefused extends Error { constructor(m, status, extra) { super(m); this.status = status; this.extra = extra; } }
+/**
+ * A Hub key's fingerprint for people to compare: SHA-256 of its public key(s), in groups of four. The KeaS app shows
+ * it before the owner accepts a new key (and checks it against this PC's own Hub key file when it has one).
+ */
+export function keyFingerprint(keys) {
+  const xs = (Array.isArray(keys) ? keys : [keys]).map((k) => String(k?.x || '')).filter(Boolean).sort();
+  if (!xs.length) return null;
+  return createHash('sha256').update(xs.join(',')).digest('hex').toUpperCase().match(/.{4}/g).join(' ');
+}
+export const KEY_CHANGE_REASONS = [
+  'The Kea Hub was reinstalled, or moved to another PC.',
+  'KeaS locked down the Hub’s data folder after finding it open to other accounts on that PC, and made new keys.',
+  'The Hub’s data folder was restored from a backup made before its key changed.',
+];
+export const KEY_CHANGE_WARNING = 'If none of these happened, don’t accept the new key: someone may be pretending to be your Kea Hub to get into payroll.';
+
 export const KEY_CHANGED = 'The Kea Hub’s signing key isn’t the one this vault trusts. If the Hub was moved or reinstalled, the owner can accept its new key in the KeaS app on this computer (Payroll, Advanced). Until then, Kea Hub sign-in is refused.';
 
 /** A Hub address the vault will send a password to: https anywhere, or plain http only to this computer. */

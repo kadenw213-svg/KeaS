@@ -30,6 +30,7 @@ const log = (...a) => { try { fs.appendFileSync(path.join(app.getPath('userData'
 
 // Developer aids: KEAS_USERDATA runs a separate profile (and never touches Kea's settings or Windows startup);
 // KEAS_CAPTURE=file.png with KEAS_EVAL=script.js runs the script in the setup page, saves a screenshot, and quits.
+// (KEAS_CAPTURE and KEAS_EVAL work only when running from source, never in the installed app.)
 const DEV = !!process.env.KEAS_USERDATA;
 if (DEV) app.setPath('userData', process.env.KEAS_USERDATA);
 if (!app.requestSingleInstanceLock()) app.quit();
@@ -44,7 +45,13 @@ async function secureFolders() {
   for (const [dir, label] of [[config.dataDir, 'The data folder'], [config.storageDir, 'The storage folder']]) {
     // (A storage folder inside the data folder already inherits its permissions.)
     if (!dir || (dir !== config.dataDir && dir.toLowerCase().startsWith(`${String(config.dataDir).toLowerCase()}\\`))) continue;
-    try { const r = await bootstart.secureDataFolder(dir); if (r.changed) log('locked down', dir); }
+    try {
+      const r = await bootstart.secureDataFolder(dir);
+      if (r.changed) log('locked down', dir);
+      // It was open to other accounts: the Hub's owner key and signing key may have been read, so the Hub makes new
+      // ones as it starts (payroll then asks the owner to check and accept the new signing key).
+      if (r.wasOpen && dir === config.dataDir && config.role === 'hub') log('replaced the Hub keys after locking down its folder:', bootstart.rotateHubSecrets(dir).join(', ') || 'none there');
+    }
     catch (e) { folderProblem = `${label}: ${e.message}`; log('folder permissions', dir, e.message); }
   }
 }
@@ -185,7 +192,7 @@ function showWindow() {
     if (config.setupDone && !app.isQuitting) { e.preventDefault(); win.hide(); }
   });
   win.on('closed', () => (win = null));
-  if (process.env.KEAS_CAPTURE) {
+  if (process.env.KEAS_CAPTURE && !app.isPackaged) {
     win.webContents.once('did-finish-load', () => setTimeout(async () => {
       if (process.env.KEAS_EVAL) {
         try { console.log('[eval]', JSON.stringify(await win.webContents.executeJavaScript(fs.readFileSync(process.env.KEAS_EVAL, 'utf8')))); }
@@ -343,11 +350,19 @@ function registerIpc() {
   });
   handle('setTheme', ({ theme }) => { config = writeConfig({ ...config, theme }); nativeTheme.themeSource = theme === 'light' || theme === 'dark' ? theme : 'system'; return theme; });
   handle('openExternal', ({ url }) => { if (/^https?:\/\//.test(url)) shell.openExternal(url); return true; });
-  handle('openFolder', ({ dir }) => shell.openPath(dir));
+  // Only KeaS's own data folder (or a folder in it) can be opened from the setup page.
+  handle('openFolder', async ({ dir }) => {
+    const real = bootstart.folderInside(config.dataDir, dir);
+    if (!real) throw new Error('KeaS only opens its own data folder.');
+    const err = await shell.openPath(real);
+    if (err) throw new Error(err);
+    return true;
+  });
   handle('payroll:open', () => openPayroll());
   handle('payroll:settings', () => payroll().settings());
   handle('payroll:localSignIn', ({ on }) => payroll().setLocalSignIn(!!on));
-  handle('payroll:repinHub', () => payroll().repinHub());
+  handle('payroll:hubKey', () => payroll().hubKey());
+  handle('payroll:repinHub', ({ fingerprint }) => payroll().repinHub({ fingerprint }));
 }
 
 /** Updates the installed service files (KeaS was updated, or its settings changed). 'repair': run it again from Settings. */

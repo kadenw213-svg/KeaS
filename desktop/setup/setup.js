@@ -357,10 +357,30 @@ function payrollAdvanced() {
         h('input', { type: 'checkbox', checked: S.ps.localSignIn, onchange: async (e) => { try { S.ps = await call(k.payrollLocalSignIn, { on: e.target.checked }); render(); } catch (err) { fail(err); } } }),
         h('span', null, 'Allow a local password while the Kea Hub can’t be reached',
           h('span', { class: 'muted small' }, ' Each payroll admin can then set a long local password (16 or more characters) in Payroll. It only works while the Hub can’t be reached, still needs the vault passphrase, and skips the Hub’s two-step sign-in, so leave it off unless you need it. Off by default.'))),
-      h('p', { class: 'muted small' }, 'Payroll trusts the Kea Hub’s signing key from when it was set up. If you moved or reinstalled the Hub, sign-in is refused until you accept its new key here. Only do this for your own Hub.'),
-      h('p', null, h('button', { class: 'btn', onclick: async () => { try { const r = await call(k.payrollRepinHub); S.error = ''; S.repinned = `Accepted the Kea Hub’s key (${r.kids.join(', ')}).`; render(); } catch (err) { fail(err); } } }, 'Accept the Kea Hub’s current key')),
+      S.ps.exportsDir && h('p', { class: 'muted small' }, `Files Payroll saves (tax form data, bank files, reports) go to ${S.ps.exportsDir}, a folder only your Windows account can open.`),
+      S.ps.folderProblem && h('p', { class: 'err' }, `The payroll folder’s permissions: ${S.ps.folderProblem}`),
+      h('p', { class: 'muted small' }, 'Payroll trusts the Kea Hub’s signing key from when it was set up. If the Hub’s key changes, sign-in is refused until you check the new key here and accept it. Only do this for your own Hub.'),
+      h('p', null, h('button', { class: 'btn', onclick: async () => { try { S.hubKey = await call(k.payrollHubKey); S.error = ''; S.repinned = ''; render(); } catch (err) { fail(err); } } }, 'Check the Kea Hub’s key')),
+      S.hubKey && hubKeyPanel(S.hubKey),
       S.repinned && h('p', { class: 'small ok' }, S.repinned),
     ]);
+}
+/** The Hub's current key next to the trusted one: the owner compares fingerprints, reads why it might change, then confirms. */
+function hubKeyPanel(s) {
+  const fp = (t) => h('code', { style: 'font-size:12px;word-break:break-all' }, t || '—');
+  if (!s.changed && s.pinned) return h('p', { class: 'small ok' }, 'The Kea Hub’s key is the one payroll trusts. Nothing to do. Fingerprint: ', fp(s.current.fingerprint));
+  return h('div', { class: 'panel' },
+    h('p', null, h('b', null, s.pinned ? 'The Kea Hub is offering a different key from the one payroll trusts.' : 'Payroll doesn’t trust a Kea Hub key yet.')),
+    h('p', { class: 'small' }, 'New key: ', fp(s.current.fingerprint)),
+    s.pinned && h('p', { class: 'small' }, `Trusted since ${new Date(s.pinned.at).toLocaleString()}: `, fp(s.pinned.fingerprint)),
+    s.localHub && h('p', { class: s.localHub.matches ? 'small ok' : 'err' }, s.localHub.matches ? 'It matches this PC’s own Kea Hub key file.' : 'It does NOT match this PC’s own Kea Hub key file. Don’t accept it.'),
+    h('p', { class: 'small' }, 'A Hub’s key changes when:'),
+    h('ul', { class: 'small' }, ...s.reasons.map((r) => h('li', null, r))),
+    h('p', { class: 'small' }, s.warning, ' Compare the new key with the fingerprint shown on the Hub’s PC before accepting it.'),
+    h('p', null, h('button', { class: 'btn', onclick: async () => {
+      if (!window.confirm(`Accept the Kea Hub key ${s.current.fingerprint}?\n\nOnly if you know why it changed and it matches your Hub.`)) return;
+      try { const r = await call(k.payrollRepinHub, { fingerprint: s.current.fingerprint }); S.error = ''; S.hubKey = null; S.repinned = `Accepted the Kea Hub’s key ${r.fingerprint}.`; render(); } catch (err) { fail(err); }
+    } }, 'Accept this key')));
 }
 
 const VIEWS = { welcome, storage, reach, owner, boot, done, status, settings };

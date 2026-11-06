@@ -33,7 +33,8 @@ function psParse(script) {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 // Every command the elevated scripts may run.
-const ALLOWED = new Set(['Step', 'ConvertFrom-Json', 'ConvertTo-Json', 'Out-Null', 'Join-Path', 'Test-Path', 'New-Item', 'icacls', 'Copy-Item', 'Remove-Item', 'Get-ChildItem', 'ForEach-Object', 'Where-Object', 'Get-CimInstance', 'Stop-Process', 'schtasks', 'powercfg', 'OwnerSid', 'ServiceDir', 'New-Object', 'Get-Acl', null]);
+const ALLOWED = new Set(['Step', 'ConvertFrom-Json', 'ConvertTo-Json', 'Out-Null', 'Join-Path', 'Test-Path', 'New-Item', 'icacls', 'Copy-Item', 'Remove-Item', 'Get-ChildItem', 'ForEach-Object', 'Where-Object', 'Get-CimInstance', 'Stop-Process', 'schtasks', 'powercfg', 'OwnerSid', 'ServiceDir', 'New-Object', 'Get-Acl',
+  'Move-Item', 'Get-Item', 'Select-Object', 'Add-Type', 'Sha256Hex', 'IsLink', 'LinkCount', 'DataProblems', null]);
 
 test('options: defaults, unknown keys dropped, numbers clamped', () => {
   const o = b.options({ delaySeconds: 99999, restartCount: 0, bogus: 1, power: 0 });
@@ -171,12 +172,20 @@ test('power targets and the plan that puts back what was turned off', () => {
 
 test('install script: locked-down service folder in Program Files, locked-down data folder, then the task; no names in the text', () => {
   const s = b.installScript({ power: { standby: 0, wake: 1 }, scheme: '381b4222-f694-41f0-9685-ff5bb260df2e' });
-  // Names come from the JSON next to the script.
-  assert.ok(s.includes("[IO.Path]::ChangeExtension($PSCommandPath, '.json')"));
+  // Names come from JSON data (base64) put into the script, never from its text.
+  assert.ok(s.includes("$cfg = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__KEAS_SETTINGS_BASE64__')) | ConvertFrom-Json"));
   assert.ok(s.includes("Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'KeaS Hub Service'"), 'the service folder can only be the one in Program Files');
-  // The service folder: owned by Administrators, nothing inherited, SYSTEM + Administrators full, the owner Modify, nobody else.
+  // The service folder: owned by Administrators, nothing inherited, SYSTEM + Administrators full, the owner only able to
+  // read while the files go in (Modify again after the task is registered), nobody else.
   assert.ok(s.includes("icacls $svc /setowner '*S-1-5-32-544' /C /Q"));
-  assert.ok(s.includes("icacls $svc /inheritance:r /grant:r $grantSystem $grantAdmins ('*' + (OwnerSid) + ':(OI)(CI)M') /C /Q"));
+  assert.ok(s.includes("icacls $svc /inheritance:r /grant:r $grantSystem $grantAdmins ('*' + (OwnerSid) + ':(OI)(CI)RX') /C /Q"));
+  assert.ok(s.includes("icacls $svc /grant ('*' + (OwnerSid) + ':(OI)(CI)M') /C /Q"));
+  assert.ok(s.indexOf("Step 'task'") < s.indexOf("Step 'service:owner'"), 'the owner may change files only after the task is registered');
+  assert.ok(s.indexOf("Step 'service:folder'") < s.indexOf("Step 'service:clear'") && s.indexOf("Step 'service:clear'") < s.indexOf("Step 'service:copy'"));
+  // Staged files: checked against their hashes, read once, those bytes written.
+  assert.ok(s.includes('if ((Sha256Hex $b) -ne [string]$f.sha256)'));
+  assert.ok(s.includes('[IO.File]::WriteAllBytes($dst, $files[$rel])'));
+  assert.ok(!s.includes('Copy-Item -LiteralPath (Join-Path $stage'), 'nothing is copied unchecked');
   assert.ok(s.includes("$grantSystem = '*S-1-5-18:(OI)(CI)F'") && s.includes("$grantAdmins = '*S-1-5-32-544:(OI)(CI)F'"));
   assert.ok(s.includes('icacls $_.FullName /reset /T /C /Q'), 'everything copied in inherits exactly that');
   assert.ok(!/S-1-5-32-545|S-1-5-11|S-1-1-0|\*Users|Everyone|Authenticated/.test(s), 'Users, Authenticated Users and Everyone get nothing');
@@ -262,9 +271,8 @@ test('C1: the data folder step really locks a folder down, and the PoC name stay
     execFileSync('icacls', [data, '/grant', '*S-1-5-32-545:(OI)(CI)M'], { stdio: 'ignore' });
     execFileSync('icacls', [join(data, 'owner.key'), '/grant', '*S-1-1-0:F'], { stdio: 'ignore' });
     const script = [b.scriptParts.head, ...b.scriptParts.dataAclLines(), b.scriptParts.tail].join('\n');
-    writeFileSync(join(root, 'acl.ps1'), '\ufeff' + script);
-    writeFileSync(join(root, 'acl.json'), JSON.stringify({ ownerSid: sid, dataDirs: [data], secretFiles: [join(data, 'owner.key')] }));
-    spawnSync(PS, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', join(root, 'acl.ps1')], { cwd: root, encoding: 'utf8', timeout: 60_000 });
+    writeFileSync(join(root, 'acl.ps1'), '\ufeff' + b.composeScript(script, { ownerSid: sid, dataDirs: [data], secretFiles: [join(data, 'owner.key')], resultFile: join(root, 'acl.result.json') }));
+    spawnSync(PS, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', join(root, 'acl.ps1')], { cwd: root, encoding: 'utf8', timeout: 120_000 });
     const result = JSON.parse(readFileSync(join(root, 'acl.result.json'), 'utf8').replace(/^\ufeff/, ''));
     assert.equal(result.ok, true, JSON.stringify(result));
     assert.ok(!readdirSync(root).includes('injected'), 'nothing in the name ran');
@@ -281,13 +289,13 @@ test('C1: secureDataFolder locks a new folder at once, and repairs or refuses an
   try {
     const sid = await b.currentUserSid();
     const dir = join(root, 'Kea Hub');
-    assert.deepEqual(await b.secureDataFolder(dir), { ok: true, changed: true });
+    assert.deepEqual(await b.secureDataFolder(dir), { ok: true, changed: true, wasOpen: false });
     assert.deepEqual(b.aclProblems(await b.aclReport(dir), sid), []);
-    assert.deepEqual(await b.secureDataFolder(dir), { ok: true, changed: false }, 'already locked: nothing to do');
+    assert.deepEqual(await b.secureDataFolder(dir), { ok: true, changed: false, wasOpen: false }, 'already locked: nothing to do');
     // Opened up again (as if by an older KeaS): repaired.
     execFileSync('icacls', [dir, '/inheritance:e', '/grant', '*S-1-5-32-545:(OI)(CI)M'], { stdio: 'ignore' });
     assert.ok(b.aclProblems(await b.aclReport(dir), sid).length > 0);
-    assert.equal((await b.secureDataFolder(dir)).changed, true);
+    assert.deepEqual(await b.secureDataFolder(dir), { ok: true, changed: true, wasOpen: true });
     assert.deepEqual(b.aclProblems(await b.aclReport(dir), sid), []);
     // A folder another account owns is refused (simulated report).
     await assert.rejects(b.secureDataFolder(dir, { sid, report: async () => ({ owner: 'S-1-5-21-9-9-9-1234', protected: true, aces: [] }) }), /another Windows account/);
@@ -323,13 +331,19 @@ test('undo script: removes the task and the service folder, restores the saved v
   assert.ok(!none.includes('powercfg'));
 });
 
-test('elevation: one Start-Process -Verb RunAs that waits; the script path is passed in the environment, not the command', () => {
+test('elevation: one Start-Process -Verb RunAs that waits; it runs an encoded check-then-run command passed in the environment', () => {
   const a = b.elevateArgs();
   const cmd = a[a.length - 1];
   assert.ok(cmd.includes('-Verb RunAs -Wait -PassThru'));
-  assert.ok(cmd.includes('$env:KEAS_ELEVATE_SCRIPT'));
+  assert.ok(cmd.includes('$env:KEAS_ELEVATE_CMD'));
+  assert.ok(cmd.includes("'-EncodedCommand',$c"));
+  assert.ok(!cmd.includes("'-File'"), 'never a script file the elevated side would trust as it is');
   assert.ok(cmd.endsWith('exit $p.ExitCode'));
   assert.ok(!/[A-Za-z]:\\/.test(cmd));
+  const boot = b.elevateBootstrap('C:\\Users\\sam\\AppData\\Roaming\\KeaS\\hub-service\\install.ps1', 'ab'.repeat(32));
+  assert.ok(boot.includes(`if ($h -ne '${'ab'.repeat(32)}') { exit 97 }`));
+  assert.ok(!/[A-Za-z]:\\/.test(boot), 'the path is base64 data');
+  assert.throws(() => b.elevateBootstrap('x', 'not a hash'));
 });
 
 test('parseTaskQuery', () => {

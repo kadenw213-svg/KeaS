@@ -17,10 +17,18 @@
 //   - "Restart after power loss" is a setting in the PC's BIOS/UEFI firmware. Windows can't change it; KeaS explains it.
 //
 // Everything that changes the system runs in ONE elevated PowerShell script (one Windows permission prompt). The script
-// text holds no folder or file names: it reads them from a JSON file next to it, so no name (whatever quote characters
-// it contains) can ever become PowerShell code. The script text, the JSON, the task XML and the launcher are built by
-// the pure functions below, so they're unit-tested and can be shown without running anything (dry run).
-const { execFile } = require('child_process');
+// text holds no folder or file names as code: they're JSON data (base64 inside the script), so no name (whatever quote
+// characters it contains) can ever become PowerShell code. The script text, its settings, the task XML and the
+// launcher are built by the pure functions below, so they're unit-tested and can be shown without running anything.
+//
+// What's staged for the elevated script sits in KeaS's own (user-writable) folder until Windows asks for permission,
+// so nothing there is trusted as it is: the elevated PowerShell is started with a short command (passed in its
+// command line, not a file) that holds the SHA-256 of the script KeaS wrote, and runs the script only if it still has
+// exactly that hash. The script in turn carries the SHA-256 of every staged file (the Hub copy, the launcher, the task
+// XML), reads each one once, checks it, and writes those same bytes into the service folder, which no other account
+// can change while that happens. A changed file stops the install before anything is copied.
+const { execFile, spawn } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -284,10 +292,11 @@ const checkScheme = (s) => {
 // ---------- the elevated scripts ----------
 // The head reads the settings from "<script name>.json" next to the script and writes the result to
 // "<script name>.result.json": the script text itself never contains a folder or file name.
-const SCRIPT_HEAD = `# Written by KeaS. Runs once, elevated. Folder and file names come from the .json file next to this script.
+const SETTINGS_SLOT = '__KEAS_SETTINGS_BASE64__';
+const SCRIPT_HEAD = `# Written by KeaS. Runs once, elevated. Folder and file names are JSON data (base64 below), never code.
 $ErrorActionPreference = 'Stop'
-$cfg = [IO.File]::ReadAllText([IO.Path]::ChangeExtension($PSCommandPath, '.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json
-$resultFile = [IO.Path]::ChangeExtension($PSCommandPath, '.result.json')
+$cfg = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${SETTINGS_SLOT}')) | ConvertFrom-Json
+$resultFile = [string]$cfg.resultFile
 $grantSystem = '*${SID.SYSTEM}:(OI)(CI)F'
 $grantAdmins = '*${SID.ADMINS}:(OI)(CI)F'
 $steps = New-Object System.Collections.ArrayList
@@ -303,9 +312,45 @@ function ServiceDir {
   if ([string]$cfg.service -ne $expected) { throw "The service folder must be $expected." }
   return $expected
 }
+function Sha256Hex([byte[]]$b) { return -join ([Security.Cryptography.SHA256]::Create().ComputeHash($b) | ForEach-Object { $_.ToString('x2') }) }
+function IsLink($i) { return [bool]($i.Attributes -band [IO.FileAttributes]::ReparsePoint) }
+$keaLinksSource = @'
+using System; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;
+public static class KeaLinks {
+  [StructLayout(LayoutKind.Sequential, Pack = 4)] struct Info { public uint Attr, C1, C2, A1, A2, W1, W2, Serial, SizeHigh, SizeLow, Links, IndexHigh, IndexLow; }
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr sec, uint disposition, uint flags, IntPtr template);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetFileInformationByHandle(SafeFileHandle h, out Info info);
+  public static uint Count(string path) {
+    using (SafeFileHandle h = CreateFileW(path, 0x80, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
+      if (h.IsInvalid) return 0;
+      Info i;
+      return GetFileInformationByHandle(h, out i) ? i.Links : 0;
+    }
+  }
+}
+'@
+function LinkCount([string]$p) { if (-not ('KeaLinks' -as [type])) { Add-Type -TypeDefinition $keaLinksSource }; return [KeaLinks]::Count($p) }
+# What can't stay in a data folder that's being locked down: links (followed by icacls /T), files with a second name
+# elsewhere (a hard link: changing its permissions changes the other one's), found without following any link.
+function DataProblems([string]$root) {
+  $out = New-Object System.Collections.ArrayList
+  $stack = New-Object System.Collections.Stack
+  $stack.Push((Get-Item -LiteralPath $root -Force))
+  while ($stack.Count -gt 0) {
+    foreach ($i in $stack.Pop().GetFileSystemInfos()) {
+      if (IsLink $i) { [void]$out.Add('link ' + $i.FullName); continue }
+      if ($i -is [IO.DirectoryInfo]) { $stack.Push($i) } elseif ((LinkCount $i.FullName) -gt 1) { [void]$out.Add('hard link ' + $i.FullName) }
+    }
+  }
+  return ,$out
+}
 `;
+// The result goes next to the script under a name only this run knows, and never through a link.
 const SCRIPT_TAIL = `
-[IO.File]::WriteAllText($resultFile, (@{ ok = -not $failed; steps = $steps } | ConvertTo-Json -Depth 4))
+$rd = [IO.Path]::GetDirectoryName($resultFile)
+if ($resultFile -and (Test-Path -LiteralPath $rd) -and -not (IsLink (Get-Item -LiteralPath $rd -Force)) -and -not (Test-Path -LiteralPath $resultFile)) {
+  [IO.File]::WriteAllText($resultFile, (@{ ok = -not $failed; steps = $steps } | ConvertTo-Json -Depth 4))
+}
 if ($failed) { exit 1 } else { exit 0 }
 `;
 const powerLine = (scheme, key, value) => {
@@ -314,21 +359,30 @@ const powerLine = (scheme, key, value) => {
 };
 
 /**
- * The service folder: made (if needed) with only SYSTEM and Administrators in full control and the owner able to change
- * files (so KeaS can update the Hub copy without asking again). Nothing is inherited from Program Files, and no other
- * account gets any access. Then the staged files are copied in and everything inside inherits exactly that.
+ * The service folder: made (if needed), owned by Administrators, with only SYSTEM and Administrators in full control
+ * and, while the install runs, the owner able to read only. Nothing is inherited from Program Files, and no other
+ * account gets any access. Whatever was in it is moved aside (moving a link moves the link, never what it points to;
+ * KeaS removes the old copy later, un-elevated). Then the staged files are checked against their hashes and written in,
+ * everything inside inherits exactly that, and after the task is registered the owner may change files again (so
+ * KeaS can update the Hub copy without asking).
  */
 const serviceLines = () => [
-  `Step 'service:folder' { $svc = ServiceDir; if (-not (Test-Path -LiteralPath $svc)) { [void](New-Item -ItemType Directory -Path $svc) }; icacls $svc /setowner '*${SID.ADMINS}' /C /Q; icacls $svc /inheritance:r /grant:r $grantSystem $grantAdmins ('*' + (OwnerSid) + ':(OI)(CI)M') /C /Q }`,
-  `Step 'service:copy' { $svc = ServiceDir; $stage = [string]$cfg.stage; $hub = Join-Path $svc 'hub'; if (Test-Path -LiteralPath $hub) { Remove-Item -LiteralPath $hub -Recurse -Force }; Copy-Item -LiteralPath (Join-Path $stage 'hub') -Destination $hub -Recurse -Force; foreach ($n in @('start-hub.cmd', 'kea-hub-task.xml', 'version.txt')) { Copy-Item -LiteralPath (Join-Path $stage $n) -Destination (Join-Path $svc $n) -Force }; Get-ChildItem -LiteralPath $svc -Force | ForEach-Object { icacls $_.FullName /setowner '*${SID.ADMINS}' /T /C /Q; icacls $_.FullName /reset /T /C /Q } }`,
+  `Step 'service:folder' { $svc = ServiceDir; if (-not (Test-Path -LiteralPath $svc)) { [void](New-Item -ItemType Directory -Path $svc) }; if (IsLink (Get-Item -LiteralPath $svc -Force)) { throw 'The service folder is a link.' }; icacls $svc /setowner '*${SID.ADMINS}' /C /Q; icacls $svc /inheritance:r /grant:r $grantSystem $grantAdmins ('*' + (OwnerSid) + ':(OI)(CI)RX') /C /Q }`,
+  `Step 'service:clear' { $svc = ServiceDir; $old = Join-Path $svc ('.old-' + [Guid]::NewGuid().ToString('N')); [void](New-Item -ItemType Directory -Path $old); Get-ChildItem -LiteralPath $svc -Force | Where-Object { $_.Name -notlike '.old-*' } | ForEach-Object { Move-Item -LiteralPath $_.FullName -Destination $old -Force } }`,
+  `Step 'service:copy' { $svc = ServiceDir; $stage = [string]$cfg.stage; $files = [ordered]@{}; foreach ($f in @($cfg.manifest)) { $rel = [string]$f.path; if (-not $rel -or [IO.Path]::IsPathRooted($rel) -or $rel.Contains(':') -or ($rel.Split([char]92) -contains '..') -or ($rel.Split([char]92) -contains '.')) { throw 'A staged file has a bad name.' }; $b = [IO.File]::ReadAllBytes((Join-Path $stage $rel)); if ((Sha256Hex $b) -ne [string]$f.sha256) { throw ('A staged file changed after KeaS wrote it (' + $rel + '). Nothing was copied. Run it again from KeaS.') }; $files[$rel] = $b }; if ($files.Count -lt 1) { throw 'Nothing was staged.' }; foreach ($rel in $files.Keys) { $dst = Join-Path $svc $rel; [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($dst)); [IO.File]::WriteAllBytes($dst, $files[$rel]) }; Get-ChildItem -LiteralPath $svc -Force | Where-Object { $_.Name -notlike '.old-*' } | ForEach-Object { icacls $_.FullName /setowner '*${SID.ADMINS}' /T /C /Q; icacls $_.FullName /reset /T /C /Q } }`,
+];
+const serviceOwnerLines = () => [
+  `Step 'service:owner' { $svc = ServiceDir; icacls $svc /grant ('*' + (OwnerSid) + ':(OI)(CI)M') /C /Q }`,
 ];
 /**
  * The data folder (and a separate storage folder): owned by the owner, with SYSTEM, Administrators and the owner in
- * full control and nobody else at all. The secret files and the database are given back to the owner and made to
- * inherit exactly that, in case another account put them there first or changed their permissions.
+ * full control and nobody else at all, and everything inside given to the owner and made to inherit exactly that
+ * (icacls /T), in case another account put things there first or changed their permissions. A folder that's a link,
+ * or that holds links or hard-linked files (found without following any link), is refused before anything changes:
+ * icacls would follow them out of the folder.
  */
 const dataAclLines = () => [
-  `Step 'data:acl' { $owner = '*' + (OwnerSid); $keep = @('${SID.SYSTEM}', '${SID.ADMINS}', (OwnerSid)); foreach ($d in @($cfg.dataDirs)) { if ($d -and (Test-Path -LiteralPath $d)) { icacls $d /setowner $owner /C /Q; icacls $d /inheritance:r /grant:r $grantSystem $grantAdmins ($owner + ':(OI)(CI)F') /C /Q; foreach ($r in @((Get-Acl -LiteralPath $d).GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) { $s = $r.IdentityReference.Value; if ([string]$r.AccessControlType -eq 'Allow' -and $keep -notcontains $s) { icacls $d /remove:g ('*' + $s) /C /Q } } } }; foreach ($f in @($cfg.secretFiles)) { if ($f -and (Test-Path -LiteralPath $f)) { icacls $f /setowner $owner /C /Q; icacls $f /reset /C /Q } } }`,
+  `Step 'data:acl' { $owner = '*' + (OwnerSid); $keep = @('${SID.SYSTEM}', '${SID.ADMINS}', (OwnerSid)); foreach ($d in @($cfg.dataDirs)) { if ($d -and (Test-Path -LiteralPath $d)) { if (IsLink (Get-Item -LiteralPath $d -Force)) { throw ('The data folder is a link to somewhere else: ' + $d) }; icacls $d /setowner $owner /C /Q; icacls $d /inheritance:r /grant:r $grantSystem $grantAdmins ($owner + ':(OI)(CI)F') /C /Q; foreach ($r in @((Get-Acl -LiteralPath $d).GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) { $s = $r.IdentityReference.Value; if ([string]$r.AccessControlType -eq 'Allow' -and $keep -notcontains $s) { icacls $d /remove:g ('*' + $s) /C /Q } }; $bad = DataProblems $d; if ($bad.Count -gt 0) { throw ('These must not stay in the data folder (another account may have put them there). Remove them, then run this again: ' + (($bad | Select-Object -First 10) -join '; ')) }; Get-ChildItem -LiteralPath $d -Force | ForEach-Object { icacls $_.FullName /setowner $owner /T /C /Q; icacls $_.FullName /reset /T /C /Q } } }; foreach ($f in @($cfg.secretFiles)) { if ($f -and (Test-Path -LiteralPath $f)) { icacls $f /setowner $owner /C /Q; icacls $f /reset /C /Q } } }`,
 ];
 /** Removes the launcher and Hub copy older KeaS versions kept in "<data folder>\service" (only if it is one). */
 const legacyLines = () => [
@@ -365,7 +419,7 @@ function installScript({ power = {}, scheme = 'SCHEME_CURRENT', bootStart = true
   if (bootStart) {
     lines.push(...serviceLines(), ...dataAclLines());
     if (stop) lines.push(...stopLines());
-    lines.push(...legacyLines(), `Step 'task' { schtasks /Create /TN ${psq(TASK_NAME)} /XML ([string]$cfg.xmlFile) /F }`);
+    lines.push(...legacyLines(), `Step 'task' { schtasks /Create /TN ${psq(TASK_NAME)} /XML ([string]$cfg.xmlFile) /F }`, ...serviceOwnerLines());
   } else if (removeTask) lines.push(...taskRemoveLines(stop), ...serviceRemoveLines(), ...legacyLines());
   lines.push(...powerLines(scheme, power));
   lines.push(SCRIPT_TAIL);
@@ -392,7 +446,7 @@ function uninstallScript({ previous = null, removeTask = true, stop = false }) {
 }
 
 /** The settings file the elevated script reads (every folder and file name it uses). */
-function scriptSettings({ config, files, ownerSid }) {
+function scriptSettings({ config, files, ownerSid, manifest = [], resultFile = null }) {
   // (install() has already refused a folder name it doesn't accept; these are data for the script, never code.)
   const norm = (d) => (typeof d === 'string' && /^[A-Za-z]:\\/.test(d) ? path.win32.normalize(d).replace(/\\+$/, '') : null);
   const dataDir = norm(config?.dataDir);
@@ -407,15 +461,43 @@ function scriptSettings({ config, files, ownerSid }) {
     secretFiles: dataDir ? SECRET_FILES.map((f) => path.win32.join(dataDir, f)) : [],
     stopPaths: [files.entry, files.launcher, ...(legacy ? [path.win32.join(legacy, 'hub', 'index.mjs'), path.win32.join(legacy, 'start-hub.cmd')] : [])],
     legacy: legacy ? [legacy] : [],
+    manifest: manifest.map((m) => ({ path: m.path, sha256: m.sha256 })),
+    resultFile,
   };
 }
 
+/** The runnable script: the template with its settings in it (base64 JSON, so a name can only ever be data). */
+function composeScript(template, settings) {
+  if (template.split(SETTINGS_SLOT).length !== 2) throw new Error('The script has no place for its settings.');
+  return template.replace(SETTINGS_SLOT, Buffer.from(JSON.stringify(settings), 'utf8').toString('base64'));
+}
+const sha256Hex = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 /**
- * The PowerShell command (run un-elevated) that runs a script elevated and waits: one Windows permission prompt. The
- * script's path is passed in the environment (KEAS_ELEVATE_SCRIPT), never inside the command text.
+ * The short command the elevated PowerShell runs (passed as -EncodedCommand): read the script file once, run it only
+ * if it still has the hash KeaS wrote (exit 97 if not), from those same bytes.
+ */
+function elevateBootstrap(scriptFile, hash) {
+  if (!/^[0-9a-f]{64}$/.test(hash)) throw new Error('bad script hash');
+  const p64 = Buffer.from(String(scriptFile), 'utf8').toString('base64');
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    `$p = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${p64}'))`,
+    '$b = [IO.File]::ReadAllBytes($p)',
+    "$h = -join ([Security.Cryptography.SHA256]::Create().ComputeHash($b) | ForEach-Object { $_.ToString('x2') })",
+    `if ($h -ne '${hash}') { exit 97 }`,
+    '$t = [Text.Encoding]::UTF8.GetString($b).TrimStart([char]0xFEFF)',
+    '. ([scriptblock]::Create($t))',
+  ].join('\n');
+}
+const encodedCommand = (text) => Buffer.from(text, 'utf16le').toString('base64');
+
+/**
+ * The PowerShell command (run un-elevated) that runs the check-then-run command elevated and waits: one Windows
+ * permission prompt. The command (base64, from elevateBootstrap) is passed in the environment (KEAS_ELEVATE_CMD) and
+ * given to the elevated PowerShell as -EncodedCommand: it never comes from a file another program could change.
  */
 function elevateArgs() {
-  const inner = "$f = $env:KEAS_ELEVATE_SCRIPT; if (-not $f) { exit 2 }; $ps = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'; $p = Start-Process -FilePath $ps -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('\"' + $f + '\"')); exit $p.ExitCode";
+  const inner = "$c = $env:KEAS_ELEVATE_CMD; if (-not $c -or $c -notmatch '^[A-Za-z0-9+/=]+$') { exit 2 }; $ps = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'; $p = Start-Process -FilePath $ps -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand',$c); exit $p.ExitCode";
   return ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', inner];
 }
 
@@ -463,6 +545,19 @@ function run(file, args, { timeout = 30_000, env } = {}) {
     execFile(file, args, { windowsHide: true, timeout, ...(env ? { env: { ...process.env, ...env } } : {}) }, (err, stdout, stderr) => resolve({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, out: String(stdout), err: String(stderr) }));
   });
 }
+/** Runs a program with `input` on its standard input (UTF-8). */
+function runInput(file, args, input, { timeout = 10 * 60_000 } = {}) {
+  return new Promise((resolve) => {
+    let out = '', err = '', done = false;
+    const c = spawn(file, args, { windowsHide: true });
+    const t = setTimeout(() => { try { c.kill(); } catch {} }, timeout);
+    c.stdout.on('data', (d) => (out += d));
+    c.stderr.on('data', (d) => (err += d));
+    c.on('error', (e) => { if (!done) { done = true; clearTimeout(t); resolve({ code: 1, out, err: err || e.message }); } });
+    c.on('close', (code) => { if (!done) { done = true; clearTimeout(t); resolve({ code: code ?? 1, out, err }); } });
+    c.stdin.end(input);
+  });
+}
 const SYS = () => path.join(systemRoot(), 'System32');
 const powercfg = () => path.join(SYS(), 'powercfg.exe');
 const schtasks = () => path.join(SYS(), 'schtasks.exe');
@@ -489,16 +584,67 @@ async function aclReport(dir) {
 }
 
 /**
+ * Everything in a folder, found without following links: { entries, links, hardLinks }. links: junctions and symbolic
+ * links (an icacls /T would follow them out of the folder); hardLinks: files that also have another name somewhere
+ * else (their permissions are shared with that other name).
+ */
+function walkFolder(dir) {
+  const entries = [], links = [], hardLinks = [];
+  const stack = [dir];
+  while (stack.length) {
+    const d = stack.pop();
+    for (const name of fs.readdirSync(d)) {
+      const p = path.join(d, name);
+      let st;
+      try { st = fs.lstatSync(p); } catch { links.push(p); continue; }
+      if (st.isSymbolicLink()) { links.push(p); continue; }
+      entries.push(p);
+      if (st.isDirectory()) stack.push(p);
+      else if (st.nlink > 1) hardLinks.push(p);
+    }
+  }
+  return { entries, links, hardLinks };
+}
+// The owners of many files at once (SIDs, '' when one can't be read). The list goes in on standard input.
+const OWNERS_PS = "$l = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd().Trim())) | ConvertFrom-Json; $t = [Security.Principal.SecurityIdentifier]; $o = @(foreach ($p in @($l)) { try { (Get-Acl -LiteralPath $p).GetOwner($t).Value } catch { '' } }); ConvertTo-Json -Compress -InputObject $o";
+async function ownersOf(paths) {
+  if (!paths.length) return [];
+  const r = await runInput(powershell(), ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', OWNERS_PS], Buffer.from(JSON.stringify(paths), 'utf8').toString('base64'));
+  try { const j = JSON.parse(r.out); const a = Array.isArray(j) ? j : [j]; return paths.map((_, i) => String(a[i] ?? '')); } catch { return paths.map(() => ''); }
+}
+const short = (list, root) => list.slice(0, 5).map((p) => path.relative(root, p) || p).join(', ') + (list.length > 5 ? ` and ${list.length - 5} more` : '');
+/**
+ * Refuses a folder that holds what another account could have slipped in while it was open: links, hard-linked files,
+ * or anything owned by another account (not this one, SYSTEM or Administrators).
+ */
+async function checkContents(dir, sid, owners) {
+  const { entries, links, hardLinks } = walkFolder(dir);
+  const ownerOf = await owners(entries);
+  const foreign = entries.filter((_, i) => ![sid, SID.SYSTEM, SID.ADMINS].includes(ownerOf[i]));
+  const found = [];
+  if (links.length) found.push(`links to other places (${short(links, dir)})`);
+  if (hardLinks.length) found.push(`files that also have another name somewhere else (hard links: ${short(hardLinks, dir)})`);
+  if (foreign.length) found.push(`files or folders that belong to another Windows account (${short(foreign, dir)})`);
+  if (found.length) throw new Error(`KeaS can’t lock this folder down: it has ${found.join('; ')}. Another account on this PC could have put them there while the folder was open to everyone. Remove them (or move your data to a new folder), then start KeaS again.`);
+}
+
+/**
  * Makes a data folder safe to use: a new folder is made and locked down at once (and must still be empty afterwards, so
  * nothing could be slipped in first); an existing one must belong to this account, and is locked down if it isn't
  * already. Only SYSTEM, Administrators and this account can then open anything in it. No elevation needed: the owner of
- * a folder may always set its permissions. Returns { ok, changed }.
+ * a folder may always set its permissions.
+ *
+ * Locking down an existing folder that was open: its contents are checked first (no links, no hard links, nothing
+ * owned by another account; see checkContents), then everything inside is made to inherit the folder's permissions
+ * (icacls /reset /T), then checked again. Returns { ok, changed, wasOpen }: wasOpen means secrets in it may have been
+ * read while it was open, so the caller makes new ones (rotateHubSecrets).
  */
-async function secureDataFolder(dir, { sid, report = aclReport, apply = (d, s) => run(icacls(), dataAclArgs(d, s)), removeGrant = (d, s) => run(icacls(), [d, '/remove:g', `*${s}`, '/C', '/Q']) } = {}) {
+async function secureDataFolder(dir, { sid, report = aclReport, apply = (d, s) => run(icacls(), dataAclArgs(d, s)), removeGrant = (d, s) => run(icacls(), [d, '/remove:g', `*${s}`, '/C', '/Q']), owners = ownersOf, reset = (p) => run(icacls(), [p, '/reset', '/T', '/C', '/Q'], { timeout: 10 * 60_000 }) } = {}) {
   dir = validateDataDir(dir);
-  if (process.platform !== 'win32') { fs.mkdirSync(dir, { recursive: true }); return { ok: true, changed: false }; }
+  if (process.platform !== 'win32') { fs.mkdirSync(dir, { recursive: true }); return { ok: true, changed: false, wasOpen: false }; }
   sid = sid || (await currentUserSid());
   const existed = fs.existsSync(dir);
+  if (existed && fs.lstatSync(dir).isSymbolicLink()) throw new Error('That folder is a link to somewhere else. Pick the real folder, or make a new one.');
   if (existed && !fs.statSync(dir).isDirectory()) throw new Error('That’s a file, not a folder.');
   if (!existed) fs.mkdirSync(dir, { recursive: true });
   const before = await report(dir);
@@ -514,9 +660,48 @@ async function secureDataFolder(dir, { sid, report = aclReport, apply = (d, s) =
     const left = aclProblems(after, sid);
     if (left.length) throw new Error(`The folder’s permissions are still too open: ${left.join('; ')}.`);
     if (!existed && fs.readdirSync(dir).length) throw new Error('Something was put in the new folder before KeaS could lock it. Pick a different folder.');
-    return { ok: true, changed: true };
+    if (existed) {
+      await checkContents(dir, sid, owners);
+      for (const name of fs.readdirSync(dir)) {
+        const rr = await reset(path.join(dir, name));
+        if (rr.code !== 0) throw new Error(`Couldn’t reset the permissions of ${name} (${(rr.err || rr.out || `code ${rr.code}`).trim().slice(0, 200)}).`);
+      }
+      await checkContents(dir, sid, owners);
+    }
+    return { ok: true, changed: true, wasOpen: existed };
   }
-  return { ok: true, changed: false };
+  return { ok: true, changed: false, wasOpen: false };
+}
+
+/**
+ * After a Hub data folder that was open to other accounts is locked down: its owner key and signing key may have been
+ * read, so they're wiped and removed, and the Hub makes new ones when it starts (it creates both when they're
+ * missing). Payroll vaults that trusted the old signing key then ask the owner to check and accept the new one.
+ * Returns the names removed.
+ */
+function rotateHubSecrets(dataDir) {
+  const gone = [];
+  for (const name of ['owner.key', 'hub-signing-key.pem']) {
+    const f = path.join(dataDir, name);
+    try {
+      const st = fs.lstatSync(f);
+      if (st.isFile()) fs.writeFileSync(f, Buffer.alloc(st.size));
+      fs.rmSync(f, { force: true });
+      gone.push(name);
+    } catch {}
+  }
+  return gone;
+}
+
+/** The real path of `p` when it's `root` or a folder inside it (links resolved first); otherwise null. */
+function folderInside(root, p) {
+  if (!root || typeof p !== 'string' || !p.trim()) return null;
+  let r, t;
+  try { r = fs.realpathSync.native(path.resolve(root)); t = fs.realpathSync.native(path.resolve(p)); } catch { return null; }
+  const rel = path.relative(r, t);
+  if (rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) return null;
+  try { if (!fs.statSync(t).isDirectory()) return null; } catch { return null; }
+  return t;
 }
 
 /** The current values of every power setting KeaS can change (reading needs no permission). */
@@ -536,39 +721,52 @@ async function taskStatus() {
   return parseTaskQuery(r.out, r.code);
 }
 
-/** Copies the Hub's files (never its data folder) to toDir, file by file (works out of app.asar too). */
-function copyHub(fromDir, toDir) {
-  const walk = (src, dst) => {
+/**
+ * Copies the Hub's files (never its data folder) to toDir, file by file (works out of app.asar too). onFile(rel, bytes)
+ * hears about each file written (for the hashes the elevated script checks).
+ */
+function copyHub(fromDir, toDir, onFile = () => {}) {
+  const walk = (src, dst, rel) => {
     fs.mkdirSync(dst, { recursive: true });
     for (const name of fs.readdirSync(src)) {
       if (name === 'data' && src === fromDir) continue;
-      const s = path.join(src, name), d = path.join(dst, name);
-      if (fs.statSync(s).isDirectory()) walk(s, d);
-      else fs.writeFileSync(d, fs.readFileSync(s));
+      const s = path.join(src, name), d = path.join(dst, name), r = rel ? `${rel}\\${name}` : name;
+      if (fs.statSync(s).isDirectory()) walk(s, d, r);
+      else { const b = fs.readFileSync(s); fs.writeFileSync(d, b); onFile(r, b); }
     }
   };
-  walk(fromDir, toDir);
+  walk(fromDir, toDir, '');
 }
 
-/** Writes the Hub copy, the launcher, the task XML and version.txt into `to` (the staging folder or the service folder). */
+/**
+ * Writes the Hub copy, the launcher, the task XML and version.txt into `to` (the staging folder or the service folder).
+ * Returns the manifest: [{ path (relative, backslashes), sha256 }] of exactly the bytes written.
+ */
 function writeServiceFiles(to, { config, exe, hubSource, version, opts, port = 4860, userId = currentUser(), files }) {
   validateDataDir(config.dataDir);
   if (config.storageDir) validateDataDir(config.storageDir, 'The storage folder');
   fs.mkdirSync(to, { recursive: true });
+  const manifest = [];
+  const put = (rel, bytes) => { fs.writeFileSync(path.join(to, rel), bytes); manifest.push({ path: rel, sha256: sha256Hex(bytes) }); };
   const hubDir = path.join(to, 'hub');
   fs.rmSync(hubDir, { recursive: true, force: true });
-  copyHub(hubSource, hubDir);
-  fs.writeFileSync(path.join(to, 'start-hub.cmd'), launcherCmd({ exe, entry: files.entry, env: hubEnv(config, { port }), logFile: files.logFile }));
+  copyHub(hubSource, hubDir, (rel, b) => manifest.push({ path: `hub\\${rel}`, sha256: sha256Hex(b) }));
+  put('start-hub.cmd', Buffer.from(launcherCmd({ exe, entry: files.entry, env: hubEnv(config, { port }), logFile: files.logFile })));
   // Task Scheduler wants the XML as UTF-16 with a byte-order mark.
-  fs.writeFileSync(path.join(to, 'kea-hub-task.xml'), Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(taskXml({ userId, launcher: files.launcher, workDir: files.hubDir, opts }), 'utf16le')]));
-  fs.writeFileSync(path.join(to, 'version.txt'), String(version || ''));
+  put('kea-hub-task.xml', Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(taskXml({ userId, launcher: files.launcher, workDir: files.hubDir, opts }), 'utf16le')]));
+  put('version.txt', Buffer.from(String(version || '')));
+  return manifest;
 }
 /** Stages the service files in KeaS's own folder (the elevated script copies them into the service folder). */
 function prepareFiles({ config, exe, hubSource, version, opts, port = 4860, userId = currentUser(), stageDir, service = serviceDir() }) {
   if (!stageDir) throw new Error('Missing the staging folder.');
   const files = planFiles({ service, stageDir });
-  writeServiceFiles(stageDir, { config, exe, hubSource, version, opts, port, userId, files });
+  files.manifest = writeServiceFiles(stageDir, { config, exe, hubSource, version, opts, port, userId, files });
   return files;
+}
+/** Removes the copies an install moved aside in the service folder (un-elevated: the owner may change files there). */
+function cleanOldCopies(service = serviceDir()) {
+  try { for (const n of fs.readdirSync(service)) if (/^\.old-[0-9a-f]{32}$/.test(n)) fs.rmSync(path.join(service, n), { recursive: true, force: true }); } catch {}
 }
 /**
  * Updates the installed service files in place (after KeaS was updated, or its settings changed), only if the service
@@ -585,6 +783,7 @@ async function refreshService({ config, exe, hubSource, version, opts, port, use
     if (aclProblems(await report(service), sid, { writeOnly: true, owners: [SID.ADMINS, SID.SYSTEM] }).length) return 'repair';
   }
   writeServiceFiles(service, { config, exe, hubSource, version, opts, port, userId, files: planFiles({ service }) });
+  cleanOldCopies(service);
   return 'updated';
 }
 
@@ -597,18 +796,23 @@ const currentUser = () => `${process.env.USERDOMAIN || os.hostname()}\\${process
 async function runElevated(script, { dir, name, settings, dryRun = false }) {
   const scriptFile = path.join(dir, `${name}.ps1`);
   const settingsFile = path.join(dir, `${name}.json`);
-  const resultFile = path.join(dir, `${name}.result.json`);
-  const json = JSON.stringify(settings, null, 1);
-  if (dryRun) return { dryRun: true, script: `${script}\n# ${name}.json (the names this script uses):\n${json.split('\n').map((l) => `# ${l}`).join('\n')}\n`, settings, scriptFile };
+  // A result file name only this run knows (the elevated script won't write through a link, or over a file).
+  const resultFile = path.join(dir, `${name}.result-${crypto.randomBytes(12).toString('hex')}.json`);
+  const full = { ...settings, resultFile };
+  const json = JSON.stringify(full, null, 1);
+  if (dryRun) return { dryRun: true, script: `${script}\n# ${name}.json (the names this script uses, base64 inside it):\n${json.split('\n').map((l) => `# ${l}`).join('\n')}\n`, settings: full, scriptFile };
   fs.mkdirSync(dir, { recursive: true });
-  fs.rmSync(resultFile, { force: true });
-  // UTF-8 with a byte-order mark, so Windows PowerShell 5.1 reads non-English folder names right.
-  fs.writeFileSync(scriptFile, '\ufeff' + script);
+  for (const n of fs.readdirSync(dir)) if (n.startsWith(`${name}.result`)) fs.rmSync(path.join(dir, n), { force: true });
+  // UTF-8 with a byte-order mark, so Windows PowerShell 5.1 reads non-English folder names right. The elevated side
+  // runs it only if it still has this hash (elevateBootstrap); the .json copy is for people to read.
+  const bytes = Buffer.from('\ufeff' + composeScript(script, full), 'utf8');
+  fs.writeFileSync(scriptFile, bytes);
   fs.writeFileSync(settingsFile, json);
-  const r = await run(powershell(), elevateArgs(), { timeout: 5 * 60_000, env: { KEAS_ELEVATE_SCRIPT: scriptFile } });
+  const r = await run(powershell(), elevateArgs(), { timeout: 5 * 60_000, env: { KEAS_ELEVATE_CMD: encodedCommand(elevateBootstrap(scriptFile, sha256Hex(bytes))) } });
   let result = null;
   try { result = JSON.parse(fs.readFileSync(resultFile, 'utf8').replace(/^\ufeff/, '')); } catch {}
   if (!result) {
+    if (r.code === 97) throw new Error('The script KeaS wrote was changed before Windows ran it, so nothing was done. Something else on this PC may be tampering with KeaS’s files; run a malware scan, then try again.');
     if (/cancel/i.test(r.err + r.out)) throw new Error('Windows asked for permission and it was declined. Nothing was changed.');
     throw new Error(`The change didn’t run (${(r.err || r.out || `code ${r.code}`).trim().slice(0, 300)}).`);
   }
@@ -630,8 +834,9 @@ async function install({ config, exe, hubSource, version, opts, port = 4860, pre
   const before = previous || (await readPower());
   const power = powerPlan(o, before, powerWasApplied);
   const script = installScript({ power, scheme: before.scheme || 'SCHEME_CURRENT', bootStart: o.bootStart, removeTask: wasInstalled, stop: stopHub });
-  const settings = scriptSettings({ config, files, ownerSid: sid });
+  const settings = scriptSettings({ config, files, ownerSid: sid, manifest: files.manifest || [] });
   const r = await runElevated(script, { dir: stageDir, name: 'install', settings, dryRun });
+  if (!dryRun) cleanOldCopies(service);
   return { ...r, previous: before, files, options: o, power, layout: LAYOUT };
 }
 async function uninstall({ config, previous = null, stopHub = false, removeTask = true, dryRun = false, stageDir, service = serviceDir() }) {
@@ -657,7 +862,8 @@ module.exports = {
   TASK_NAME, DEFAULTS, POWER, POWER_LOSS_NOTE, SID, LAYOUT, SECRET_FILES, CLEARED_PREFIXES, CLEARED_VARS,
   options, hubEnv, launcherCmd, taskXml, powerTargets, powerPlan, parsePowerQuery, installScript, uninstallScript, scriptSettings, elevateArgs, parseTaskQuery,
   readPower, taskStatus, prepareFiles, refreshService, planFiles, serviceDir, install, uninstall, hubAnswering, currentUser, currentUserSid, parseWhoami, copyHub, cmdSetValue, psq,
-  validateDataDir, checkUserSid, dataAclArgs, aclProblems, aclReport, secureDataFolder,
+  validateDataDir, checkUserSid, dataAclArgs, aclProblems, aclReport, secureDataFolder, walkFolder, ownersOf, rotateHubSecrets, folderInside,
+  composeScript, elevateBootstrap, encodedCommand, writeServiceFiles, cleanOldCopies,
   // For tests: the pieces the scripts are made of.
-  scriptParts: { head: SCRIPT_HEAD, tail: SCRIPT_TAIL, serviceLines, dataAclLines, legacyLines },
+  scriptParts: { head: SCRIPT_HEAD, tail: SCRIPT_TAIL, serviceLines, serviceOwnerLines, dataAclLines, legacyLines },
 };

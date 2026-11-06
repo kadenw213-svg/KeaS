@@ -198,13 +198,22 @@ test('H1: once pinned, a different Hub key is refused (even at the right address
     assert.equal(r.status, 401);
     assert.equal(r.body.hubKeyChanged, true);
     assert.equal((await call('GET', '/v1/vault/status')).body.locked, true);
-    // The owner accepts the new key in the KeaS app (not over HTTP).
-    await app.repinHub();
+    // M: the owner is shown the new key's fingerprint (next to the trusted one, with why it may have changed) and
+    // must confirm that exact fingerprint in the KeaS app (not over HTTP).
+    const st = await app.hubKeyStatus();
+    assert.equal(st.changed, true);
+    assert.match(st.current.fingerprint, /^([0-9A-F]{4} ){15}[0-9A-F]{4}$/);
+    assert.notEqual(st.current.fingerprint, st.pinned.fingerprint);
+    assert.ok(st.reasons.length >= 2 && /pretending/.test(st.warning));
+    await assert.rejects(app.repinHub(), /fingerprint/, 'not without a confirmed fingerprint');
+    await assert.rejects(app.repinHub({ fingerprint: st.pinned.fingerprint }), /different key/, 'not a fingerprint other than the one offered');
+    assert.equal((await signin()).status, 401, 'still refused');
+    await app.repinHub({ fingerprint: st.current.fingerprint });
     const ok = await signin();
     assert.equal(ok.status, 200, JSON.stringify(ok.body));
     await call('POST', '/v1/vault/lock', ok.body.token);
-    await app.repinHub();
-  } finally { hubKey = key; await app.repinHub(); }
+    assert.equal((await app.hubKeyStatus()).changed, false);
+  } finally { hubKey = key; await app.repinHub({ fingerprint: (await app.hubKeyStatus()).current.fingerprint }); }
   token = (await signin()).body.token;
 });
 
