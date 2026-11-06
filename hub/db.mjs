@@ -175,6 +175,9 @@ const COLUMNS = [
   ['course_members', 'target', 'TEXT'],
   // Material from a finished job already copied into each person's storage (so a retry never copies twice).
   ['scan_jobs', 'delivered', 'INTEGER NOT NULL DEFAULT 0'],
+  // How the person shows on leaderboards unless a class says otherwise: 'name', 'nickname' or 'hidden'.
+  ['accounts', 'board_default', "TEXT NOT NULL DEFAULT 'name'"],
+  ['accounts', 'nickname', 'TEXT'],
 ];
 
 export function openDb(file) {

@@ -286,6 +286,7 @@ export function createHub({
     emailVerified: !!a.email_verified, verifiedBy: a.verified_by, identityVerified: !!a.identity_verified,
     canHost: !!a.can_host || a.role === 'owner', totpEnabled: !!a.totp_enabled, owner: a.role === 'owner', createdAt: a.created_at,
     birthYear: a.birth_year ?? null, ...consentOf(a),
+    leaderboard: { show: a.board_default || 'name', nickname: a.nickname ?? null },
   });
   // ---------- parent or guardian sign-off (members under 18, before the shared Claude) ----------
   const thisYear = () => new Date(now()).getUTCFullYear();
@@ -597,6 +598,18 @@ export function createHub({
     return { status: approve ? 'approved' : 'declined' };
   }, { auth: false });
 
+  // How the person shows on leaderboards: their name, a nickname, or hidden. It's the default for classes they join
+  // later, and (unless everyClass is false) it replaces each class's own choice too.
+  R('POST', '/v1/me/leaderboard', ({ me, body }) => {
+    const show = V.enum(body.show, 'Leaderboard name', ['name', 'nickname', 'hidden']);
+    const nickname = 'nickname' in body ? V.str(body.nickname, 'Nickname', { optional: true, max: 30 }) : me.nickname ?? null;
+    if (show === 'nickname' && !nickname) bad('Pick a nickname first.');
+    h.tx(() => {
+      h.run('UPDATE accounts SET board_default = ?, nickname = ?, updated_at = ? WHERE id = ?', show, nickname, now(), me.id);
+      if (body.everyClass !== false) h.run('UPDATE class_members SET board = ?, nickname = ? WHERE account_id = ?', show, nickname, me.id);
+    });
+    return { account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', me.id)) };
+  });
   R('POST', '/v1/me/password', async ({ me, body, token, ip }) => {
     if (!(await verifyPassword(body.current ?? '', me.pw_hash))) { fails.fail(nameHash(me.email)); throw new HttpError(401, 'Your current password is wrong.'); }
     const problem = passwordProblem(body.next, { email: me.email, name: me.display_name });
@@ -707,6 +720,17 @@ export function createHub({
     h.run('UPDATE invites SET revoked = 1 WHERE code = ?', inv.code);
     return { ok: true };
   });
+  // What a code would join, so Kea can ask "Join BIOL 1010?" first. Same answer for a bad code as /v1/join gives.
+  R('GET', '/v1/invites/:code', ({ me, params, ip }) => {
+    limit('join', ip); limit('join', me.id);
+    const code = normCode(params.code);
+    const inv = code.length === 10 ? h.get('SELECT * FROM invites WHERE code = ?', code) : null;
+    const usable = inv && !inv.revoked && (inv.expires_at == null || inv.expires_at > now()) && (inv.max_uses == null || inv.uses < inv.max_uses);
+    const c = usable ? loadClass(inv.class_id) : null;
+    if (!c || c.status !== 'active') notFound("That code doesn't work. Check it, or ask for a new one.");
+    const out = classOut(c, membership(c.id, me.id));
+    return { class: { id: out.id, title: out.title, description: out.description, members: out.members, instructors: out.instructors }, role: inv.role, alreadyMember: !!out.role };
+  });
   R('POST', '/v1/join', ({ me, body, ip }) => {
     limit('join', ip); limit('join', me.id);
     const code = normCode(body.code);
@@ -718,8 +742,11 @@ export function createHub({
     const existing = membership(c.id, me.id);
     if (!existing) {
       h.tx(() => {
-        h.run('INSERT INTO class_members (class_id,account_id,role,board,nickname,joined_at) VALUES (?,?,?,?,?,?)', c.id, me.id, inv.role,
-          V.enum(body.board ?? 'name', 'Leaderboard name', ['name', 'nickname', 'hidden']), V.str(body.nickname, 'Nickname', { optional: true, max: 30 }), now());
+        // (No choice given: the account's own leaderboard setting.)
+        const nick = 'nickname' in body ? V.str(body.nickname, 'Nickname', { optional: true, max: 30 }) : me.nickname ?? null;
+        let board = V.enum(body.board ?? me.board_default ?? 'name', 'Leaderboard name', ['name', 'nickname', 'hidden']);
+        if (board === 'nickname' && !nick) board = 'name';
+        h.run('INSERT INTO class_members (class_id,account_id,role,board,nickname,joined_at) VALUES (?,?,?,?,?,?)', c.id, me.id, inv.role, board, nick, now());
         h.run('UPDATE invites SET uses = uses + 1 WHERE code = ?', code);
       });
       audit(me.id, 'class.join', c.id, { role: inv.role }, ip);
@@ -1430,6 +1457,8 @@ export function createHub({
     if (url.pathname === '/terms' && req.method === 'GET') return serveTermsPage(url, res);
     // The page a parent opens from a member's sign-off link.
     if (url.pathname === '/consent' && req.method === 'GET') return serveConsentPage(url, res);
+    const joinLink = /^\/join\/([A-Za-z0-9-]{1,40})$/.exec(url.pathname);
+    if (joinLink && req.method === 'GET') return serveJoinPage(joinLink[1], res);
     try {
       const fileMatch = /^\/v1\/files\/(.+)$/.exec(url.pathname);
       const fileRoute = fileMatch && ['GET', 'PUT', 'DELETE'].includes(req.method);
@@ -1487,6 +1516,24 @@ export function createHub({
     if (status === 429 && payload?.retryAfter) res.setHeader('retry-after', String(payload.retryAfter));
     send(res, status, payload, cookies);
     if (log) console.log(`${new Date().toISOString()} ${req.method} ${url.pathname} ${status} ${Date.now() - t0}ms`);
+  }
+
+  // An invite link (https://<hub>/join/<code>) opened in a browser: how to use it in Kea. It doesn't look the code up,
+  // so the page says nothing about the class to someone who only has the link.
+  function serveJoinPage(code, res) {
+    const c = normCode(code).slice(0, 10);
+    const html = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Join a class in Kea</title>
+<style>:root{color-scheme:light dark;--bg:#f7f7f8;--fg:#1f1f1f;--muted:#5f6368;--card:#fff;--line:#dadce0}@media (prefers-color-scheme:dark){:root{--bg:#131314;--fg:#e3e3e3;--muted:#9aa0a6;--card:#1e1f20;--line:#3c4043}}
+body{margin:0;font-family:"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--fg);display:grid;place-items:center;min-height:100vh;padding:16px;box-sizing:border-box}
+main{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:28px;max-width:420px}h1{font-size:20px;font-weight:600;margin:0 0 8px}p{color:var(--muted);line-height:1.5}
+.code{font:600 26px/1.2 ui-monospace,Consolas,monospace;letter-spacing:3px;padding:12px 16px;border:1px dashed var(--line);border-radius:10px;text-align:center;color:var(--fg);user-select:all}</style>
+<main><h1>Join a class in Kea</h1><p>Open Kea, go to School, choose <strong>Join a class</strong>, and paste this link or type the code:</p>
+<div class="code">${c || '—'}</div><p>New to Kea? Download it, sign in to your Kea account, then use the code.</p></main></html>`;
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer',
+      'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+    });
+    res.end(html);
   }
 
   function serveTermsPage(url, res) {
