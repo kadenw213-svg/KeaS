@@ -14,7 +14,7 @@
         "nonSchoolDayMaxHours": 8, "nonSchoolWeekMaxHours": 40,
         "earliest": null, "latest": null, "latestSummer": null,
         "restrictedPositions": [],
-        "note": "verify: Colorado Youth Employment Opportunity Act limits (8 h/day, 40 h/week for minors) entered from memory; school-day limits may be stricter."
+        "note": "Not yet verified: Colorado Youth Employment Opportunity Act limits (8 h/day, 40 h/week for minors); school-day limits may be stricter."
       }
     ]
   },
@@ -25,16 +25,16 @@
   },
   "sickLeave": { "accrueHoursPer": 30, "cap": 48, "note": "HFWA: 1 hour paid sick leave per 30 hours worked, up to 48 hours per year." },
   "finalPay": {
-    "involuntary": { "rule": "immediate", "note": "C.R.S. 8-4-109: wages are due immediately when the employer ends the employment (with short extensions when the accounting unit is closed or offsite). Entered from memory, not verified." },
-    "voluntary": { "rule": "next_payday", "note": "C.R.S. 8-4-109: when the employee quits, wages are due by the next regular payday. Entered from memory, not verified." }
+    "involuntary": { "rule": "immediate", "note": "C.R.S. 8-4-109: wages are due immediately when the employer ends the employment (with short extensions when the accounting unit is closed or offsite). Not yet verified against the official source." },
+    "voluntary": { "rule": "next_payday", "note": "C.R.S. 8-4-109: when the employee quits, wages are due by the next regular payday. Not yet verified against the official source." }
   },
-  "ptoPayout": { "required": true, "kinds": ["vacation", "pto"], "note": "Colorado: earned, unused vacation is wages and is paid at separation (Nieto v. Clark's Market, 2021); paid sick leave under HFWA is not. Entered from memory, not verified." },
+  "ptoPayout": { "required": true, "kinds": ["vacation", "pto"], "note": "Colorado: earned, unused vacation is wages and is paid at separation (Nieto v. Clark's Market, 2021); paid sick leave under HFWA is not. Not yet verified against the official source." },
   "leave": [
-    { "law": "CO FAMLI", "weeks": 12, "eligibility": { "hoursWorked": null }, "note": "Colorado FAMLI: up to 12 weeks of paid family and medical leave (more in some pregnancy cases), paid by the state program; job protection after 180 days of employment. Entered from memory, not verified." },
+    { "law": "CO FAMLI", "weeks": 12, "eligibility": { "hoursWorked": null }, "note": "Colorado FAMLI: up to 12 weeks of paid family and medical leave (more in some pregnancy cases), paid by the state program; job protection after 180 days of employment. Not yet verified against the official source." },
     { "law": "CO HFWA", "weeks": null, "note": "Healthy Families and Workplaces Act paid sick leave; tracked as a time-off policy, protected (never counts against attendance)." }
   ],
   "newHire": { "reportDays": 20 },
-  "notes": ["Defaults entered 2026-10-27, not yet verified against current Colorado rules. Do not rely on them.", "Final pay, payout, leave and new-hire entries added 2026-11-05 from memory; not verified."],
+  "notes": ["Not yet verified against current Colorado rules.", "Final pay, payout, leave and new-hire entries not yet verified."],
   "source": [
     { "title": "Colorado COMPS Order #39 (7 CCR 1103-1)", "url": "https://cdle.colorado.gov/comps", "checked": "2026-10-27" },
     { "title": "Colorado minimum wage", "url": "https://cdle.colorado.gov/minimumwage", "checked": "2026-10-27" },

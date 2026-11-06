@@ -30,10 +30,10 @@
   "minimumWage": { "standard": 7.25, "tipped": 2.13, "youthDiscountPct": null, "localOverrides": [] },
   "sickLeave": null,
   "leave": [
-    { "law": "FMLA", "weeks": 12, "eligibility": { "monthsEmployed": 12, "hoursWorked": 1250, "employeesWithin75Miles": 50 }, "note": "Family and Medical Leave Act: up to 12 weeks of unpaid, job-protected leave in a 12-month period for covered employers (50+ employees). Entered from memory, not verified." }
+    { "law": "FMLA", "weeks": 12, "eligibility": { "monthsEmployed": 12, "hoursWorked": 1250, "employeesWithin75Miles": 50 }, "note": "Family and Medical Leave Act: up to 12 weeks of unpaid, job-protected leave in a 12-month period for covered employers (50+ employees). Not yet verified against the official source." }
   ],
-  "cobra": { "minEmployees": 20, "employerNoticeDays": 30, "administratorNoticeDays": 14, "note": "Federal COBRA: group health plans of employers with 20+ employees; the employer tells the plan administrator within 30 days of the qualifying event, and the administrator sends the election notice within 14 days. Many states have their own continuation laws for smaller employers. Entered from memory, not verified." },
-  "aca": { "fullTimeMonthlyHours": 130, "note": "ACA: 130 hours in a month counts as full-time for the monthly measurement method. Entered from memory, not verified." },
+  "cobra": { "minEmployees": 20, "employerNoticeDays": 30, "administratorNoticeDays": 14, "note": "Federal COBRA: group health plans of employers with 20+ employees; the employer tells the plan administrator within 30 days of the qualifying event, and the administrator sends the election notice within 14 days. Many states have their own continuation laws for smaller employers. Not yet verified against the official source." },
+  "aca": { "fullTimeMonthlyHours": 130, "note": "ACA: 130 hours in a month counts as full-time for the monthly measurement method. Not yet verified against the official source." },
   "newHire": { "reportDays": 20 },
   "retention": [
     { "category": "i9", "yearsAfterCreated": 3, "yearsAfterTermination": 1, "note": "Form I-9: 3 years after hire or 1 year after employment ends, whichever is later." },
