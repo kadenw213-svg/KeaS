@@ -25,7 +25,7 @@ import { clientAddress, ipBucket, isLoopback } from './lib/clientip.mjs';
 import { scoreAnswer, capped, levelOf, weekStart, dayKey, streak } from './lib/study.mjs';
 import { mountOrgs } from './org/routes.mjs';
 
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 const HOST = '127.0.0.1';
 const MAX_BODY = 2 * 1024 * 1024;
 const SESSION_DAYS = 30;
