@@ -641,14 +641,19 @@ async function uninstall({ config, previous = null, stopHub = false, removeTask 
   return runElevated(script, { dir: stageDir, name: 'uninstall', settings, dryRun });
 }
 
-/** Is a Kea Hub already answering on this port (started before sign-in by the task)? */
-async function hubAnswering(port, { timeoutMs = 1500, fetchFn = fetch } = {}) {
+/**
+ * Is OUR Kea Hub already answering on this port (started before sign-in by the task)? Answering as a Kea Hub isn't
+ * enough: it must also prove it holds the signing key in `dataDir` (desktop/hubid.cjs), so a program another Windows
+ * account started on the port is never taken for it.
+ */
+async function hubAnswering(port, { dataDir = null, timeoutMs = 1500, fetchFn = fetch } = {}) {
   try {
     const r = await fetchFn(`http://127.0.0.1:${port}/v1/health`, { signal: AbortSignal.timeout(timeoutMs) });
     if (!r.ok) return false;
     const j = await r.json();
-    return j?.service === 'kea-hub';
+    if (j?.service !== 'kea-hub') return false;
   } catch { return false; }
+  return require('./hubid.cjs').verifyHubIdentity(port, dataDir, { timeoutMs: Math.max(timeoutMs, 1500), fetchFn });
 }
 
 const POWER_LOSS_NOTE = 'To have this PC turn itself back on after a power cut, turn on "Restore on AC power loss" (some PCs call it "AC Power Recovery" or "After Power Failure: Power On") in its BIOS/UEFI settings. Windows can’t change that setting: restart the PC, press the key it shows for Setup (often Del, F2 or F10), and look under Power or Advanced. With that on, the Kea Hub comes back by itself, before anyone signs in.';

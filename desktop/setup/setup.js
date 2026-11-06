@@ -326,7 +326,11 @@ function status() {
     h('h1', null, c.role === 'hub' ? 'Kea Hub' : 'KeaS server'),
     h('div', { class: 'panel' },
       h('p', null, h('span', { class: `dot ${S.running ? 'ok' : 'bad'}`, style: 'display:inline-block;vertical-align:-4px;margin-right:8px' }), S.running ? 'Running' : 'Not running'),
-      c.publicUrl ? h('p', null, 'Public address: ', h('span', { class: 'url' }, c.publicUrl)) : h('p', { class: 'muted' }, 'Only reachable on this computer.'),
+      c.publicUrl ? h('p', null, 'Public address: ', h('span', { class: 'url' }, c.publicUrl), ' ',
+        h('button', { class: 'btn', disabled: S.busy, onclick: async () => {
+          if (!confirm('Turn off public access? Nobody outside this computer can reach the server until you turn Funnel on again in setup.')) return;
+          try { S.busy = true; render(); await call(k.tsFunnelOff); await load(); } catch (e) { fail(e); } finally { S.busy = false; render(); }
+        } }, 'Turn off public access')) : h('p', { class: 'muted' }, 'Only reachable on this computer.'),
       h('p', null, 'Data: ', h('span', { class: 'url' }, c.dataDir), ' ', h('button', { class: 'btn', onclick: () => k.openFolder({ dir: c.dataDir }) }, 'Open folder')),
       c.role === 'hub' && h('p', { class: 'muted small' }, `Each account gets ${c.quotaGb || 5} GB of Kea storage. Owner: ${c.ownerEmail || 'not set'}.`)),
     c.role === 'hub' && h('div', { class: 'panel' },

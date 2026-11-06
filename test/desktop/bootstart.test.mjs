@@ -402,16 +402,60 @@ test('dry run returns the script and its settings, and changes nothing', async (
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('hubAnswering: only a Kea Hub on the port counts', async () => {
-  const srv = http.createServer((req, res) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(req.url === '/v1/health' ? { ok: true, service: 'kea-hub' } : {})); });
-  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
-  const port = srv.address().port;
-  assert.equal(await b.hubAnswering(port), true);
-  srv.close();
-  await new Promise((r) => srv.once('close', r));
-  assert.equal(await b.hubAnswering(port, { timeoutMs: 500 }), false);
+test('hubAnswering: only OUR Kea Hub counts: it must prove it holds the signing key in the data folder', async () => {
+  const { generateKeyPairSync, sign } = await import('node:crypto');
+  const dataDir = mkdtempSync(join(tmpdir(), 'keas-hubid-'));
+  const real = generateKeyPairSync('ed25519').privateKey;
+  writeFileSync(join(dataDir, 'hub-signing-key.pem'), real.export({ type: 'pkcs8', format: 'pem' }));
+  // A Kea Hub look-alike that signs identity nonces with `key`.
+  const hubLike = (key) => http.createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    const u = new URL(req.url, 'http://x');
+    if (u.pathname === '/v1/health') return res.end(JSON.stringify({ ok: true, service: 'kea-hub' }));
+    if (u.pathname === '/v1/identity') return res.end(JSON.stringify({ sig: sign(null, Buffer.from(`kea-hub-identity:v1:${u.searchParams.get('nonce')}`), key).toString('base64url') }));
+    res.end('{}');
+  });
+  const listen = async (srv) => { await new Promise((r) => srv.listen(0, '127.0.0.1', r)); return srv.address().port; };
+  const ours = hubLike(real);
+  const port = await listen(ours);
+  assert.equal(await b.hubAnswering(port, { dataDir }), true);
+  assert.equal(await b.hubAnswering(port), false, 'nothing to check it against: not trusted');
+  ours.close();
+  await new Promise((r) => ours.once('close', r));
+  assert.equal(await b.hubAnswering(port, { dataDir, timeoutMs: 500 }), false);
+  // Another program on the port, answering like a Hub but with its own key (another Windows account's squatter).
+  const squatter = hubLike(generateKeyPairSync('ed25519').privateKey);
+  assert.equal(await b.hubAnswering(await listen(squatter), { dataDir }), false);
+  squatter.close();
   const other = http.createServer((_q, res) => res.end('{"service":"other"}'));
-  await new Promise((r) => other.listen(0, '127.0.0.1', r));
-  assert.equal(await b.hubAnswering(other.address().port), false);
+  assert.equal(await b.hubAnswering(await listen(other), { dataDir }), false);
   other.close();
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('a real Kea Hub proves its identity to KeaS (desktop/hubid.cjs against hub/index.mjs)', async () => {
+  const { createHub } = await import('../../hub/index.mjs');
+  const { verifyHubIdentity } = require('../../desktop/hubid.cjs');
+  const dataDir = mkdtempSync(join(tmpdir(), 'keas-hubid-real-'));
+  const hub = createHub({ dataDir, log: false });
+  const p = await hub.listen({ port: 0, ownerPort: 0 });
+  try {
+    assert.equal(await verifyHubIdentity(p.port, dataDir), true);
+    const elsewhere = mkdtempSync(join(tmpdir(), 'keas-hubid-other-'));
+    const { generateKeyPairSync } = await import('node:crypto');
+    writeFileSync(join(elsewhere, 'hub-signing-key.pem'), generateKeyPairSync('ed25519').privateKey.export({ type: 'pkcs8', format: 'pem' }));
+    assert.equal(await verifyHubIdentity(p.port, elsewhere), false, 'a Hub with another key is not this data folder’s Hub');
+    rmSync(elsewhere, { recursive: true, force: true });
+    assert.equal((await fetch(`http://127.0.0.1:${p.port}/v1/identity?nonce=xyz`)).status, 400);
+  } finally { await hub.close(); rmSync(dataDir, { recursive: true, force: true }); }
+});
+
+test('tailscale: up keeps running unattended on Windows; Funnel off removes only KeaS’s handler', async () => {
+  const ts = require('../../desktop/tailscale.cjs');
+  assert.ok(ts.upArgs(60_000, 'win32').includes('--unattended'));
+  assert.ok(!ts.upArgs(60_000, 'linux').includes('--unattended'));
+  const mine = { AllowFunnel: { 'pc.tail.ts.net:443': true }, Web: { 'pc.tail.ts.net:443': { Handlers: { '/': { Proxy: 'http://127.0.0.1:4860' } } } } };
+  assert.equal(ts.servesPort(mine, 4860), true);
+  assert.equal(ts.servesPort(mine, 4850), false, 'someone else’s Funnel is left alone');
+  assert.equal(ts.servesPort({ Web: mine.Web }, 4860), false, 'served on the tailnet only is not a Funnel');
 });

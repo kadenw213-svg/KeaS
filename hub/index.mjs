@@ -1787,7 +1787,16 @@ export function createHub({
   // (kea/Documents/).
   const PROFILE_DIR = /^kea\/Kea\/[^/]+\/$/;
   function jobScope(j) {
-    const t = PROFILE_DIR.test(j.target || '') ? j.target : guessTarget(j.account_id);
+    let t = PROFILE_DIR.test(j.target || '') ? j.target : guessTarget(j.account_id);
+    // (Else the profile their Kea named in the job.json it uploaded for this job.)
+    if (!t || !PROFILE_DIR.test(t)) {
+      try {
+        const sp = spaces.user(j.account_id);
+        const row = spaceRow(sp, `scan-inbox/${j.id}/job.json`);
+        const profile = row && row.size < 64 * 1024 ? JSON.parse(spaceRead(sp, row).toString('utf8')).profile : null;
+        if (typeof profile === 'string') t = `${checkPath(`kea/Kea/${profile}`)}/`;
+      } catch {}
+    }
     if (!t || !PROFILE_DIR.test(t)) forbidden('This job has no Kea profile folder to work in.');
     return t;
   }
