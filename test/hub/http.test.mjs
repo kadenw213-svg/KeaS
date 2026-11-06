@@ -225,6 +225,9 @@ test('signed token for other services', async () => {
   const r = await call('POST', '/v1/auth/token', t, { aud: 'org:pool' });
   const p = verifyToken(hub.key.publicKey, r.body.token, { aud: 'org:pool', nowMs: clock });
   assert.deepEqual([p.email, p.name, p.owner], ['tok@example.com', 'Tok', false]);
+  // Only known audiences: a signed-in account can't mint a token named for anything else.
+  assert.equal((await call('POST', '/v1/auth/token', t, { aud: 'keas-payroll' })).status, 200);
+  for (const aud of ['keas-payroll-admin', 'anything', 'org:', 'org:a/b', 'https://evil.example']) assert.equal((await call('POST', '/v1/auth/token', t, { aud })).status, 400, aud);
 });
 
 test('owner console: needs the key, and only exists on its own port', async () => {

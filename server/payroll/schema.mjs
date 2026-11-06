@@ -209,8 +209,34 @@ export function migratePayroll(db) {
   }
 }
 
-/** Every sealed column, so changing the passphrase can re-encrypt all of them. [table, key column, sealed column] */
-export const SEALED_COLUMNS = [
+/**
+ * Values sealed as they're written: pay amounts, birthdates and personal emails. A trigger seals each one on insert or
+ * update (keas_seal, with the vault's key), and the database layer opens them as they're read, so the code using them
+ * sees plain numbers and text. Nothing filters or sums these in SQL. [table, columns]
+ */
+export const SEALED_VALUES = [
+  ['people', ['pay_rate_cents', 'birthdate', 'email', 'ytd_wages_cents']],
+  ['pay_rates', ['rate_cents']],
+  ['raises', ['old_rate_cents', 'new_rate_cents', 'retro_cents']],
+  ['offers', ['rate_cents']],
+  ['payrun_lines', ['gross', 'net', 'withheld', 'employer_total', 'detail']],
+];
+/** Column names whose sealed values are opened when read (a plain value in a same-named column is left alone). */
+export const SEALED_VALUE_NAMES = [...new Set(SEALED_VALUES.flatMap(([, cols]) => cols))];
+const notSealed = (v) => `${v} IS NOT NULL AND NOT (typeof(${v}) = 'text' AND substr(${v}, 1, 3) = 'v1.')`;
+/** The triggers that seal SEALED_VALUES as they're written. */
+export function sealTriggersSql() {
+  const out = [];
+  for (const [table, cols] of SEALED_VALUES) for (const col of cols) {
+    const body = `BEGIN UPDATE ${table} SET ${col} = keas_seal(NEW.${col}) WHERE rowid = NEW.rowid; END;`;
+    out.push(`CREATE TRIGGER IF NOT EXISTS seal_${table}_${col}_ins AFTER INSERT ON ${table} WHEN ${notSealed(`NEW.${col}`)} ${body}`);
+    out.push(`CREATE TRIGGER IF NOT EXISTS seal_${table}_${col}_upd AFTER UPDATE OF ${col} ON ${table} WHEN ${notSealed(`NEW.${col}`)} ${body}`);
+  }
+  return out.join('\n');
+}
+
+/** Columns the code seals itself (JSON or text blobs). [table, key column, sealed column] */
+export const SEALED_TEXT_COLUMNS = [
   ['people', 'id', 'deposit'],
   ['people', 'id', 'pii_enc'],
   ['orgs', 'id', 'bank'],
@@ -219,3 +245,5 @@ export const SEALED_COLUMNS = [
   ['i9_records', 'person_id', 'section2_enc'],
   ['documents', 'id', 'content_enc'],
 ];
+/** Every sealed column, so changing the passphrase can re-encrypt all of them. [table, key column, sealed column] */
+export const SEALED_COLUMNS = [...SEALED_TEXT_COLUMNS, ...SEALED_VALUES.flatMap(([table, cols]) => cols.map((col) => [table, 'rowid', col]))];

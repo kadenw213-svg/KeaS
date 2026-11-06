@@ -251,7 +251,8 @@ function bootForm() {
     box('bootStart', 'Start the Kea Hub when Windows starts, before anyone signs in', 'Recommended for the PC the Hub lives on.'),
     box('power', 'Keep this PC awake on AC power', 'So the Hub doesn’t go to sleep at night.'),
     h('details', { open: !!S.bootAdv, ontoggle: (e) => (S.bootAdv = e.target.open) }, h('summary', null, 'Advanced'),
-      h('p', { class: 'muted small' }, `The Hub runs as a Scheduled Task (${S.bs.taskName}) under your Windows account, with highest privileges, whether or not you’re signed in. It doesn’t store your Windows password, so it can’t reach network drives: keep the Hub’s data on a drive inside this PC.`),
+      h('p', { class: 'muted small' }, `The Hub runs as a Scheduled Task (${S.bs.taskName}) under your Windows account, with normal rights, whether or not you’re signed in. It doesn’t store your Windows password, so it can’t reach network drives: keep the Hub’s data on a drive inside this PC.`),
+      h('p', { class: 'muted small' }, `What the task runs is kept in ${S.bs.serviceDir}, which only Administrators and you can change. The Hub’s data folder can only be opened by you, Administrators and Windows itself.`),
       BOOT_ADV.map(([key, label, hint]) => box(key, label, hint, (key === 'runOnBattery' || key === 'restartOnFailure' ? !o.bootStart : !o.power))),
       BOOT_NUM.map(([key, label, min, max, hint]) => h('label', { class: 'field' }, label,
         h('input', { type: 'number', min: String(min), max: String(max), value: String(o[key]), disabled: !o.bootStart || S.busy, oninput: (e) => (o[key] = Number(e.target.value)) }),
@@ -291,6 +292,8 @@ function settings() {
   return [
     h('h1', null, 'Startup and power'),
     h('p', { class: 'muted' }, 'Start the Kea Hub before anyone signs in, and keep this PC awake for it. Saving asks Windows for permission once.'),
+    S.bs.needsUpdate && h('div', { class: 'err' }, 'Starting before sign-in needs to be set up again: it was set up by an earlier version of KeaS, or the permissions on its folder changed. Click Save to move it to a protected folder.'),
+    S.bs.folderProblem && h('div', { class: 'err' }, S.bs.folderProblem),
     ...bootForm(),
     S.error && h('div', { class: 'err' }, S.error),
     h('div', { class: 'actions' },
@@ -332,13 +335,32 @@ function status() {
         c.boot?.powerApplied ? ' This PC stays awake on AC power.' : '', S.hubExternal ? ' The Hub running now was started before sign-in.' : ''),
       h('button', { class: 'btn', onclick: () => { S.bs = null; S.bo = null; S.bootScript = null; S.bootResult = null; go('settings'); } }, 'Change…')),
     c.role === 'hub' && c.publicUrl && h('p', null, h('button', { class: 'btn', onclick: () => k.openExternal({ url: `${c.publicUrl}/terms` }) }, 'Open the terms page')),
+    c.role === 'hub' && c.boot?.installed && (c.boot.layout !== 2 || c.boot.repair) && h('div', { class: 'err' }, 'Starting the Hub before sign-in needs to be set up again, so what it runs is kept in a protected folder. ', h('button', { class: 'btn', onclick: () => { S.bs = null; S.bo = null; S.bootScript = null; S.bootResult = null; go('settings'); } }, 'Set it up again')),
+    S.folderProblem && h('div', { class: 'err' }, S.folderProblem),
     h('h2', { style: 'margin-top:22px' }, 'Payroll'),
     h('div', { class: 'panel' },
       h('p', null, 'Pay runs, tax forms and HR records for your organization. Payroll runs only on this computer: SSNs and bank details are encrypted with a passphrase you choose and never go to the Hub.'),
-      h('p', null, h('button', { class: 'btn primary', onclick: async () => { try { await call(k.openPayroll); } catch (e) { fail(e); } } }, 'Open Payroll'))),
+      h('p', null, h('button', { class: 'btn primary', onclick: async () => { try { await call(k.openPayroll); } catch (e) { fail(e); } } }, 'Open Payroll')),
+      payrollAdvanced()),
     S.error && h('div', { class: 'err' }, S.error),
     h('p', { class: 'muted small' }, 'Closing this window keeps the server running in the tray. Quit from the tray icon to stop it.'),
   ];
+}
+
+// Payroll settings only this app can change (the payroll page can't): the local password fallback, and accepting the
+// Kea Hub's signing key after the Hub was moved or reinstalled.
+function payrollAdvanced() {
+  return h('details', { open: !!S.payAdv, ontoggle: (e) => { S.payAdv = e.target.open; if (S.payAdv && !S.ps) call(k.payrollSettings).then((v) => { S.ps = v; render(); }).catch(fail); } }, h('summary', null, 'Advanced'),
+    !S.ps ? h('p', { class: 'muted small' }, 'Loading…') : [
+      h('p', { class: 'muted small' }, `Payroll admins sign in with their Kea Hub account at ${S.ps.hubUrl || '(no Kea Hub set)'}, plus the vault passphrase.`),
+      h('label', { class: 'check' },
+        h('input', { type: 'checkbox', checked: S.ps.localSignIn, onchange: async (e) => { try { S.ps = await call(k.payrollLocalSignIn, { on: e.target.checked }); render(); } catch (err) { fail(err); } } }),
+        h('span', null, 'Allow a local password while the Kea Hub can’t be reached',
+          h('span', { class: 'muted small' }, ' Each payroll admin can then set a long local password (16 or more characters) in Payroll. It only works while the Hub can’t be reached, still needs the vault passphrase, and skips the Hub’s two-step sign-in, so leave it off unless you need it. Off by default.'))),
+      h('p', { class: 'muted small' }, 'Payroll trusts the Kea Hub’s signing key from when it was set up. If you moved or reinstalled the Hub, sign-in is refused until you accept its new key here. Only do this for your own Hub.'),
+      h('p', null, h('button', { class: 'btn', onclick: async () => { try { const r = await call(k.payrollRepinHub); S.error = ''; S.repinned = `Accepted the Kea Hub’s key (${r.kids.join(', ')}).`; render(); } catch (err) { fail(err); } } }, 'Accept the Kea Hub’s current key')),
+      S.repinned && h('p', { class: 'small ok' }, S.repinned),
+    ]);
 }
 
 const VIEWS = { welcome, storage, reach, owner, boot, done, status, settings };
@@ -349,7 +371,7 @@ function render() {
 
 async function load() {
   const st = await call(k.state);
-  S.config = st.config; S.defaults = st.defaults;
+  S.config = st.config; S.defaults = st.defaults; S.folderProblem = st.folderProblem || null;
   S.running = st.running.hub || st.running.org;
   S.hubExternal = !!st.running.hubExternal;
   document.getElementById('theme').value = st.config.theme || 'system';

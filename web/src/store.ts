@@ -59,7 +59,7 @@ interface WorkState {
   status: null | 'ready' | 'offline' | 'signedOut';
   /** 'vault' = the payroll vault on the payroll admin's PC; 'org' = the workforce server. */
   mode: 'vault' | 'org' | null;
-  vault: { initialized: boolean; locked: boolean; hubUrl: string | null; org: string | null; localAccounts: boolean } | null;
+  vault: { initialized: boolean; locked: boolean; hubUrl: string | null; org: string | null; localAccounts: boolean; localSignIn?: boolean } | null;
   error: string | null;
   tick: number;
   set(p: Partial<WorkState>): void;

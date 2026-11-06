@@ -212,12 +212,11 @@ function VaultSetup() {
     { name: 'tz', label: 'Time zone', type: 'select', required: true, options: TIME_ZONES.map((z) => ({ value: z, label: z.split('/')[1].replace('_', ' ') })) },
     { name: 'name', label: 'Your name', required: true },
     { name: 'email', label: local ? 'Your email' : 'Your Kea Hub email', type: 'email', required: true },
-    { name: 'password', label: local ? 'A password for this vault (10+ characters)' : 'Your Kea Hub password', type: 'password', required: true },
+    { name: 'password', label: local ? 'A local password (16+ characters; a few unrelated words work well)' : 'Your Kea Hub password', type: 'password', required: true },
     ...(!local ? [{ name: 'code', label: 'Two-step code (if you use one)', placeholder: '123456' } as Field] : []),
     { name: 'passphrase', label: 'Vault passphrase (12+ characters)', type: 'password', required: true, help: 'Encrypts SSNs, bank details and documents. It can’t be recovered if it’s lost, so keep it somewhere safe.' },
     { name: 'passphrase2', label: 'Vault passphrase again', type: 'password', required: true },
-    { name: 'hubUrl', label: 'Kea Hub address', advanced: true, placeholder: 'https://…' },
-    ...(!local ? [{ name: 'localPassword', label: 'Local password for when the Hub can’t be reached (10+ characters)', type: 'password', advanced: true } as Field] : []),
+    ...(!local && vault?.localSignIn ? [{ name: 'localPassword', label: 'Local password for when the Hub can’t be reached (16+ characters)', type: 'password', advanced: true, help: 'Only works while the Kea Hub can’t be reached, and still needs the vault passphrase.' } as Field] : []),
     { name: 'payPeriodAnchor', label: 'First day of a pay period', type: 'date', advanced: true, help: 'Biweekly periods count from this day. Default: this week’s Sunday.' },
     { name: 'futaExempt', label: '501(c)(3): exempt from FUTA', type: 'checkbox', advanced: true },
     { name: 'sutaRate', label: 'State unemployment rate (for example 0.0305)', type: 'number', step: '0.0001', advanced: true }
@@ -226,14 +225,17 @@ function VaultSetup() {
     <>
       <h1>Set up payroll on this computer</h1>
       <p className="muted">Payroll keeps SSNs, bank details, tax forms and pay runs on this computer only, encrypted with a passphrase you choose. None of it goes to the Hub.</p>
-      <label className="pr-check">
-        <input type="checkbox" checked={local} onChange={(e) => setLocal(e.target.checked)} /> Use a local account instead of a Kea Hub account
-      </label>
+      <p className="muted small">Kea Hub: {vault?.hubUrl || 'not set'} (set in the KeaS app on this computer).</p>
+      {vault?.localSignIn && (
+        <label className="pr-check">
+          <input type="checkbox" checked={local} onChange={(e) => setLocal(e.target.checked)} /> Use a local account (only while the Kea Hub can’t be reached)
+        </label>
+      )}
       {err && <div className="work-banner warn">{err}</div>}
       <Form
         key={String(local)}
         fields={fields}
-        initial={{ tz: 'America/Denver', hubUrl: vault?.hubUrl || '' }}
+        initial={{ tz: 'America/Denver' }}
         submit="Set up payroll"
         onSubmit={async (v) => {
           setErr(null);
@@ -241,14 +243,13 @@ function VaultSetup() {
           try {
             await api('POST', '/v1/vault/setup', {
               passphrase: v.passphrase,
-              hubUrl: v.hubUrl || undefined,
               org: { name: v.orgName, state: String(v.state || '').toUpperCase(), tz: v.tz, payPeriodAnchor: v.payPeriodAnchor || undefined, futaExempt: !!v.futaExempt, sutaRate: v.sutaRate ?? undefined },
               admin: { name: v.name, email: v.email },
               signIn: local ? { mode: 'local', password: v.password } : { mode: 'hub', password: v.password, code: v.code || undefined, localPassword: v.localPassword || undefined }
             });
             useWork.getState().set({ status: null, error: null });
           } catch (e: any) {
-            setErr(e instanceof ApiError && e.status === 503 ? `${e.message} Check the Hub address under Advanced, or use a local account.` : e.message);
+            setErr(e instanceof ApiError && e.status === 503 ? `${e.message} Check that the Kea Hub is running.` : e.message);
           }
         }}
       />

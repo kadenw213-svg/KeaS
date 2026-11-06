@@ -108,7 +108,8 @@ export function registerRun(c) {
   /** YTD gross before this period: opening YTD (imported or entered) plus finalized runs this year. */
   function ytdFor(person, year, beforeStart) {
     const opening = person.ytdYear == null || person.ytdYear === year ? person.ytdWagesCents || 0 : 0;
-    const fin = h.get(`SELECT COALESCE(SUM(l.gross),0) AS g FROM payrun_lines l JOIN payruns r ON r.id = l.run_id WHERE l.person_id = ? AND r.status = 'finalized' AND substr(r.pay_date,1,4) = ? AND r.period_start < ?`, person.id, String(year), beforeStart).g;
+    // (Pay amounts are sealed in the database, so they're added up here rather than in SQL.)
+    const fin = h.all(`SELECT l.gross FROM payrun_lines l JOIN payruns r ON r.id = l.run_id WHERE l.person_id = ? AND r.status = 'finalized' AND substr(r.pay_date,1,4) = ? AND r.period_start < ?`, person.id, String(year), beforeStart).reduce((t, r) => t + (Number(r.gross) || 0), 0);
     return opening + fin;
   }
   c.ytdFor = ytdFor;

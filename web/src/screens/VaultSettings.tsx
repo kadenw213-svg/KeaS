@@ -10,7 +10,7 @@ export function VaultSettings() {
   const owner = can(me, 'owner');
   const settings = useLoad<any>('/v1/org/settings');
   const users = useLoad<any>(mode === 'vault' ? '/v1/vault/users' : null);
-  const [dlg, setDlg] = useState<null | 'pass' | 'local' | 'user' | 'hub'>(null);
+  const [dlg, setDlg] = useState<null | 'pass' | 'local' | 'user'>(null);
   return (
     <Page title={mode === 'vault' ? 'Vault and settings' : 'Payroll settings'}>
       {mode === 'vault' && (
@@ -21,12 +21,9 @@ export function VaultSettings() {
             <button className="btn" onClick={() => setDlg('pass')}>
               <Lock size={15} /> Change the passphrase
             </button>
-            <button className="btn" onClick={() => setDlg('local')}>
-              Local password (for when the Hub is down)
-            </button>
-            {owner && (
-              <button className="btn" onClick={() => setDlg('hub')}>
-                Kea Hub address
+            {users.data?.localSignIn && (
+              <button className="btn" onClick={() => setDlg('local')}>
+                Local password (for when the Hub can’t be reached)
               </button>
             )}
           </div>
@@ -35,7 +32,9 @@ export function VaultSettings() {
             <Loading error={users.error} />
           ) : (
             <>
-              <p className="muted small">Kea Hub: {users.data.hubUrl || 'not set'}</p>
+              <p className="muted small">
+                Kea Hub: {users.data.hubUrl || 'not set'}. The Hub, its signing key and whether local passwords may be used are set in the KeaS app on this computer.
+              </p>
               <Table
                 cols={[
                   { key: 'name', label: 'Person' },
@@ -131,17 +130,8 @@ export function VaultSettings() {
         <FormDialog
           title="Local password"
           onClose={() => setDlg(null)}
-          fields={[{ name: 'password', label: 'Password for signing in when the Hub can’t be reached (10+ characters)', type: 'password', required: true }]}
+          fields={[{ name: 'password', label: 'Password for signing in when the Hub can’t be reached (16+ characters)', type: 'password', required: true, help: 'Only works while the Kea Hub can’t be reached, and still needs the vault passphrase.' }]}
           onSubmit={async (v) => (await act(api('POST', '/v1/vault/local-password', v), 'Saved.')) && (setDlg(null), users.reload())}
-        />
-      )}
-      {dlg === 'hub' && (
-        <FormDialog
-          title="Kea Hub address"
-          onClose={() => setDlg(null)}
-          initial={{ hubUrl: users.data?.hubUrl || '' }}
-          fields={[{ name: 'hubUrl', label: 'Address', placeholder: 'https://…' }]}
-          onSubmit={async (v) => (await act(api('POST', '/v1/vault/hub-url', { hubUrl: v.hubUrl || '' }), 'Saved.')) && (setDlg(null), users.reload())}
         />
       )}
       {dlg === 'user' && (
