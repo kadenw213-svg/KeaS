@@ -20,6 +20,7 @@ import { newSecret, checkCode, otpauthUri } from './lib/totp.mjs';
 import { loadOrCreateKey, signToken } from './lib/tokens.mjs';
 import { Windows, failures } from './lib/limiter.mjs';
 import { scoreAnswer, capped, levelOf, weekStart, dayKey, streak } from './lib/study.mjs';
+import { mountOrgs } from './org/routes.mjs';
 
 export const VERSION = '0.1.0';
 const HOST = '127.0.0.1';
@@ -1435,6 +1436,8 @@ export function createHub({
     const sp = spaces.course(runningJob(params.id).course_key);
     return rawOut(spaceRead(sp, spaceRow(sp, String(query.path ?? '')) ?? notFound()));
   });
+  // Organizations (hub/org/): members and codes, structure, budgets, certs, availability, schedules, the to-do box.
+  mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, bad, forbidden, notFound, rawOut });
 
   // ================= request handling =================
   const clientIp = (req) => {
