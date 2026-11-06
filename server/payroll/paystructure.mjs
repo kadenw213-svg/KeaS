@@ -172,6 +172,10 @@ export function registerPayStructure(c) {
   route('POST', '/v1/people/:id/deposit', ({ me, org, params, body }) => {
     if (params.id !== me.id) need(me, 'payroll');
     const p = c.getPerson(params.id, org.id);
+    // Your own first account can be added (new hires do it while onboarding); changing it afterwards is for payroll
+    // (or the owner), so a stolen sign-in can't send someone's pay to another account.
+    const self = p.id === me.id;
+    if (self && depositAccounts(vault.openJson(p.depositRaw)).length) c.notSelf(me, p.id, 'your own direct deposit once it’s set');
     const list = Array.isArray(body.accounts) ? body.accounts : [body];
     if (list.length < 1 || list.length > 4) bad('1 to 4 accounts');
     const accounts = list.map((a, i) => {
@@ -184,7 +188,7 @@ export function registerPayStructure(c) {
     });
     if (!accounts.some((a) => a.remainder)) accounts[accounts.length - 1] = { ...accounts.at(-1), remainder: true, amountCents: undefined, pct: undefined };
     h.run('UPDATE people SET deposit = ? WHERE id = ?', vault.sealJson({ accounts }), p.id);
-    audit(org.id, me.id, 'deposit_set', p.id, { accounts: accounts.length });
+    audit(org.id, me.id, 'deposit_set', p.id, { accounts: accounts.length, ...(self ? { self: true } : {}) });
     c.markTask?.(p.id, 'deposit', me.id);
     return { profile: profile(c.getPerson(p.id, org.id), org) };
   });
@@ -196,19 +200,31 @@ export function registerPayStructure(c) {
     return { rates: h.all('SELECT * FROM pay_rates WHERE person_id = ? ORDER BY effective_from DESC', p.id).map(rowToRate), current: rateFor(h, p, null, today(org)) };
   });
   // A first rate for a person or position. Changing an existing rate is a raise (it goes through approvals).
+  // Only the owner adds a rate directly when it pays more than the person's current rate, or starts before today for
+  // someone already paid (that would mean retro pay): anyone else's goes through the raise approval instead.
   route('POST', '/v1/people/:id/rates', ({ me, org, params, body }) => {
     need(me, 'payroll');
     const p = c.getPerson(params.id, org.id);
+    const self = c.notSelf(me, p.id);
+    const isOwner = me.roles.includes('owner');
     const positionId = body.positionId ? V.id(body.positionId, 'positionId') : null;
     if (positionId && !h.get('SELECT 1 FROM positions WHERE id = ? AND org_id = ?', positionId, org.id)) bad('unknown positionId');
-    if (h.get('SELECT 1 FROM pay_rates WHERE person_id = ? AND position_id IS ?', p.id, positionId) && !me.roles.includes('owner')) throw new HttpError(409, 'this person already has that rate; change it with a raise');
+    if (h.get('SELECT 1 FROM pay_rates WHERE person_id = ? AND position_id IS ?', p.id, positionId) && !isOwner) throw new HttpError(409, 'this person already has that rate; change it with a raise');
     const kind = V.enum(body.kind ?? 'hourly', 'kind', ['hourly', 'salary']);
     const rateCents = money(body.rateCents, 'rateCents');
     const effectiveFrom = V.date(body.effectiveFrom ?? p.hireDate ?? today(org), 'effectiveFrom');
+    const cur = rateFor(h, p, positionId, today(org));
+    const paidBefore = !!h.get('SELECT 1 FROM payrun_lines WHERE person_id = ? LIMIT 1', p.id);
+    const higher = !!cur && rateCents > cur.cents;
+    const backdated = effectiveFrom < today(org) && (!!cur || paidBefore);
+    if (!isOwner && (higher || backdated)) {
+      const r = requestRaise({ org, me, p, positionId, effectiveDate: effectiveFrom, newRate: rateCents, kind, reason: V.str(body.label, 'label', { optional: true, max: 60 }) || (higher ? 'New rate above the current one' : 'Back-dated rate') });
+      return { status: 202, body: { ...r, needsApproval: true, message: `${higher ? 'This rate is above the current one' : 'This rate starts before today'}, so it goes through the raise approval.` } };
+    }
     const id = uid('rt');
     h.run('INSERT INTO pay_rates (id,person_id,position_id,kind,rate_cents,effective_from,label,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)', id, p.id, positionId, kind, rateCents, effectiveFrom, V.str(body.label, 'label', { optional: true, max: 60 }), me.id, iso(now()));
     if (!positionId && kind === 'hourly') h.run('UPDATE people SET pay_rate_cents = ? WHERE id = ?', rateCents, p.id);
-    audit(org.id, me.id, 'rate_add', p.id, { positionId, kind, rateCents, effectiveFrom });
+    audit(org.id, me.id, 'rate_add', p.id, { positionId, kind, rateCents, effectiveFrom, ...(self ? { self: true } : {}), ...(higher || backdated ? { ownerDirect: true } : {}) });
     return { status: 201, body: { rate: rowToRate(h.get('SELECT * FROM pay_rates WHERE id = ?', id)) } };
   });
 
@@ -272,6 +288,7 @@ export function registerPayStructure(c) {
   route('POST', '/v1/raises', ({ me, org, body }) => {
     need(me, 'manager', 'payroll');
     const p = c.getPerson(V.id(body.personId, 'personId'), org.id);
+    c.notSelf(me, p.id);
     const positionId = body.positionId ? V.id(body.positionId, 'positionId') : null;
     const effectiveDate = V.date(body.effectiveDate, 'effectiveDate');
     const cur = rateFor(h, p, positionId, effectiveDate);
@@ -280,6 +297,11 @@ export function registerPayStructure(c) {
     else if (body.percent != null) { if (!cur) bad('this person has no current rate to raise by a percent'); newRate = Math.round(cur.cents * (1 + Number(body.percent) / 100)); }
     else bad('give newRateCents or percent');
     const kind = cur?.kind ?? V.enum(body.kind ?? 'hourly', 'kind', ['hourly', 'salary']);
+    return { status: 201, body: requestRaise({ org, me, p, positionId, effectiveDate, newRate, kind, reason: V.str(body.reason, 'reason', { optional: true, max: 300 }) }) };
+  });
+  /** Starts a raise (a new rate from a date) through the approvals engine. */
+  function requestRaise({ org, me, p, positionId, effectiveDate, newRate, kind, reason }) {
+    const cur = rateFor(h, p, positionId, effectiveDate);
     const warnings = [];
     if (p.gradeId) {
       const g = h.get('SELECT * FROM pay_grades WHERE id = ?', p.gradeId);
@@ -287,13 +309,13 @@ export function registerPayStructure(c) {
     }
     const id = uid('rs');
     h.run(`INSERT INTO raises (id,org_id,person_id,position_id,kind,old_rate_cents,new_rate_cents,effective_date,reason,status,requested_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,'pending',?,?)`,
-      id, org.id, p.id, positionId, kind, cur?.cents ?? null, newRate, effectiveDate, V.str(body.reason, 'reason', { optional: true, max: 300 }), me.id, iso(now()));
+      id, org.id, p.id, positionId, kind, cur?.cents ?? null, newRate, effectiveDate, reason ?? null, me.id, iso(now()));
     const fmt = (x) => (kind === 'salary' ? `$${(x / 100).toLocaleString('en-US')}/yr` : `$${(x / 100).toFixed(2)}/h`);
     const ap = approvals.start({ orgId: org.id, kind: 'raise', targetId: id, requestedBy: me.id, subjectPersonId: p.id, departmentId: p.departmentId, amountCents: newRate - (cur?.cents ?? 0), title: `${p.name}: ${cur ? fmt(cur.cents) + ' → ' : ''}${fmt(newRate)} from ${effectiveDate}`, detail: { warnings } });
     h.run('UPDATE raises SET approval_id = ? WHERE id = ?', ap.id, id);
-    audit(org.id, me.id, 'raise_request', id, { personId: p.id, newRate, effectiveDate });
-    return { status: 201, body: { raise: rowToRaise(h.get('SELECT * FROM raises WHERE id = ?', id)), approval: ap, warnings } };
-  });
+    audit(org.id, me.id, 'raise_request', id, { personId: p.id, newRate, effectiveDate, ...(p.id === me.id ? { self: true } : {}) });
+    return { raise: rowToRaise(h.get('SELECT * FROM raises WHERE id = ?', id)), approval: ap, warnings };
+  }
 
   /** Put an approved raise into effect: close the old rate, add the new one, and owe retro pay for periods already paid. */
   function applyRaise(raiseId, actor) {

@@ -12,11 +12,21 @@ import { toCsv } from '../lib/csv.mjs';
 import { rateFor, rowToDiff, diffApplies, depositAccounts, splitNet } from './paystructure.mjs';
 import { allocationFor, DEFAULT_GL } from './orgstructure.mjs';
 import { policiesFor, balance, accrualFor, postAccruals, holidaysFor, ptoInPeriod } from './leave.mjs';
+import { sha256, canonical } from '../lib/vault.mjs';
 
 const J = (s, d) => { try { return s == null ? d : JSON.parse(s); } catch { return d; } };
 const $ = (cents) => (cents < 0 ? '-' : '') + '$' + (Math.abs(cents) / 100).toFixed(2);
 const hrs = (min) => +(min / 60).toFixed(2);
 export const PERIODS_PER_YEAR = { weekly: 52, biweekly: 26, semimonthly: 24, monthly: 12 };
+
+/**
+ * What a pay-run approval is given for: a hash of the period, every line (pay, taxes, hours, earnings, accounts it
+ * goes to) and the totals. Timecard sign-off and time-off balances aren't part of it. Finalizing recomputes the run
+ * and refuses when this differs from the approved one.
+ */
+export function payrunHash(pr) {
+  return sha256(canonical({ period: pr.period, payDate: pr.payDate, totals: pr.totals, lines: pr.lines.map(({ approved, flags, balances, ...l }) => l) }));
+}
 
 /** Split an integer total across weights so the parts add up exactly (largest remainder). */
 export function apportion(total, weights) {
@@ -280,11 +290,14 @@ export function registerRun(c) {
     const unapproved = lines.filter((l) => !l.approved && l.hours.regular + l.hours.overtime > 0);
     if (unapproved.length) blockers.push(`${unapproved.length} timecard(s) aren’t approved.`);
     if (needsApproval && ap?.status !== 'approved') blockers.push(ap ? 'The pay run approval isn’t finished.' : 'The pay run needs approval first.');
+    const hash = payrunHash({ period, payDate: addDays(period.end, 6), totals, lines });
+    const changedSinceApproval = needsApproval && ap?.status === 'approved' && ap.bindHash !== hash;
+    if (changedSinceApproval) blockers.push('The pay run changed after approval (hours, rates, earnings or people are different now), so it needs approving again. Submit it for approval again.');
     if (finalized) blockers.push('This period is already finalized.');
     return {
       period, payDate: addDays(period.end, 6), units: 'cents', year, unverified: !T.verified, tablesVerified: T.verified, canFinalize: blockers.length === 0, blockers,
       tables: T.list, lines, totals, warnings, finalized: finalized ? { id: finalized.id, at: finalized.finalized_at, by: finalized.finalized_by } : null,
-      approval: ap ? { id: ap.id, status: ap.status } : null, needsApproval,
+      approval: ap ? { id: ap.id, status: ap.status, changedSinceApproval } : null, needsApproval, hash,
     };
   }
   c.payrun = payrun;
@@ -308,9 +321,11 @@ export function registerRun(c) {
     need(me, 'payroll');
     const period = c.parsePeriod(org, V.date(body.periodStart, 'periodStart'), null);
     const existing = approvals.find(org.id, 'payrun', `${org.id}:${period.start}`);
-    if (existing) throw new HttpError(409, `already ${existing.status}`, { approval: existing });
     const pr = payrun(org, period);
-    const ap = approvals.start({ orgId: org.id, kind: 'payrun', targetId: `${org.id}:${period.start}`, requestedBy: me.id, amountCents: pr.totals.gross, title: `Pay run ${period.start} to ${period.end}: ${$(pr.totals.gross)} gross, ${pr.totals.people} people`, detail: { totals: pr.totals } });
+    // An approval for a run that has changed since is set aside; the run as it is now is submitted instead.
+    if (existing && (existing.status !== 'approved' || existing.bindHash === pr.hash)) throw new HttpError(409, `already ${existing.status}`, { approval: existing });
+    if (existing) { h.run(`UPDATE approval_requests SET status = 'superseded', decided_at = ? WHERE id = ?`, isoNow(now()), existing.id); audit(org.id, me.id, 'approval_superseded', existing.id, { kind: 'payrun', reason: 'the pay run changed after approval' }); }
+    const ap = approvals.start({ orgId: org.id, kind: 'payrun', targetId: `${org.id}:${period.start}`, requestedBy: me.id, amountCents: pr.totals.gross, title: `Pay run ${period.start} to ${period.end}: ${$(pr.totals.gross)} gross, ${pr.totals.people} people`, detail: { totals: pr.totals }, bindHash: pr.hash });
     return { status: 201, body: { approval: ap } };
   });
 
@@ -320,7 +335,7 @@ export function registerRun(c) {
     const pr = payrun(org, period);
     // The payroll safety rule: never finalize on tables that aren't verified for the year.
     if (!pr.tablesVerified) throw new HttpError(409, `The tax and labor tables for ${pr.year} aren’t verified, so this pay run can’t be finalized.`, { blockers: pr.blockers, tables: pr.tables });
-    if (!pr.canFinalize) throw new HttpError(409, pr.blockers.join(' '), { blockers: pr.blockers });
+    if (!pr.canFinalize) throw new HttpError(409, pr.blockers.join(' '), { blockers: pr.blockers, changedSinceApproval: !!pr.approval?.changedSinceApproval });
     const id = uid('run');
     const people = h.all(`SELECT * FROM people WHERE org_id = ? AND status IN ('active','leave')`, org.id).map((r) => c.getPerson(r.id, org.id));
     h.tx(() => {

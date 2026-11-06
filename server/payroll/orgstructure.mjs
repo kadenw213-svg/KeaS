@@ -128,10 +128,13 @@ export function registerOrgStructure(c) {
     const entityId = optRef('legal_entities', body.entityId, 'entityId', org.id);
     const headPersonId = body.headPersonId ? V.id(body.headPersonId, 'headPersonId') : null;
     if (headPersonId && !h.get('SELECT 1 FROM people WHERE id = ? AND org_id = ?', headPersonId, org.id)) bad('unknown headPersonId');
+    // A department head approves "department head" steps: only the owner sets one.
+    const prevHead = body.id ? h.get('SELECT head_person_id FROM departments WHERE id = ?', id)?.head_person_id ?? null : null;
+    if (headPersonId !== prevHead) need(me, 'owner');
     h.run(`INSERT INTO departments (id,org_id,parent_id,name,code,cost_center_id,entity_id,head_person_id,location) VALUES (?,?,?,?,?,?,?,?,?)
       ON CONFLICT(id) DO UPDATE SET parent_id=excluded.parent_id, name=excluded.name, code=excluded.code, cost_center_id=excluded.cost_center_id, entity_id=excluded.entity_id, head_person_id=excluded.head_person_id, location=excluded.location`,
       id, org.id, parentId, name, V.str(body.code, 'code', { optional: true, max: 30 }), costCenterId, entityId, headPersonId, V.str(body.location, 'location', { optional: true, max: 120 }));
-    audit(org.id, me.id, 'department_save', id, { name, parentId });
+    audit(org.id, me.id, 'department_save', id, { name, parentId, ...(headPersonId !== prevHead ? { headFrom: prevHead, headTo: headPersonId } : {}) });
     return { department: depts(org.id).find((d) => d.id === id) };
   });
   route('POST', '/v1/departments/:id/delete', ({ me, org, params }) => {
@@ -154,9 +157,12 @@ export function registerOrgStructure(c) {
   });
 
   // Who's where: department, entity, manager and default allocations for one person.
+  // Managers decide "manager of" approval steps, so only the owner changes who manages whom (and nobody but the owner
+  // changes their own job record).
   route('POST', '/v1/people/:id/job', ({ me, org, params, body }) => {
     need(me, 'owner', 'payroll');
     const p = c.getPerson(params.id, org.id);
+    c.notSelf(me, p.id, 'your own department or manager');
     const departmentId = body.departmentId === undefined ? p.departmentId : optRef('departments', body.departmentId, 'departmentId', org.id);
     const entityId = body.entityId === undefined ? p.entityId : optRef('legal_entities', body.entityId, 'entityId', org.id);
     let managerId = p.managerId;
@@ -164,11 +170,13 @@ export function registerOrgStructure(c) {
       managerId = body.managerId ? V.id(body.managerId, 'managerId') : null;
       if (managerId === p.id) bad('a person can’t manage themselves');
       if (managerId && !h.get('SELECT 1 FROM people WHERE id = ? AND org_id = ?', managerId, org.id)) bad('unknown managerId');
+      if (managerId !== p.managerId) need(me, 'owner');
     }
     const defaultAllocations = body.defaultAllocations === undefined ? p.defaultAllocations : body.defaultAllocations?.length ? validateSplits(body.defaultAllocations, bad, { allowMinutes: false }) : [];
     for (const s of defaultAllocations) { if (s.departmentId) optRef('departments', s.departmentId, 'departmentId', org.id); if (s.costCenterId) optRef('cost_centers', s.costCenterId, 'costCenterId', org.id); }
     h.run('UPDATE people SET department_id = ?, entity_id = ?, manager_id = ?, default_allocations = ? WHERE id = ?', departmentId, entityId, managerId, JSON.stringify(defaultAllocations), p.id);
     audit(org.id, me.id, 'person_job', p.id, { departmentId, entityId, managerId, defaultAllocations });
+    if (managerId !== p.managerId) audit(org.id, me.id, 'manager_change', p.id, { from: p.managerId, to: managerId });
     return { person: { id: p.id, departmentId, entityId, managerId, defaultAllocations } };
   });
 

@@ -1,6 +1,8 @@
 // Approvals engine: configurable chains of steps for time off, timecards, budgets, raises, pay runs, expenses and offers.
 // A step is { type: 'role', role } | { type: 'person', personId } | { type: 'manager_of' } | { type: 'department_head' }.
-// Nobody approves their own request or one about themselves (the owner can, and it's recorded).
+// Nobody approves their own request or one about themselves, and each step needs someone who hasn't approved an
+// earlier step of the same request (the owner can do either, and it's recorded). Only the owner changes the chains.
+// A request can be bound to exactly what was approved (bind_hash): a pay run checks it again before it's finalized.
 
 export const APPROVAL_KINDS = ['time_off', 'timecard', 'budget', 'raise', 'payrun', 'expense', 'offer'];
 export const DEFAULT_STEPS = {
@@ -19,7 +21,7 @@ const J = (s, d) => { try { return s == null ? d : JSON.parse(s); } catch { retu
 export const rowToApproval = (r) => r && ({
   id: r.id, kind: r.kind, targetId: r.target_id, requestedBy: r.requested_by, subjectPersonId: r.subject_person_id, title: r.title,
   detail: J(r.detail, null), amountCents: r.amount_cents, chainId: r.chain_id, steps: J(r.steps, []), stepIndex: r.step_index,
-  status: r.status, createdAt: r.created_at, decidedAt: r.decided_at,
+  status: r.status, createdAt: r.created_at, decidedAt: r.decided_at, bindHash: r.bind_hash ?? null,
 });
 const rowToChain = (r) => ({ id: r.id, kind: r.kind, name: r.name, steps: J(r.steps, []), minAmountCents: r.min_amount_cents, departmentId: r.department_id, active: !!r.active });
 
@@ -57,6 +59,8 @@ export function makeApprovals({ h, now, iso, uid, audit, HttpError }) {
     if (reqRow.status !== 'pending') return false;
     const isOwner = rolesOf(actorRow).includes('owner');
     if (!isOwner && (actorRow.id === reqRow.requested_by || actorRow.id === reqRow.subject_person_id)) return false;
+    // A different person at each step: someone who approved an earlier step can't approve this one too.
+    if (!isOwner && h.get(`SELECT 1 FROM approval_actions WHERE request_id = ? AND actor = ? AND decision = 'approve'`, reqRow.id, actorRow.id)) return false;
     const steps = J(reqRow.steps, []);
     const who = resolve(steps[reqRow.step_index], reqRow);
     if (isOwner) return true;
@@ -76,12 +80,12 @@ export function makeApprovals({ h, now, iso, uid, audit, HttpError }) {
     configured: (orgId, kind) => !!h.get('SELECT 1 FROM approval_chains WHERE org_id = ? AND kind = ? AND active = 1', orgId, kind),
     get: (id) => rowToApproval(h.get('SELECT * FROM approval_requests WHERE id = ?', id)),
     find: (orgId, kind, targetId) => rowToApproval(h.get(`SELECT * FROM approval_requests WHERE org_id = ? AND kind = ? AND target_id = ? AND status IN ('pending','approved') ORDER BY created_at DESC LIMIT 1`, orgId, kind, targetId)),
-    start({ orgId, kind, targetId, requestedBy, subjectPersonId = null, title, detail = null, amountCents = null, departmentId = null }) {
+    start({ orgId, kind, targetId, requestedBy, subjectPersonId = null, title, detail = null, amountCents = null, departmentId = null, bindHash = null }) {
       const chain = chainFor(orgId, kind, { amountCents, departmentId });
       const steps = chain ? J(chain.steps, []) : DEFAULT_STEPS[kind];
       const id = uid('ap');
-      h.run(`INSERT INTO approval_requests (id,org_id,kind,target_id,requested_by,subject_person_id,title,detail,amount_cents,chain_id,steps,step_index,status,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,0,'pending',?)`, id, orgId, kind, targetId, requestedBy, subjectPersonId, title, JSON.stringify(detail), amountCents, chain?.id ?? null, JSON.stringify(steps), iso(now()));
+      h.run(`INSERT INTO approval_requests (id,org_id,kind,target_id,requested_by,subject_person_id,title,detail,amount_cents,chain_id,steps,step_index,status,created_at,bind_hash)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,0,'pending',?,?)`, id, orgId, kind, targetId, requestedBy, subjectPersonId, title, JSON.stringify(detail), amountCents, chain?.id ?? null, JSON.stringify(steps), iso(now()), bindHash);
       audit(orgId, requestedBy, 'approval_start', id, { kind, targetId });
       return api.get(id);
     },
@@ -93,6 +97,8 @@ export function makeApprovals({ h, now, iso, uid, audit, HttpError }) {
       const actor = person(actorId);
       if (!canAct(actor, r)) throw new HttpError(403, 'this step isn’t yours to approve');
       const steps = J(r.steps, []);
+      // The owner may act on more than one step or on their own request; the audit trail says so.
+      const ownerOverride = rolesOf(actor).includes('owner') && (actorId === r.requested_by || actorId === r.subject_person_id || !!h.get(`SELECT 1 FROM approval_actions WHERE request_id = ? AND actor = ? AND decision = 'approve'`, id, actorId));
       let out;
       h.tx(() => {
         h.run('INSERT INTO approval_actions (request_id,step_index,actor,decision,comment,at) VALUES (?,?,?,?,?,?)', id, r.step_index, actorId, approve ? 'approve' : 'deny', comment, iso(now()));
@@ -104,7 +110,7 @@ export function makeApprovals({ h, now, iso, uid, audit, HttpError }) {
         if (out.status === 'approved') hook?.approved?.(out, actorId);
         if (out.status === 'denied') hook?.denied?.(out, actorId);
       });
-      audit(r.org_id, actorId, approve ? 'approval_approve' : 'approval_deny', id, { kind: r.kind, step: r.step_index, comment });
+      audit(r.org_id, actorId, approve ? 'approval_approve' : 'approval_deny', id, { kind: r.kind, step: r.step_index, comment, ...(ownerOverride ? { ownerOverride: true } : {}) });
       return out;
     },
     cancel(id, actorId) {
@@ -165,8 +171,9 @@ export function registerApprovals(c) {
     need(me, 'manager', 'payroll');
     return { chains: approvals.chains(org.id), kinds: APPROVAL_KINDS, defaults: DEFAULT_STEPS };
   });
+  // Changing who approves is the owner's alone (a payroll admin could otherwise turn off the owner's own check).
   route('POST', '/v1/approval-chains', ({ me, org, body }) => {
-    need(me, 'owner', 'payroll');
+    need(me, 'owner');
     const kind = V.enum(body.kind, 'kind', APPROVAL_KINDS);
     const name = V.str(body.name, 'name', { min: 1, max: 100 });
     const steps = validateSteps(body.steps, bad);
@@ -180,11 +187,12 @@ export function registerApprovals(c) {
     h.run(`INSERT INTO approval_chains (id,org_id,kind,name,steps,min_amount_cents,department_id,active) VALUES (?,?,?,?,?,?,?,?)
       ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, name = excluded.name, steps = excluded.steps, min_amount_cents = excluded.min_amount_cents, department_id = excluded.department_id, active = excluded.active`,
       id, org.id, kind, name, JSON.stringify(steps), minAmountCents, departmentId, active);
-    audit(org.id, me.id, 'approval_chain_save', id, { kind, steps });
+    const before = body.id ? h.get('SELECT kind, steps, active, min_amount_cents, department_id FROM approval_chains WHERE id = ?', id) : null;
+    audit(org.id, me.id, 'approval_chain_save', id, { kind, steps, active: !!active, minAmountCents, departmentId, before: before ? { kind: before.kind, steps: J(before.steps, []), active: !!before.active, minAmountCents: before.min_amount_cents, departmentId: before.department_id } : null });
     return { chain: approvals.chains(org.id).find((x) => x.id === id) };
   });
   route('POST', '/v1/approval-chains/:id/delete', ({ me, org, params }) => {
-    need(me, 'owner', 'payroll');
+    need(me, 'owner');
     h.run('DELETE FROM approval_chains WHERE id = ? AND org_id = ?', params.id, org.id);
     audit(org.id, me.id, 'approval_chain_delete', params.id, null);
     return { ok: true };

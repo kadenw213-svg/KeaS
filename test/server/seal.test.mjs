@@ -33,7 +33,8 @@ test('M3: the PoC values (pay amounts, medical text, candidates, reviews, notes,
   const pay = await login('p03');
   const mgr = await login('p02');
   // A rate (its amount also goes into the audit trail) and a legal name.
-  assert.equal((await call('POST', '/v1/people/p06/rates', pay, { positionId: 'pos-si', rateCents: Number(NEEDLES.rate), effectiveFrom: '2099-01-01' })).status, 201);
+  assert.equal((await call('POST', '/v1/people/p06/rates', await login('p01'), { positionId: 'pos-si', rateCents: Number(NEEDLES.rate), effectiveFrom: '2099-01-01' })).status, 201);
+  assert.equal((await call('POST', '/v1/people/p07/rates', pay, { positionId: 'pos-hg', rateCents: Number(NEEDLES.rate), effectiveFrom: '2099-01-01' })).status, 202, 'a raise request (its amounts are sealed too)');
   assert.equal((await call('POST', '/v1/people/p06/profile', pay, { legalName: NEEDLES.legal })).status, 200);
   // Medical leave.
   const lc = await call('POST', '/v1/leave-cases', pay, { personId: 'p05', law: 'fmla', reason: NEEDLES.reason, startDate: '2030-01-05', notes: `${NEEDLES.medical} chemotherapy`, entitlementHours: 480 });

@@ -148,6 +148,7 @@ export function registerLeave(c) {
     need(me, 'payroll');
     const pol = getPolicy(V.id(body.policyId, 'policyId'), org.id);
     const p = c.getPerson(V.id(body.personId, 'personId'), org.id);
+    c.notSelf(me, p.id, 'your own time-off balance');
     const hours = num(body.hours, 'hours', { min: -10000 });
     const note = V.str(body.note, 'note', { min: 3, max: 300 });
     h.run(`INSERT INTO pto_ledger (person_id,policy_id,date,hours,kind,ref,note,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)`, p.id, pol.id, V.date(body.date ?? today(org), 'date'), hours, 'adjust', null, note, me.id, iso(now()));

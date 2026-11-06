@@ -13,6 +13,15 @@ import { registerYearEnd } from './yearend.mjs';
 import { registerTalent } from './talent.mjs';
 
 export function registerPayroll(c) {
+  /**
+   * Nobody changes their own pay, raises, extra earnings, time-off balance or job record (who approves for them) but
+   * the owner, and the owner's own changes are marked in the audit trail. Returns true when it's the owner's own.
+   */
+  c.notSelf = (me, personId, what = 'your own pay') => {
+    if (me.id !== personId) return false;
+    if (!me.roles.includes('owner')) throw new c.HttpError(403, `You can’t change ${what}. Ask the owner (or another payroll admin) to do it.`);
+    return true;
+  };
   registerVaultAuth(c);
   registerApprovals(c);
   registerOrgStructure(c);

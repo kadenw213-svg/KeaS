@@ -86,6 +86,7 @@ export function registerYearEnd(c) {
   route('POST', '/v1/contractor-payments', ({ me, org, body }) => {
     need(me, 'payroll');
     const p = c.getPerson(V.id(body.personId, 'personId'), org.id);
+    c.notSelf(me, p.id);
     if (p.workerType !== 'contractor') bad(`${p.name} isn’t set up as a contractor`);
     const cents = Math.round(Number(body.cents));
     if (!(cents > 0)) bad('cents must be more than 0');

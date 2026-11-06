@@ -126,6 +126,7 @@ export function registerOnboarding(c) {
   route('POST', '/v1/offers', ({ me, org, body }) => {
     need(me, 'payroll');
     let p = body.personId ? c.getPerson(V.id(body.personId, 'personId'), org.id) : null;
+    if (p) c.notSelf(me, p.id);
     if (!p) p = c.createPerson(org, me, { name: V.str(body.name, 'name', { min: 1, max: 120 }), email: body.email ?? null, status: 'applicant' });
     const kind = V.enum(body.kind ?? 'hourly', 'kind', ['hourly', 'salary']);
     const rateCents = Math.round(Number(body.rateCents));
@@ -436,6 +437,7 @@ export function registerOnboarding(c) {
   route('POST', '/v1/offboarding/:id/payout', ({ me, org, params }) => {
     need(me, 'payroll');
     const r = getOff(params.id, org.id);
+    c.notSelf(me, r.person_id);
     if (h.get(`SELECT 1 FROM extra_earnings WHERE source = ?`, `offboarding:${r.id}`)) throw new HttpError(409, 'the payout is already added');
     const p = c.getPerson(r.person_id, org.id);
     const plan = ptoPlan(org, p).filter((x) => x.pay && x.hours > 0 && x.cents > 0);

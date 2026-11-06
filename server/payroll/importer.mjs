@@ -183,6 +183,7 @@ export function registerImport(c) {
         const blocking = r.problems.filter((x) => !/skipped/.test(x));
         if (blocking.length) { result.skipped++; result.errors.push({ row: i + 2, problems: r.problems }); return; }
         let person = findPerson(org.id, r);
+        if (person && person.id === me.id && !me.roles.includes('owner') && p.kind !== 'hours') { result.skipped++; result.errors.push({ row: i + 2, problems: ['this row is you: your own pay, deposit and year-to-date amounts are changed by the owner'] }); return; }
         if (p.kind === 'employees') {
           let deptId = null;
           if (r.department) {
