@@ -184,7 +184,7 @@ export function createHub({
   // the file itself changes.
   {
     const text = readFileSync(termsFile, 'utf8');
-    const fileHash = sha(text);
+    const fileHash = sha(JSON.stringify(JSON.parse(text))); // (the same however its line endings were checked out)
     const seen = h.get("SELECT value FROM settings WHERE key = 'termsFileHash'");
     if (!currentTerms() || (seen && JSON.parse(seen.value) !== fileHash)) publishTerms(JSON.parse(text));
     h.run("INSERT INTO settings (key,value) VALUES ('termsFileHash',?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify(fileHash));
