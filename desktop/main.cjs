@@ -3,7 +3,8 @@
 //   - an organization's KeaS server (schedules, time clock, payroll prep for one org),
 // picking which drive holds the data, setting up Tailscale so it's reachable from anywhere, and (for the Hub) making
 // the owner account. After that it runs the server in the background, starts with Windows, and sits in the tray.
-const { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage, nativeTheme } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage, nativeTheme, safeStorage } = require('electron');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -16,6 +17,8 @@ const HUB_PORT = 4860;
 const ORG_PORT = 4850;
 const configFile = () => path.join(app.getPath('userData'), 'keas-config.json');
 const readConfig = () => { try { return JSON.parse(fs.readFileSync(configFile(), 'utf8')); } catch { return {}; } };
+/** The config the setup page may see (no secrets, not even DPAPI-protected ones). */
+const publicConfig = () => ({ ...config, googleClientSecret: undefined, orgVaultKey: undefined });
 const writeConfig = (c) => { fs.mkdirSync(path.dirname(configFile()), { recursive: true }); fs.writeFileSync(configFile(), JSON.stringify(c, null, 1)); return c; };
 let config = {};
 let win = null, tray = null;
@@ -33,7 +36,37 @@ if (!app.requestSingleInstanceLock()) app.quit();
 app.on('second-instance', () => showWindow());
 
 // ---------- the servers, run inside this app (Electron includes Node 24: SQLite and Argon2 built in) ----------
+// The data folder is locked down (only this Windows account, SYSTEM and Administrators can open it) before anything
+// is written there; an older setup's folder is fixed the next time KeaS starts. A problem is logged and shown.
+let folderProblem = null;
+async function secureFolders() {
+  folderProblem = null;
+  for (const [dir, label] of [[config.dataDir, 'The data folder'], [config.storageDir, 'The storage folder']]) {
+    // (A storage folder inside the data folder already inherits its permissions.)
+    if (!dir || (dir !== config.dataDir && dir.toLowerCase().startsWith(`${String(config.dataDir).toLowerCase()}\\`))) continue;
+    try { const r = await bootstart.secureDataFolder(dir); if (r.changed) log('locked down', dir); }
+    catch (e) { folderProblem = `${label}: ${e.message}`; log('folder permissions', dir, e.message); }
+  }
+}
+/**
+ * The organization server's vault passphrase: random, kept only in KeaS's settings encrypted with Windows DPAPI
+ * (safeStorage), so it never sits in a file next to the database. A key file left by an older KeaS is moved in and
+ * then deleted.
+ */
+function orgVaultPassphrase() {
+  if (!safeStorage.isEncryptionAvailable()) throw new Error('Windows can’t protect the organization server’s key on this PC (DPAPI isn’t available).');
+  if (config.orgVaultKey) return { pass: safeStorage.decryptString(Buffer.from(config.orgVaultKey, 'base64')), legacy: null };
+  const legacy = path.join(config.dataDir, 'org.db.vaultkey');
+  const had = fs.existsSync(legacy);
+  const pass = had ? fs.readFileSync(legacy, 'utf8').trim() : crypto.randomBytes(32).toString('base64url');
+  config = writeConfig({ ...config, orgVaultKey: safeStorage.encryptString(pass).toString('base64') });
+  return { pass, legacy: had ? legacy : null };
+}
+function removeKeyFile(file) {
+  try { const n = fs.statSync(file).size; fs.writeFileSync(file, Buffer.alloc(n)); fs.rmSync(file, { force: true }); log('moved the vault key into Windows-protected settings'); } catch (e) { log('key file', e.message); }
+}
 async function startServices() {
+  if (config.dataDir && !hub && !org && !hubExternal) await secureFolders();
   if (config.role === 'hub' && !hub && await bootstart.hubAnswering(HUB_PORT)) {
     if (!hubExternal) log('hub already running (started before sign-in); using it');
     hubExternal = true;
@@ -54,7 +87,9 @@ async function startServices() {
   }
   if (config.role === 'org' && !org) {
     const { createApp } = await import(pathToFileURL(path.join(ROOT, 'server', 'index.mjs')).href);
-    org = createApp({ dbFile: path.join(config.dataDir, 'org.db'), log: false });
+    const { pass, legacy } = orgVaultPassphrase();
+    org = createApp({ dbFile: path.join(config.dataDir, 'org.db'), log: false, passphrase: pass, devKeyFile: false });
+    if (legacy) removeKeyFile(legacy);
     await org.listen(ORG_PORT);
     log('org server started', config.dataDir);
   }
@@ -83,7 +118,9 @@ async function hubDb() {
 const hubRunning = () => !!hub || hubExternal;
 
 // ---------- start before sign-in, and power settings ----------
-const bootArgs = () => ({ config, exe: process.execPath, hubSource: path.join(ROOT, 'hub'), version: app.getVersion(), port: HUB_PORT });
+// The files the task uses are staged in KeaS's own folder, then copied into "<Program Files>\KeaS Hub Service" by the
+// elevated script (see bootstart.cjs).
+const bootArgs = () => ({ config, exe: process.execPath, hubSource: path.join(ROOT, 'hub'), version: app.getVersion(), port: HUB_PORT, stageDir: path.join(app.getPath('userData'), 'hub-service') });
 async function bootStatus() {
   const task = await bootstart.taskStatus();
   let power = null;
@@ -91,6 +128,9 @@ async function bootStatus() {
   return {
     task, power, external: hubExternal, saved: config.boot || null, options: bootstart.options(config.boot?.options),
     defaults: bootstart.DEFAULTS, note: bootstart.POWER_LOSS_NOTE, taskName: bootstart.TASK_NAME, testProfile: DEV,
+    // Set up by an older KeaS (the launcher in the data folder), or its folder's permissions changed: run it again.
+    needsUpdate: !!config.boot?.installed && (config.boot.layout !== bootstart.LAYOUT || !!config.boot.repair),
+    serviceDir: bootstart.serviceDir(), folderProblem,
   };
 }
 const TEST_PROFILE = 'A test profile (KEAS_USERDATA) never changes Windows settings. Use "Show what it runs" instead.';
@@ -110,14 +150,14 @@ async function bootApply(opts = {}, dryRun = false) {
   const installed = o.bootStart ? ok('task') : (!!was.installed && !ok('task:delete'));
   const powerOn = Object.keys(bootstart.powerTargets(o)).length > 0;
   const powerApplied = powerOn ? (ok('power:apply') || !!was.powerApplied) : (!!was.powerApplied && !ok('power:apply'));
-  config = writeConfig({ ...config, boot: { options: o, installed, powerApplied, previous: powerApplied ? r.previous : null, at: Date.now(), steps: r.steps } });
+  config = writeConfig({ ...config, boot: { options: o, installed, layout: installed ? (ok('service:copy') ? bootstart.LAYOUT : was.layout || 1) : null, repair: false, powerApplied, previous: powerApplied ? r.previous : null, at: Date.now(), steps: r.steps } });
   if (!o.bootStart && was.installed && hubExternal && !installed) { hubExternal = false; if (extDb) { try { extDb.close(); } catch {} extDb = null; } await startServices().catch((e) => log('start failed', e.message)); }
   refreshTray();
   return { ok: r.ok, steps: r.steps, status: await bootStatus() };
 }
 async function bootRemove(dryRun = false) {
   if (DEV && !dryRun) throw new Error(TEST_PROFILE);
-  const r = await bootstart.uninstall({ config, previous: config.boot?.powerApplied ? config.boot.previous : null, stopHub: hubExternal, dryRun });
+  const r = await bootstart.uninstall({ config, previous: config.boot?.powerApplied ? config.boot.previous : null, stopHub: hubExternal, dryRun, stageDir: bootArgs().stageDir });
   if (dryRun) return r;
   if (r.ok) {
     config = writeConfig({ ...config, boot: { options: bootstart.options(config.boot?.options), installed: false, powerApplied: false, previous: null, at: Date.now(), steps: r.steps } });
@@ -196,7 +236,7 @@ function refreshTray() {
 
 // ---------- Payroll (the payroll vault, on this PC only; see payroll.cjs) ----------
 let payrollApi = null;
-const payroll = () => (payrollApi ||= require('./payroll.cjs').createPayroll({ getConfig: () => config, userData: app.getPath('userData'), root: ROOT, hubPort: HUB_PORT, log }));
+const payroll = () => (payrollApi ||= require('./payroll.cjs').createPayroll({ getConfig: () => config, setConfig: (patch) => { config = writeConfig({ ...config, ...patch }); }, userData: app.getPath('userData'), root: ROOT, hubPort: HUB_PORT, log }));
 const openPayroll = () => payroll().open().catch((e) => { log('payroll', e.message); throw e; });
 app.on('before-quit', () => { payrollApi?.stop(); });
 
@@ -213,13 +253,15 @@ function drives() {
   }
   return out;
 }
-function checkFolder(dir) {
-  fs.mkdirSync(dir, { recursive: true });
+/** A folder KeaS may keep data in: checked (bootstart.validateDataDir), made if needed, and locked down to this account. */
+async function checkFolder(dir, label) {
+  dir = bootstart.validateDataDir(dir, label);
+  await bootstart.secureDataFolder(dir);
   const probe = path.join(dir, `.keas-write-test-${process.pid}`);
   fs.writeFileSync(probe, 'ok');
   fs.rmSync(probe, { force: true });
   const s = fs.statfsSync(dir);
-  return { ok: true, free: s.bavail * s.bsize };
+  return { ok: true, free: s.bavail * s.bsize, dir };
 }
 
 // ---------- IPC for the setup screens ----------
@@ -230,21 +272,26 @@ const handle = (name, fn) => ipcMain.handle(name, async (_e, arg) => {
 
 let ownerToken = null;
 function registerIpc() {
-  handle('state', async () => ({ config: { ...config, googleClientSecret: undefined }, running: { hub: hubRunning(), org: !!org, hubExternal }, port: servicePort(), defaults: { hubData: defaultFolder('Kea Hub'), orgData: defaultFolder('KeaS Server') }, version: app.getVersion() }));
+  handle('state', async () => ({ config: publicConfig(), folderProblem, running: { hub: hubRunning(), org: !!org, hubExternal }, port: servicePort(), defaults: { hubData: defaultFolder('Kea Hub'), orgData: defaultFolder('KeaS Server') }, version: app.getVersion() }));
   handle('drives', () => drives());
   handle('pickFolder', async ({ start }) => {
     const r = await dialog.showOpenDialog(win, { title: 'Where should KeaS keep its data?', defaultPath: start, properties: ['openDirectory', 'createDirectory'] });
-    return r.canceled ? null : r.filePaths[0];
+    if (r.canceled) return null;
+    const p = r.filePaths[0];
+    // Never a whole drive: its permissions let every account on the PC change what's in it.
+    if (path.parse(p).root.toLowerCase() === path.join(p, path.sep).toLowerCase()) throw new Error(`Pick or make a folder on that drive (for example ${path.join(p, 'Kea Hub')}), not the drive itself.`);
+    return p;
   });
   handle('checkFolder', ({ dir }) => checkFolder(dir));
-  handle('saveSetup', ({ role, dataDir, storageDir, quotaGb, reach }) => {
+  handle('saveSetup', async ({ role, dataDir, storageDir, quotaGb, reach }) => {
     if (!['hub', 'org'].includes(role)) throw new Error('Pick what this PC is for.');
-    checkFolder(dataDir);
-    if (storageDir) checkFolder(storageDir);
+    dataDir = (await checkFolder(dataDir)).dir;
+    if (storageDir) storageDir = (await checkFolder(storageDir, 'The storage folder')).dir;
     config = writeConfig({ ...config, role, dataDir, storageDir: storageDir || path.join(dataDir, 'storage'), quotaGb: Number(quotaGb) || 5, tailscale: reach === 'tailscale' });
-    // The before-sign-in launcher reads these settings at each start: keep it in step (no permission needed).
-    if (config.boot?.installed && !DEV) { try { bootstart.prepareFiles({ ...bootArgs(), opts: config.boot.options }); } catch (e) { log('boot files', e.message); } }
-    return config;
+    // The before-sign-in launcher reads these settings at each start: keep it in step (no permission needed, as long
+    // as the service folder's permissions are still the locked-down ones).
+    if (config.boot?.installed && config.boot.layout === bootstart.LAYOUT && !DEV) await refreshBoot(true);
+    return publicConfig();
   });
   handle('start', async () => { await startServices(); return { hub: hubRunning(), org: !!org, port: servicePort() }; });
   handle('boot:status', () => bootStatus());
@@ -289,12 +336,24 @@ function registerIpc() {
     if (!DEV) app.setLoginItemSettings({ openAtLogin: !!startWithWindows, args: ['--hidden'] });
     makeTray();
     pointKeaHere();
-    return config;
+    return publicConfig();
   });
   handle('setTheme', ({ theme }) => { config = writeConfig({ ...config, theme }); nativeTheme.themeSource = theme === 'light' || theme === 'dark' ? theme : 'system'; return theme; });
   handle('openExternal', ({ url }) => { if (/^https?:\/\//.test(url)) shell.openExternal(url); return true; });
   handle('openFolder', ({ dir }) => shell.openPath(dir));
   handle('payroll:open', () => openPayroll());
+  handle('payroll:settings', () => payroll().settings());
+  handle('payroll:localSignIn', ({ on }) => payroll().setLocalSignIn(!!on));
+  handle('payroll:repinHub', () => payroll().repinHub());
+}
+
+/** Updates the installed service files (KeaS was updated, or its settings changed). 'repair': run it again from Settings. */
+async function refreshBoot(force) {
+  try {
+    const r = await bootstart.refreshService({ ...bootArgs(), opts: config.boot.options, force });
+    if (r === 'repair') { log('the Hub service folder’s permissions changed; not updating it'); config = writeConfig({ ...config, boot: { ...config.boot, repair: true } }); }
+    else if (r === 'updated') log('updated the Hub service files');
+  } catch (e) { log('boot files', e.message); }
 }
 
 function defaultFolder(name) {
@@ -327,7 +386,7 @@ app.whenReady().then(async () => {
   if (config.setupDone) {
     try { await startServices(); } catch (e) { log('start failed', e.message); }
     // KeaS was updated: the before-sign-in Hub uses the new Hub files from its next start.
-    if (config.role === 'hub' && config.boot?.installed && !DEV) bootstart.refreshIfOutdated({ ...bootArgs(), opts: config.boot.options });
+    if (config.role === 'hub' && config.boot?.installed && config.boot.layout === bootstart.LAYOUT && !DEV) await refreshBoot(false);
     makeTray();
   }
   if (!process.argv.includes('--hidden') || !config.setupDone) showWindow();
