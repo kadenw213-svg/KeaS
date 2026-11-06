@@ -107,6 +107,11 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   const membersOf = (oid, { status = 'active' } = {}) =>
     h.all(`SELECT m.*, a.display_name, a.email, a.email_verified, a.phone, a.phone_visibility, a.supporter_until FROM org_members m JOIN accounts a ON a.id = m.account_id WHERE m.org_id = ?${status ? ' AND m.status = ?' : ''} ORDER BY a.display_name`, ...(status ? [oid, status] : [oid]));
 
+  // How many rows of each kind one organization can have (audit 2026-11-06, section 2 L2): far above any real one, so a
+  // script can't fill the Hub's database through one organization.
+  const capRows = (table, oid, max, what) => {
+    if (h.get(`SELECT COUNT(*) AS n FROM ${table} WHERE org_id = ?`, oid).n >= max) bad(`This organization has the most ${what} it can have (${max}). Remove some first.`);
+  };
   const getSetting = (k, d) => { const r = h.get('SELECT value FROM settings WHERE key = ?', k); return r ? JSON.parse(r.value) : d; };
   const setSetting = (k, v) => h.run('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', k, JSON.stringify(v));
 
@@ -143,6 +148,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     if (existing) return { org: orgOut(o, existing), alreadyMember: true };
     const pending = !!c.needs_approval && !orgSettings(o).autoApproveJoins;
     h.tx(() => {
+      capRows('org_members', o.id, 5000, 'members');
       h.run('INSERT INTO org_members (org_id,account_id,role,status,department_id,joined_at,via_code) VALUES (?,?,?,?,?,?,?)', o.id, me.id, c.role, pending ? 'pending' : 'active', c.department_id, now(), c.code);
       if (c.position_id) h.run('INSERT OR IGNORE INTO org_member_positions (org_id,account_id,position_id) VALUES (?,?,?)', o.id, me.id, c.position_id);
       h.run('UPDATE org_codes SET uses = uses + 1 WHERE code = ?', c.code);
@@ -207,6 +213,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     const dept = body.departmentId ? deptRow(o.id, body.departmentId).id : null;
     const pos = body.positionId ? positionRow(o.id, body.positionId).id : null;
     const code = newOrgCode();
+    capRows('org_codes', o.id, 1000, 'join codes');
     h.run('INSERT INTO org_codes (code,org_id,role,label,department_id,position_id,needs_approval,max_uses,expires_at,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
       code, o.id, role, V.str(body.label, 'Label', { optional: true, max: 60 }), dept, pos,
       body.needsApproval == null ? (role === 'member' ? 0 : 1) : V.bool(body.needsApproval, 'Needs approval') ? 1 : 0,
@@ -348,6 +355,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   OR('POST', '/v1/orgs/:id/departments', ({ me, params, body }) => {
     const { o } = asOrg(params.id, me, 'admin');
     const did = id();
+    capRows('org_departments', o.id, 500, 'departments');
     h.run('INSERT INTO org_departments (id,org_id,parent_id,name,cost_center_id,location_id,sort) VALUES (?,?,?,?,?,?,?)', did, o.id,
       body.parentId ? deptRow(o.id, body.parentId).id : null, V.str(body.name, 'Name', { min: 1, max: 80 }),
       body.costCenterId ? ccRow(o.id, body.costCenterId).id : null, body.locationId ? locRow(o.id, body.locationId).id : null, V.int(body.sort ?? 0, 'Order', { min: 0, max: 10000 }));
@@ -384,6 +392,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   OR('POST', '/v1/orgs/:id/positions', ({ me, params, body }) => {
     const { o } = asOrg(params.id, me, 'admin');
     const pid = id();
+    capRows('org_positions', o.id, 500, 'positions');
     h.run('INSERT INTO org_positions (id,org_id,name,department_id,tags,cost_rate,color) VALUES (?,?,?,?,?,?,?)', pid, o.id, V.str(body.name, 'Name', { min: 1, max: 80 }),
       body.departmentId ? deptRow(o.id, body.departmentId).id : null, JSON.stringify(tags(body.tags)), cents(body.costRate, 'Cost rate'), V.str(body.color, 'Color', { optional: true, max: 20 }));
     return { status: 201, body: { position: posOut(positionRow(o.id, pid), true) } };
@@ -414,6 +423,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
       const { o } = asOrg(params.id, me, 'admin');
       const rid = id();
       const vals = fields.map(([f, n, min, max]) => V.str(body[f], n, { min, max, optional: min === 0 }));
+      capRows(table, o.id, 300, path.replace('-', ' '));
       h.run(`INSERT INTO ${table} (id,org_id,${fields.map((f) => f[0]).join(',')}) VALUES (?,?,${fields.map(() => '?').join(',')})`, rid, o.id, ...vals);
       return { status: 201, body: { item: out(h.get(`SELECT * FROM ${table} WHERE id = ?`, rid)) } };
     });
@@ -495,6 +505,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     const f = certTypeFields(o, body);
     if (!f.name) bad('Give the certification a name.');
     const tid = id();
+    capRows('org_cert_types', o.id, 300, 'certification types');
     h.run('INSERT INTO org_cert_types (id,org_id,name,valid_months,positions,warn_days) VALUES (?,?,?,?,?,?)', tid, o.id, f.name, f.valid, f.positions, f.warn);
     return { status: 201, body: { certType: certTypeOut(certTypeRow(o.id, tid)) } };
   });
@@ -531,6 +542,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     const t = certTypeRow(o.id, tid);
     const cid = id();
     const exp = expiresOn ?? (t.valid_months ? addDays(addMonths(issuedOn, t.valid_months), -1) : null);
+    capRows('org_certs', o.id, 50000, 'certification records');
     h.run('INSERT INTO org_certs (id,org_id,account_id,type_id,issued_on,expires_on,source,class_id,note,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)', cid, o.id, aid, t.id, issuedOn, exp, source, classId, note, by, now());
     return cid;
   };
@@ -575,6 +587,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   });
   OR('POST', '/v1/orgs/:id/classes', ({ me, params, body, ip }) => {
     const { o, m } = asOrg(params.id, me, 'manager');
+    capRows('org_classes', o.id, 500, 'classes');
     const cid = id();
     const cert = body.certTypeId ? certTypeRow(o.id, body.certTypeId).id : null;
     h.tx(() => {
@@ -678,6 +691,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   OR('POST', '/v1/orgs/:id/block-sets', ({ me, params, body }) => {
     const { o } = asOrg(params.id, me, 'manager');
     const sid = id();
+    capRows('org_block_sets', o.id, 300, 'block templates');
     h.run('INSERT INTO org_block_sets (id,org_id,name,position_id,blocks,created_at) VALUES (?,?,?,?,?,?)', sid, o.id, V.str(body.name, 'Name', { min: 1, max: 80 }),
       body.positionId ? positionRow(o.id, body.positionId).id : null, JSON.stringify(parseBlocks(o.id, body.blocks)), now());
     return { status: 201, body: { blockSet: setOut(h.get('SELECT * FROM org_block_sets WHERE id = ?', sid)) } };
@@ -785,6 +799,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     }
     const month = new Date(`${start}T12:00:00Z`).toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
     const fid = id();
+    capRows('org_forms', o.id, 2000, 'availability forms');
     h.run('INSERT INTO org_forms (id,org_id,title,period_start,period_end,status,deadline_at,blocks,exceptions,questions,audience,minor_note,reminders,allow_changes,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
       fid, o.id, V.str(body.title ?? `${month} availability`, 'Title', { min: 1, max: 120 }), start, end, 'draft',
       body.deadline != null ? V.time(body.deadline, 'Deadline') : defaultDeadline(o, start),
@@ -1044,6 +1059,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     const start = f ? f.period_start : date(body.periodStart, 'Start'), end = f ? f.period_end : date(body.periodEnd, 'End');
     if (end < start) bad('The end must be on or after the start.');
     const sid = id();
+    capRows('org_schedules', o.id, 2000, 'schedules');
     h.run('INSERT INTO org_schedules (id,org_id,form_id,title,period_start,period_end,created_by,created_at) VALUES (?,?,?,?,?,?,?,?)', sid, o.id, f?.id ?? null,
       V.str(body.title ?? (f ? f.title.replace(/availability/i, 'schedule') : `Schedule ${start}`), 'Title', { min: 1, max: 120 }), start, end, me.id, now());
     audit(me.id, 'org.schedule_create', o.id, { schedule: sid }, ip);
@@ -1444,6 +1460,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   OR('POST', '/v1/orgs/:id/policies', ({ me, params, body }) => {
     const { o } = asOrg(params.id, me, 'manager');
     const pid = id();
+    capRows('org_policies', o.id, 1000, 'acknowledgments');
     h.run('INSERT INTO org_policies (id,org_id,title,body,url,due_on,audience,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)', pid, o.id, V.str(body.title, 'Title', { min: 1, max: 120 }),
       V.str(body.body, 'Text', { optional: true, max: 20000 }), V.url(body.url, 'Link'), date(body.dueOn, 'Due', { optional: true }), JSON.stringify(body.audience ? parseAudience(o.id, body.audience) : {}), me.id, now());
     return { status: 201, body: { id: pid } };

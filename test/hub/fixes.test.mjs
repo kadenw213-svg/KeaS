@@ -543,3 +543,13 @@ test('2 H1/M4: big downloads stream out paced; busy numbers show in /owner/stats
     for (const k of ['lagMs', 'hashing', 'downloads', 'uploads', 'rejected', 'shed', 'connections']) assert.ok(k in busy, k);
   } finally { await H2.close(); }
 });
+
+test('2 L2: one organization can hold only so many rows of each kind', async () => {
+  const boss = await H.person('l2-boss@example.com', 'Cap Boss');
+  ok(await H.owner('POST', '/owner/orgs/settings', { autoApprove: true }));
+  const org = ok(await H.call('POST', '/v1/orgs', boss.token, { name: 'Cap Org' }), 201).org;
+  ok(await H.call('POST', `/v1/orgs/${org.id}/locations`, boss.token, { name: 'Main', address: '' }), 201);
+  for (let i = 0; i < 300; i++) H.hub.h.run('INSERT INTO org_locations (id,org_id,name) VALUES (?,?,?)', `loc-${i}`, org.id, `L${i}`);
+  const full = await H.call('POST', `/v1/orgs/${org.id}/locations`, boss.token, { name: 'One more', address: '' });
+  assert.deepEqual([full.status, /the most locations/.test(full.body.error)], [400, true]);
+});
