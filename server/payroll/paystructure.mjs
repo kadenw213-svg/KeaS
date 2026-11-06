@@ -199,9 +199,29 @@ export function registerPayStructure(c) {
     const p = c.getPerson(params.id, org.id);
     return { rates: h.all('SELECT * FROM pay_rates WHERE person_id = ? ORDER BY effective_from DESC', p.id).map(rowToRate), current: rateFor(h, p, null, today(org)) };
   });
+  /**
+   * Would this new rate need the raise approval (for anyone but the owner)? It does when it pays more than the rate it
+   * would replace or more than the best rate the person has now under any position (salaries compared by the hour, so
+   * an hourly rate can't pass as "lower" than a salary in cents), or when it starts before today for someone who
+   * already has a rate or was already paid (that would mean retro pay).
+   */
+  function rateCheck(org, p, positionId, kind, rateCents, effectiveFrom) {
+    const day = today(org);
+    const hourly = (k, cents) => (k === 'salary' ? cents / 2080 : cents);
+    const rows = h.all('SELECT kind, rate_cents, effective_from, effective_to FROM pay_rates WHERE person_id = ?', p.id);
+    const current = rows.filter((r) => r.effective_from <= day && (!r.effective_to || r.effective_to >= day));
+    const cur = rateFor(h, p, positionId, day);
+    const asked = hourly(kind, rateCents);
+    const best = Math.max(cur ? hourly(cur.kind, cur.cents) : 0, ...(current.length ? current : rows).map((r) => hourly(r.kind, r.rate_cents)));
+    const had = rows.length > 0 || !!cur;
+    const higher = had && (asked > best || (!!cur && asked > hourly(cur.kind, cur.cents)));
+    const backdated = effectiveFrom < day && (had || !!h.get('SELECT 1 FROM payrun_lines WHERE person_id = ? LIMIT 1', p.id));
+    return { higher, backdated };
+  }
+  c.rateCheck = rateCheck;
   // A first rate for a person or position. Changing an existing rate is a raise (it goes through approvals).
-  // Only the owner adds a rate directly when it pays more than the person's current rate, or starts before today for
-  // someone already paid (that would mean retro pay): anyone else's goes through the raise approval instead.
+  // Only the owner adds a rate directly when rateCheck says it's higher or back-dated: anyone else's goes through the
+  // raise approval instead.
   route('POST', '/v1/people/:id/rates', ({ me, org, params, body }) => {
     need(me, 'payroll');
     const p = c.getPerson(params.id, org.id);
@@ -213,10 +233,7 @@ export function registerPayStructure(c) {
     const kind = V.enum(body.kind ?? 'hourly', 'kind', ['hourly', 'salary']);
     const rateCents = money(body.rateCents, 'rateCents');
     const effectiveFrom = V.date(body.effectiveFrom ?? p.hireDate ?? today(org), 'effectiveFrom');
-    const cur = rateFor(h, p, positionId, today(org));
-    const paidBefore = !!h.get('SELECT 1 FROM payrun_lines WHERE person_id = ? LIMIT 1', p.id);
-    const higher = !!cur && rateCents > cur.cents;
-    const backdated = effectiveFrom < today(org) && (!!cur || paidBefore);
+    const { higher, backdated } = rateCheck(org, p, positionId, kind, rateCents, effectiveFrom);
     if (!isOwner && (higher || backdated)) {
       const r = requestRaise({ org, me, p, positionId, effectiveDate: effectiveFrom, newRate: rateCents, kind, reason: V.str(body.label, 'label', { optional: true, max: 60 }) || (higher ? 'New rate above the current one' : 'Back-dated rate') });
       return { status: 202, body: { ...r, needsApproval: true, message: `${higher ? 'This rate is above the current one' : 'This rate starts before today'}, so it goes through the raise approval.` } };
@@ -304,6 +321,7 @@ export function registerPayStructure(c) {
     return { status: 201, body: requestRaise({ org, me, p, positionId, effectiveDate, newRate, kind, reason: V.str(body.reason, 'reason', { optional: true, max: 300 }) }) };
   });
   /** Starts a raise (a new rate from a date) through the approvals engine. */
+  c.requestRaise = (a) => requestRaise(a);
   function requestRaise({ org, me, p, positionId, effectiveDate, newRate, kind, reason }) {
     const cur = rateFor(h, p, positionId, effectiveDate);
     const warnings = [];

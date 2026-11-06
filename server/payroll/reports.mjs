@@ -1,6 +1,7 @@
 // Reporting: the payroll register, tax liability, labor distribution (with budgets), and a custom report builder
 // (pick a dataset, fields, filters, group-by; save it; download CSV). SSNs and bank details are never report fields.
 import { toCsv } from '../lib/csv.mjs';
+import { byName } from '../db.mjs';
 import { dayNum, addDays } from '../lib/time.mjs';
 import { policiesFor, balance } from './leave.mjs';
 import { rateFor } from './paystructure.mjs';
@@ -107,7 +108,7 @@ export function registerReports(c) {
       label: 'People', fields: { name: 'text', status: 'text', workerType: 'text', department: 'text', entity: 'text', manager: 'text', positions: 'text', hireDate: 'date', termDate: 'date', rate: 'money', rateKind: 'text', grade: 'text', employeeNumber: 'text' },
       rows(org) {
         const n = names(org.id), grades = new Map(h.all('SELECT id, code FROM pay_grades WHERE org_id = ?', org.id).map((r) => [r.id, r.code]));
-        return h.all('SELECT id FROM people WHERE org_id = ? ORDER BY name', org.id).map((r) => c.getPerson(r.id, org.id)).map((p) => {
+        return byName(h.all('SELECT id, name FROM people WHERE org_id = ?', org.id)).map((r) => c.getPerson(r.id, org.id)).map((p) => {
           const rt = rateFor(h, p, null, today(org));
           return { name: p.name, status: p.status, workerType: p.workerType, department: n.dept.get(p.departmentId) || '', entity: n.entity.get(p.entityId) || '', manager: n.person.get(p.managerId) || '', positions: p.positions.map((x) => n.position.get(x) || x).join(', '), hireDate: p.hireDate || '', termDate: p.termDate || '', rate: rt?.cents ?? null, rateKind: rt?.kind || '', grade: grades.get(p.gradeId) || '', employeeNumber: p.employeeNumber || '' };
         });
@@ -132,7 +133,7 @@ export function registerReports(c) {
     },
     timeoff: {
       label: 'Time-off balances', fields: { name: 'text', policy: 'text', kind: 'text', hours: 'number' },
-      rows(org) { return h.all(`SELECT id FROM people WHERE org_id = ? AND status != 'terminated' ORDER BY name`, org.id).map((r) => c.getPerson(r.id, org.id)).flatMap((p) => policiesFor(h, p).map((pol) => ({ name: p.name, policy: pol.name, kind: pol.kind, hours: balance(h, p.id, pol.id) }))); },
+      rows(org) { return byName(h.all(`SELECT id, name FROM people WHERE org_id = ? AND status != 'terminated'`, org.id)).map((r) => c.getPerson(r.id, org.id)).flatMap((p) => policiesFor(h, p).map((pol) => ({ name: p.name, policy: pol.name, kind: pol.kind, hours: balance(h, p.id, pol.id) }))); },
     },
     expenses: {
       label: 'Expenses', fields: { date: 'date', name: 'text', kind: 'text', category: 'text', status: 'text', amount: 'money', miles: 'number' },

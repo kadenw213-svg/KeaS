@@ -202,11 +202,37 @@ function VaultGate() {
 
 const TIME_ZONES = ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Phoenix', 'America/Los_Angeles', 'America/Anchorage', 'Pacific/Honolulu'];
 
+/** The one-time setup token the KeaS app put in this window's address; kept for reloads, and taken out of the address. */
+function setupToken(): string {
+  const key = 'keas-vault-setup';
+  const m = /^#setup=([\w-]+)$/.exec(location.hash);
+  try {
+    if (m) {
+      sessionStorage.setItem(key, m[1]);
+      history.replaceState(null, '', location.pathname + location.search);
+    }
+    return m?.[1] ?? sessionStorage.getItem(key) ?? '';
+  } catch {
+    return m?.[1] ?? '';
+  }
+}
+
 function VaultSetup() {
   const { vault } = useWork();
   const [local, setLocal] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [token] = useState(setupToken);
+  // A Hub on another PC: the owner compares its key with the one on that PC before any password goes to it.
+  const [hubKey, setHubKey] = useState<{ ownHub: boolean; fingerprint: string } | null>(null);
+  useEffect(() => {
+    if (!vault?.hubUrl) return;
+    api<{ ownHub: boolean; fingerprint: string }>('GET', `/v1/vault/setup-hub-key?token=${encodeURIComponent(token)}`)
+      .then(setHubKey)
+      .catch(() => setHubKey(null));
+  }, [vault?.hubUrl, token]);
+  const confirmKey = !local && !!hubKey && !hubKey.ownHub;
   const fields: Field[] = [
+    ...(confirmKey ? [{ name: 'hubKeyOk', label: 'This fingerprint matches the one shown on the Hub’s PC', type: 'checkbox', required: true } as Field] : []),
     { name: 'orgName', label: 'Organization', required: true },
     { name: 'state', label: 'State (two letters)', required: true, placeholder: 'CO' },
     { name: 'tz', label: 'Time zone', type: 'select', required: true, options: TIME_ZONES.map((z) => ({ value: z, label: z.split('/')[1].replace('_', ' ') })) },
@@ -231,21 +257,28 @@ function VaultSetup() {
           <input type="checkbox" checked={local} onChange={(e) => setLocal(e.target.checked)} /> Use a local account (only while the Kea Hub can’t be reached)
         </label>
       )}
+      {confirmKey && (
+        <p className="muted small">
+          Kea Hub key fingerprint: <code>{hubKey?.fingerprint}</code>. On the Hub’s PC, run <code>node hub/owner.mjs key-fingerprint</code> or open KeaS (Payroll, Advanced) and compare.
+        </p>
+      )}
       {err && <div className="work-banner warn">{err}</div>}
       <Form
-        key={String(local)}
+        key={`${local}-${confirmKey}`}
         fields={fields}
         initial={{ tz: 'America/Denver' }}
         submit="Set up payroll"
         onSubmit={async (v) => {
           setErr(null);
           if (v.passphrase !== v.passphrase2) return setErr('The two passphrases don’t match.');
+          if (confirmKey && !v.hubKeyOk) return setErr('Compare the Kea Hub’s key fingerprint first.');
           try {
             await api('POST', '/v1/vault/setup', {
+              setupToken: token,
               passphrase: v.passphrase,
               org: { name: v.orgName, state: String(v.state || '').toUpperCase(), tz: v.tz, payPeriodAnchor: v.payPeriodAnchor || undefined, futaExempt: !!v.futaExempt, sutaRate: v.sutaRate ?? undefined },
               admin: { name: v.name, email: v.email },
-              signIn: local ? { mode: 'local', password: v.password } : { mode: 'hub', password: v.password, code: v.code || undefined, localPassword: v.localPassword || undefined }
+              signIn: local ? { mode: 'local', password: v.password } : { mode: 'hub', password: v.password, code: v.code || undefined, localPassword: v.localPassword || undefined, hubKeyFingerprint: confirmKey ? hubKey?.fingerprint : undefined }
             });
             useWork.getState().set({ status: null, error: null });
           } catch (e: any) {

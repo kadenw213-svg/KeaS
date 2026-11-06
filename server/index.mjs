@@ -5,7 +5,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { serveStatic, securityHeaders, DEFAULT_WEB_DIR } from './static.mjs';
 import { fileURLToPath } from 'node:url';
-import { openDb, DEFAULT_DB, rowToPerson, rowToOrg, rowToShift, rowToPosition, rowToCertType, rowToPunch, rowToRequest, rowToSwap } from './db.mjs';
+import { openDb, DEFAULT_DB, byName, rowToPerson, rowToOrg, rowToShift, rowToPosition, rowToCertType, rowToPunch, rowToRequest, rowToSwap } from './db.mjs';
 import { seed } from './seed.mjs';
 import { mergeRules, checkAssignment, timecard, unforceable, isBlocked } from './lib/rules.mjs';
 import { makeVault, openDevVault, VaultLocked, VaultDamaged, SealError } from './payroll/vaultstate.mjs';
@@ -77,12 +77,17 @@ function sameOrigin(req, origins) {
  * hubUrl: the Kea Hub payroll admins sign in at, set by the KeaS app (never by a request). localSignIn: true, or a
  * function returning it, when the owner turned on local passwords in the KeaS app. devKeyFile: development and tests
  * only, keep a generated passphrase in a file next to the database (never for a real organization's data).
+ *
+ * setupToken (vault): the one-time secret that setting up an empty vault needs. Left out, one is generated
+ * (app.setupToken); the KeaS app gives it to its payroll window only. false: no token, and no fingerprint to confirm
+ * for a Hub on another PC (tests only; a request or environment variable can't turn this off).
  */
 export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = process.env.KEAS_WEB_DIR || DEFAULT_WEB_DIR, log = true, now = () => Date.now(),
   vault: vaultMode = process.env.KEAS_VAULT === '1', hubUrl = process.env.KEAS_HUB_URL || null, sharedDir = SHARED, passphrase = process.env.KEAS_VAULT_PASSPHRASE || null, fetchImpl = globalThis.fetch,
   localSignIn = false, hubTrustKeys = null, devKeyFile = dbFile === DEFAULT_DB || dbFile === ':memory:' || process.env.KEAS_DEV_KEYFILE === '1',
-  demo = process.env.KEAS_DEV_DEMO === '1', publicHosts = [] } = {}) {
+  demo = process.env.KEAS_DEV_DEMO === '1', publicHosts = [], setupToken = undefined } = {}) {
   const demoOn = !!demo && !vaultMode;
+  const vaultSetupToken = !vaultMode || setupToken === false ? null : setupToken || process.env.KEAS_VAULT_SETUP_TOKEN || randomBytes(32).toString('base64url');
   const extraHosts = (Array.isArray(publicHosts) ? publicHosts : [publicHosts]).filter(Boolean).map((x) => String(x).toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, ''));
   const fixedHubUrl = checkHubUrl(hubUrl);
   const h = openDb(dbFile);
@@ -214,7 +219,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
   route('GET', '/v1/me', ({ me, org }) => ({ mode: vaultMode ? 'vault' : 'org', person: publicPerson(me, me, org), certs: certsOf(me.id), org: { id: org.id, name: org.name, state: org.state, tz: org.tz, lateThresholdMin: org.lateThresholdMin, workweekStart: org.workweekStart }, period: { current: currentPeriod(org), lastCompleted: lastCompleted(org) } }));
 
   route('GET', '/v1/org', ({ me, org }) => {
-    const people = h.all('SELECT * FROM people WHERE org_id = ? ORDER BY name', org.id).map(rowToPerson);
+    const people = byName(h.all('SELECT * FROM people WHERE org_id = ?', org.id).map(rowToPerson));
     return {
       org: { id: org.id, name: org.name, state: org.state, tz: org.tz, lateThresholdMin: org.lateThresholdMin, workweekStart: org.workweekStart, payFrequency: org.payFrequency, payPeriodAnchor: org.payPeriodAnchor, futaExempt: org.futaExempt, sutaRate: org.sutaRate },
       positions: positionsOf(org.id), certTypes: certTypesOf(org.id),
@@ -501,6 +506,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     localSignIn: typeof localSignIn === 'function' ? localSignIn : () => !!localSignIn,
     // This PC's own Hub's public key (from the KeaS app, when this PC is the Hub): the Hub must prove it holds it.
     hubTrustKeys: typeof hubTrustKeys === 'function' ? hubTrustKeys : () => hubTrustKeys,
+    setupToken: vaultSetupToken,
     uid: (p) => `${p}-${randomUUID()}`, today: (org) => localDate(now(), org.tz),
     getPerson, getShift, loadOrg, rulesFor, tablesFor, computeTimecard, positionsOf,
     periodOf, currentPeriod, lastCompleted, parsePeriod, newSession, sessionCookie,
@@ -609,7 +615,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
   }
   const ownOrigins = () => new Set([...localHosts().map((x) => `http://${x}`), ...extraHosts.map((x) => `https://${x}`)]);
   return {
-    server, h, vault,
+    server, h, vault, setupToken: vaultSetupToken,
     /**
      * The Kea Hub's current signing key next to the one payroll trusts: fingerprints to compare, and why a key changes.
      * The KeaS app shows this before the owner accepts a new key (repinHub).
@@ -648,4 +654,5 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const app = createApp({ demo: process.argv.includes('--demo') || process.env.KEAS_DEV_DEMO === '1' });
   const port = await app.listen();
   console.log(`KeaS workforce server ${VERSION} on http://${HOST}:${port}`);
+  if (app.setupToken && !app.vault.initialized()) console.log(`To set up this vault, open http://${HOST}:${port}/payroll#setup=${app.setupToken}`);
 }

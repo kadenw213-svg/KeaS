@@ -1,6 +1,7 @@
 // Time off and leave: accrual policies, balances (a ledger), time-off requests through approvals, holiday calendars,
 // and FMLA / state leave cases. Eligibility is shown as facts; a person makes the leave decision.
 import { addDays, dayNum, localDate } from '../lib/time.mjs';
+import { byName } from '../db.mjs';
 import { pairPunches } from '../lib/rules.mjs';
 
 export const rowToPolicy = (r) => ({
@@ -161,7 +162,7 @@ export function registerLeave(c) {
   route('GET', '/v1/pto/balances', ({ me, org, query }) => {
     const pid = query.personId ? V.id(query.personId, 'personId') : null;
     if (pid !== me.id) need(me, 'manager', 'payroll');
-    const people = pid ? [c.getPerson(pid, org.id)] : h.all(`SELECT id FROM people WHERE org_id = ? AND status != 'terminated' ORDER BY name`, org.id).map((r) => c.getPerson(r.id, org.id));
+    const people = pid ? [c.getPerson(pid, org.id)] : byName(h.all(`SELECT id, name FROM people WHERE org_id = ? AND status != 'terminated'`, org.id)).map((r) => c.getPerson(r.id, org.id));
     return {
       people: people.map((p) => ({
         id: p.id, name: p.name,

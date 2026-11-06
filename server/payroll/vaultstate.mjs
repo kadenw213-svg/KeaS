@@ -12,7 +12,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { createVaultMeta, openVault, seal, unseal, isSealed, isSealedV1, unsealV1, sealContext, VaultDamaged, SealError } from '../lib/vault.mjs';
-import { SEALED_COLUMNS } from './schema.mjs';
+import { SEALED_COLUMNS, SEALED_LATER } from './schema.mjs';
 
 export { VaultDamaged, SealError };
 export class VaultLocked extends Error { constructor() { super('The payroll vault is locked. Sign in with the vault passphrase.'); } }
@@ -23,7 +23,7 @@ const V1_VALUE_COLUMNS = new Set(['people.pay_rate_cents', 'people.birthdate', '
   'payrun_lines.withheld', 'payrun_lines.employer_total', 'payrun_lines.detail']);
 const colName = ([t, , c]) => `${t}.${c}`;
 // Every column sealed when values were first bound to their rows: a vault this new never upgrades them from plaintext.
-const BASE_SEALED = new Set(SEALED_COLUMNS.map(colName));
+const BASE_SEALED = new Set(SEALED_COLUMNS.map(colName).filter((n) => !SEALED_LATER.includes(n)));
 const COLUMNS_CTX = 'keas-payroll-sealed-columns';
 
 export function makeVault(h) {

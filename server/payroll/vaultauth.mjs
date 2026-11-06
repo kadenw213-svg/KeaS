@@ -11,8 +11,10 @@
 //   The counts are kept in the vault's database, so restarting the vault doesn't reset them.
 // - The vault locks itself (key wiped from memory, everyone signed out) after a quiet spell (15 minutes unless the
 //   settings say otherwise), and a sign-in lasts 2 hours at most.
+import { timingSafeEqual, createHash } from 'node:crypto';
 import { hashLocalPassword, checkLocalPassword } from '../lib/vault.mjs';
-import { HubUnreachable, HubRefused, ISSUER } from './hub.mjs';
+import { byName } from '../db.mjs';
+import { HubUnreachable, HubRefused, ISSUER, keyFingerprint } from './hub.mjs';
 import { addDays, weekStartOf } from '../lib/time.mjs';
 
 /** Where wrong-try counts live: in memory (tests), or a table (the vault: survives restarts). */
@@ -135,9 +137,39 @@ export function registerVaultAuth(c) {
     return user;
   }
 
+  // Setting up: only from the KeaS app's own payroll window, which got the one-time token when the app started this
+  // server. Anything else on this PC that finds the port before the owner does can't claim the empty vault.
+  const sameSecret = (a, b) => timingSafeEqual(createHash('sha256').update(String(a ?? '')).digest(), createHash('sha256').update(String(b ?? '')).digest());
+  const checkSetupToken = (given) => { if (c.setupToken && !sameSecret(given, c.setupToken)) throw new HttpError(403, 'Set up payroll from the Payroll window in the KeaS app on this computer.'); };
+
+  /**
+   * The key to send the password to on first setup. The Hub on this PC: its own key file (c.hubTrustKeys). A Hub on
+   * another PC: the key whose fingerprint the owner was shown and confirmed (GET /v1/vault/setup-hub-key). A Hub
+   * offering any other key gets neither the password nor the code.
+   */
+  async function setupTrust(confirmed) {
+    const own = c.hubTrustKeys?.();
+    if (own?.length) return own;
+    if (!c.setupToken) return null;
+    const want = String(confirmed ?? '').toUpperCase().trim();
+    if (!want) throw new HttpError(409, 'Compare the Kea Hub’s key fingerprint with the one on the Hub’s PC and confirm it first.', { confirmHubKey: true });
+    const keys = await hub.fetchKeys(hubUrl()).catch((e) => { throw hubError(e, null); });
+    if (keyFingerprint(keys) !== want) throw new HttpError(409, 'The Kea Hub is now offering a different key from the one you confirmed. Nothing was sent to it; check the fingerprint again.', { confirmHubKey: true, hubKeyChanged: true });
+    return keys;
+  }
+  route('GET', '/v1/vault/setup-hub-key', async ({ query }) => {
+    if (c.mode !== 'vault') throw new HttpError(404, 'not found');
+    if (vault.initialized()) throw new HttpError(409, 'This vault is already set up.');
+    checkSetupToken(query.token);
+    if (!hubUrl()) throw new HttpError(409, 'No Kea Hub is set for payroll on this computer.');
+    if (c.hubTrustKeys?.()?.length) return { url: hubUrl(), ownHub: true, fingerprint: keyFingerprint(c.hubTrustKeys()) };
+    try { return { url: hubUrl(), ownHub: false, fingerprint: keyFingerprint(await hub.fetchKeys(hubUrl())) }; } catch (e) { throw hubError(e, null); }
+  }, { auth: false, open: true });
+
   route('POST', '/v1/vault/setup', async ({ body, secure }) => {
     if (c.mode !== 'vault') throw new HttpError(404, 'not found');
     if (vault.initialized()) throw new HttpError(409, 'This vault is already set up. Sign in instead.');
+    checkSetupToken(body.setupToken);
     if (body.hubUrl !== undefined) bad('The Kea Hub for payroll is set in the KeaS app on this computer, not here.');
     const passphrase = V.str(body.passphrase, 'passphrase', { min: 12, max: 500 });
     const o = body.org || {}, a = body.admin || {}, s = body.signIn || {};
@@ -151,7 +183,8 @@ export function registerVaultAuth(c) {
     let hubSub = null, localPw = null, keys = null;
     if (mode === 'hub') {
       let who;
-      try { who = await hub.signIn(hubUrl(), { email, password: String(s.password ?? ''), code: s.code ? String(s.code) : undefined }, { trust: c.hubTrustKeys?.() }); }
+      const trust = await setupTrust(s.hubKeyFingerprint);
+      try { who = await hub.signIn(hubUrl(), { email, password: String(s.password ?? ''), code: s.code ? String(s.code) : undefined }, { trust }); }
       catch (e) { if (e instanceof HubRefused && (e.status === 401 || e.status === 403)) throw new HttpError(401, e.message); throw hubError(e, null); }
       if (who.email !== email) bad('That Kea Hub account has a different email.');
       if (!who.emailVerified) throw new HttpError(403, 'Verify your email address in your Kea Hub account first, then set up payroll.');
@@ -235,7 +268,7 @@ export function registerVaultAuth(c) {
 
   route('GET', '/v1/vault/users', ({ me, org }) => {
     need(me, 'owner', 'payroll');
-    return { users: h.all('SELECT v.*, p.name FROM vault_users v JOIN people p ON p.id = v.person_id WHERE p.org_id = ? ORDER BY p.name', org.id).map((u) => ({ id: u.id, personId: u.person_id, name: u.name, email: u.email, hubLinked: !!u.hub_sub, localPassword: !!u.local_pw, lastLogin: u.last_login })), hubUrl: hubUrl(), localSignIn: localOn(), hubKeyPinned: !!pin() };
+    return { users: byName(h.all('SELECT v.*, p.name FROM vault_users v JOIN people p ON p.id = v.person_id WHERE p.org_id = ?', org.id)).map((u) => ({ id: u.id, personId: u.person_id, name: u.name, email: u.email, hubLinked: !!u.hub_sub, localPassword: !!u.local_pw, lastLogin: u.last_login })), hubUrl: hubUrl(), localSignIn: localOn(), hubKeyPinned: !!pin() };
   });
   route('POST', '/v1/vault/users', ({ me, org, body }) => {
     need(me, 'owner');

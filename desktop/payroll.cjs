@@ -52,7 +52,9 @@ function createPayroll({ getConfig, setConfig, userData, root, hubPort, log = ()
       const pub = hubPublicKey(c.dataDir);
       return pub ? [{ kty: 'OKP', crv: 'Ed25519', x: pub.export({ format: 'jwk' }).x }] : null;
     };
-    server = createApp({ dbFile: path.join(dir(), 'payroll-vault.db'), vault: true, hubUrl: hubUrl(), localSignIn, hubTrustKeys, log: false });
+    // setupToken: only this app's payroll window gets it (in the address's fragment, which never reaches a server or a
+    // log), so nothing else on this PC can claim an empty vault by reaching the port first.
+    server = createApp({ dbFile: path.join(dir(), 'payroll-vault.db'), vault: true, hubUrl: hubUrl(), localSignIn, hubTrustKeys, log: false, setupToken: crypto.randomBytes(32).toString('base64url') });
     port = await server.listen(0);
     log('payroll vault started', dir());
     return port;
@@ -85,7 +87,7 @@ function createPayroll({ getConfig, setConfig, userData, root, hubPort, log = ()
     win.webContents.setWindowOpenHandler(({ url }) => { if (/^https?:/.test(url) && !url.startsWith(origin)) shell.openExternal(url); return { action: 'deny' }; });
     win.webContents.on('will-navigate', (e, url) => { if (!url.startsWith(origin + '/')) e.preventDefault(); });
     win.on('closed', () => { win = null; stop(); });
-    await win.loadURL(`${origin}/payroll`);
+    await win.loadURL(`${origin}/payroll${server.vault.initialized() ? '' : `#setup=${server.setupToken}`}`);
     return true;
   }
   /** The payroll settings only this app can change. */

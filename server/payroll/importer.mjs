@@ -175,7 +175,7 @@ export function registerImport(c) {
   route('POST', '/v1/import/commit', ({ me, org, body }) => {
     need(me, 'payroll');
     const p = prep(body);
-    const result = { created: 0, updated: 0, skipped: 0, errors: [] };
+    const result = { created: 0, updated: 0, skipped: 0, raises: 0, errors: [] };
     const year = Number(body.year ?? today(org).slice(0, 4));
     const asOf = V.date(body.asOf ?? today(org), 'asOf');
     h.tx(() => {
@@ -185,7 +185,7 @@ export function registerImport(c) {
         let person = findPerson(org.id, r);
         if (person && person.id === me.id && !me.roles.includes('owner') && p.kind !== 'hours') { result.skipped++; result.errors.push({ row: i + 2, problems: ['this row is you: your own pay, deposit and year-to-date amounts are changed by the owner'] }); return; }
         if (p.kind === 'employees') {
-          let deptId = null;
+          let deptId = null, rateHeld = false;
           if (r.department) {
             deptId = h.get('SELECT id FROM departments WHERE org_id = ? AND lower(name) = lower(?)', org.id, r.department)?.id;
             if (!deptId) { deptId = uid('dp'); h.run('INSERT INTO departments (id,org_id,name) VALUES (?,?,?)', deptId, org.id, r.department); }
@@ -199,12 +199,21 @@ export function registerImport(c) {
           } else {
             const cur = c.getPerson(person.id, org.id);
             c.writePersonSets(person.id, c.applyProfile(cur, { ...fields, w4: fields.w4 ? { ...cur.w4, ...fields.w4, filing: fields.w4.filing } : undefined }, me, org));
-            if (r.payRate != null && !h.get('SELECT 1 FROM pay_rates WHERE person_id = ? AND position_id IS NULL', person.id)) h.run('INSERT INTO pay_rates (id,person_id,position_id,kind,rate_cents,effective_from,label,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)', uid('rt'), person.id, null, r.payType || 'hourly', r.payRate, r.hireDate || asOf, 'Imported', me.id, iso(now()));
+            if (r.payRate != null && !h.get('SELECT 1 FROM pay_rates WHERE person_id = ? AND position_id IS NULL', person.id)) {
+              // The same rule as adding a rate by hand: higher or back-dated goes through the raise approval, unless the owner imports it.
+              const kind = r.payType || 'hourly', from = r.hireDate || asOf;
+              const { higher, backdated } = c.rateCheck(org, cur, null, kind, r.payRate, from);
+              if ((higher || backdated) && !me.roles.includes('owner')) {
+                c.requestRaise({ org, me, p: cur, positionId: null, effectiveDate: from, newRate: r.payRate, kind, reason: higher ? 'Imported rate above the current one' : 'Imported back-dated rate' });
+                rateHeld = true;
+                result.raises++;
+              } else h.run('INSERT INTO pay_rates (id,person_id,position_id,kind,rate_cents,effective_from,label,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)', uid('rt'), person.id, null, kind, r.payRate, from, 'Imported', me.id, iso(now()));
+            }
             result.updated++;
           }
           if (deptId) h.run('UPDATE people SET department_id = ? WHERE id = ?', deptId, person.id);
           if (r.routing && r.account) h.run('UPDATE people SET deposit = ? WHERE id = ?', vault.sealJson({ accounts: [{ routing: r.routing, account: r.account, accountType: r.accountType, remainder: true }] }), person.id);
-          if (r.payRate != null && (r.payType || 'hourly') === 'hourly') h.run('UPDATE people SET pay_rate_cents = COALESCE(pay_rate_cents, ?) WHERE id = ?', r.payRate, person.id);
+          if (r.payRate != null && !rateHeld && (r.payType || 'hourly') === 'hourly') h.run('UPDATE people SET pay_rate_cents = COALESCE(pay_rate_cents, ?) WHERE id = ?', r.payRate, person.id);
         } else if (!person) { result.skipped++; result.errors.push({ row: i + 2, problems: [`no match for ${r.name || r.employeeNumber || r.email}`] }); return; }
         else if (p.kind === 'ytd') {
           h.run('DELETE FROM ytd_imports WHERE person_id = ? AND year = ? AND source = ?', person.id, year, p.source);

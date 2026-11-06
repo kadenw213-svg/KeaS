@@ -164,6 +164,9 @@ export function openDb(file = DEFAULT_DB) {
 
 const J = (s, d) => { try { return s == null ? d : JSON.parse(s); } catch { return d; } };
 
+/** People's names are sealed, so SQL can't sort by them: rows with a name sorted in code (the same order every time). */
+export const byName = (rows) => rows.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+
 export function rowToPerson(r) {
   if (!r) return null;
   return {

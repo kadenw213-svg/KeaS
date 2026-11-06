@@ -147,6 +147,7 @@ export function Import() {
         <div className="card" style={{ marginTop: 14 }}>
           <strong>
             {result.created} added · {result.updated} updated · {result.skipped} skipped
+            {result.raises ? ` · ${result.raises} rate${result.raises === 1 ? '' : 's'} sent for raise approval` : ''}
           </strong>
           {result.errors.map((e: any, i: number) => (
             <p key={i} className="small muted">

@@ -67,7 +67,7 @@ before(async () => {
   hubKey = key;
   hubServer = fakeHub();
   hubBase = await listen(hubServer);
-  app = createApp({ dbFile: join(dir, 'vault.db'), log: false, vault: true, hubUrl: hubBase, localSignIn: () => localOn });
+  app = createApp({ dbFile: join(dir, 'vault.db'), log: false, vault: true, setupToken: false, hubUrl: hubBase, localSignIn: () => localOn });
   base = `http://127.0.0.1:${await app.listen(0)}`;
 });
 after(async () => { await app.close(); hubServer.close(); rmSync(dir, { recursive: true, force: true }); });
@@ -284,7 +284,7 @@ test('M2: wrong tries by anyone else never lock out the payroll admin who signs 
 test('M3: pay amounts, birthdates and emails are sealed in the database file; the app reads them as usual', async () => {
   // A fresh vault (the one above is rate-limited now).
   const d = mkdtempSync(join(tmpdir(), 'keas-vault-m3-'));
-  const a2 = createApp({ dbFile: join(d, 'payroll-vault.db'), log: false, vault: true, hubUrl: hubBase });
+  const a2 = createApp({ dbFile: join(d, 'payroll-vault.db'), log: false, vault: true, setupToken: false, hubUrl: hubBase });
   const b2 = `http://127.0.0.1:${await a2.listen(0)}`;
   const c2 = async (method, path, t, body) => { const r = await fetch(b2 + path, { method, headers: { 'content-type': 'application/json', ...(t ? { authorization: `Bearer ${t}` } : {}) }, body: body === undefined ? undefined : JSON.stringify(body) }); return { status: r.status, body: await r.json() }; };
   try {
@@ -304,13 +304,13 @@ test('M3: pay amounts, birthdates and emails are sealed in the database file; th
   try {
     // The file itself (and its write-ahead log): sealed values only, no plaintext anywhere.
     const db = new DatabaseSync(join(d, 'payroll-vault.db'), { readOnly: true });
-    const row = db.prepare(`SELECT email, birthdate, pay_rate_cents, ytd_wages_cents FROM people WHERE name = 'Alice Employee'`).get();
+    const row = db.prepare(`SELECT name, email, birthdate, pay_rate_cents, ytd_wages_cents FROM people WHERE roles NOT LIKE '%owner%'`).get();
     for (const [k, v] of Object.entries(row)) assert.ok(isSealed(v), `${k} is sealed`);
     for (const r of db.prepare('SELECT rate_cents FROM pay_rates').all()) assert.ok(isSealed(r.rate_cents));
     assert.ok(db.prepare('SELECT COUNT(*) AS n FROM pay_rates').get().n >= 1);
     db.close();
     const raw = Buffer.concat(['payroll-vault.db', 'payroll-vault.db-wal'].map((f) => join(d, f)).filter(existsSync).map((f) => readFileSync(f)));
-    for (const needle of ['alice.home@example.net', '1990-04-17', '123-45-6701', '123456701']) assert.equal(raw.indexOf(Buffer.from(needle)), -1, `${needle} isn't in the file`);
+    for (const needle of ['Alice Employee', 'alice.home@example.net', '1990-04-17', '123-45-6701', '123456701']) assert.equal(raw.indexOf(Buffer.from(needle)), -1, `${needle} isn't in the file`);
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
@@ -402,7 +402,7 @@ test('M1: the organization server never writes its vault key next to the databas
 
 test('the vault works with real data: an employee’s SSN and bank are sealed; changing the passphrase re-encrypts', async () => {
   const d = mkdtempSync(join(tmpdir(), 'keas-vault-real-'));
-  const a2 = createApp({ dbFile: join(d, 'v.db'), log: false, vault: true, hubUrl: hubBase });
+  const a2 = createApp({ dbFile: join(d, 'v.db'), log: false, vault: true, setupToken: false, hubUrl: hubBase });
   const b2 = `http://127.0.0.1:${await a2.listen(0)}`;
   const c2 = async (method, path, t, body) => { const r = await fetch(b2 + path, { method, headers: { 'content-type': 'application/json', ...(t ? { authorization: `Bearer ${t}` } : {}) }, body: body === undefined ? undefined : JSON.stringify(body) }); return { status: r.status, body: await r.json() }; };
   const sign = (passphrase) => c2('POST', '/v1/vault/signin', null, { email: ACCOUNT.email, password: ACCOUNT.password, passphrase });
@@ -447,7 +447,7 @@ test('the vault works with real data: an employee’s SSN and bank are sealed; c
 test('L: vault sessions last 2 hours at most; a quiet vault locks itself (15 minutes by default, a setting) and wipes its key', async () => {
   const d = mkdtempSync(join(tmpdir(), 'keas-vault-idle-'));
   let clock = Date.now();
-  const a2 = createApp({ dbFile: join(d, 'v.db'), log: false, vault: true, hubUrl: hubBase, now: () => clock });
+  const a2 = createApp({ dbFile: join(d, 'v.db'), log: false, vault: true, setupToken: false, hubUrl: hubBase, now: () => clock });
   const b2 = `http://127.0.0.1:${await a2.listen(0)}`;
   const c2 = async (method, path, t, body, headers = {}) => { const r = await fetch(b2 + path, { method, headers: { 'content-type': 'application/json', ...(t ? { authorization: `Bearer ${t}` } : {}), ...headers }, body: body === undefined ? undefined : JSON.stringify(body) }); return { status: r.status, body: await r.json() }; };
   try {
@@ -490,7 +490,7 @@ test('L: vault sessions last 2 hours at most; a quiet vault locks itself (15 min
 test('L: wrong-passphrase counts survive a restart of the vault', async () => {
   const d = mkdtempSync(join(tmpdir(), 'keas-vault-limits-'));
   const file = join(d, 'v.db');
-  const open = async () => { const a = createApp({ dbFile: file, log: false, vault: true, hubUrl: hubBase }); return { a, b: `http://127.0.0.1:${await a.listen(0)}` }; };
+  const open = async () => { const a = createApp({ dbFile: file, log: false, vault: true, setupToken: false, hubUrl: hubBase }); return { a, b: `http://127.0.0.1:${await a.listen(0)}` }; };
   let { a, b } = await open();
   const c2 = async (method, path, body) => { const r = await fetch(b + path, { method, headers: { 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) }); return { status: r.status, body: await r.json() }; };
   try {
@@ -529,7 +529,7 @@ test('HIGH: setting up payroll on the Hub’s own PC: whatever answers on the Hu
   // Another program on the Hub's address: real-looking keys and tokens of its own, any password accepted.
   const fake = fakeHub({ accept: () => true, signer: () => otherKey, log: captured, up: () => true });
   const fakeBase = await listen(fake);
-  const a2 = createApp({ dbFile: join(d, 'v.db'), log: false, vault: true, hubUrl: fakeBase, hubTrustKeys: () => [{ kty: 'OKP', crv: 'Ed25519', x: key.jwk.x }] });
+  const a2 = createApp({ dbFile: join(d, 'v.db'), log: false, vault: true, setupToken: false, hubUrl: fakeBase, hubTrustKeys: () => [{ kty: 'OKP', crv: 'Ed25519', x: key.jwk.x }] });
   const b2 = `http://127.0.0.1:${await a2.listen(0)}`;
   try {
     const r = await fetch(b2 + '/v1/vault/setup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ passphrase: PASS, org: { name: 'Camp', state: 'TX' }, admin: { name: 'Pat Lee', email: ACCOUNT.email }, signIn: { password: ACCOUNT.password, code: '123456' } }) });

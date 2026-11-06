@@ -202,6 +202,8 @@ const ADD_COLUMNS = {
   ],
   // What an approval was given for (a pay run: a hash of its lines and totals); acting on something else is refused.
   approval_requests: [['bind_hash', 'TEXT']],
+  // Where a finalized line was paid (the deposit destinations its approval covered); the bank file is built from this.
+  payrun_lines: [['deposits', 'TEXT']],
 };
 
 export function migratePayroll(db) {
@@ -219,17 +221,18 @@ export function migratePayroll(db) {
  * these in SQL. A row's key must never change once the row is written.
  */
 export const SEALED = [
-  ['people', ['id'], ['pay_rate_cents', 'birthdate', 'email', 'ytd_wages_cents', 'deposit', 'pii_enc', 'legal_name']],
+  ['people', ['id'], ['name', 'pay_rate_cents', 'birthdate', 'email', 'ytd_wages_cents', 'deposit', 'pii_enc', 'legal_name']],
   ['orgs', ['id'], ['bank']],
   ['legal_entities', ['id'], ['bank_enc']],
   ['pay_rates', ['id'], ['rate_cents']],
-  ['raises', ['id'], ['old_rate_cents', 'new_rate_cents', 'retro_cents']],
+  ['raises', ['id'], ['old_rate_cents', 'new_rate_cents', 'retro_cents', 'reason']],
   ['offers', ['id'], ['rate_cents', 'body']],
   ['extra_earnings', ['id'], ['cents', 'detail']],
   ['payruns', ['id'], ['totals']],
-  ['payrun_lines', ['run_id', 'person_id'], ['gross', 'net', 'withheld', 'employer_total', 'detail']],
+  ['payrun_lines', ['run_id', 'person_id'], ['gross', 'net', 'withheld', 'employer_total', 'detail', 'deposits']],
   ['ytd_imports', ['id'], ['cents']],
-  ['contractor_payments', ['id'], ['cents']],
+  ['contractor_payments', ['id'], ['cents', 'memo']],
+  ['expenses', ['id'], ['amount_cents', 'description']],
   ['aca_months', ['person_id', 'year', 'month'], ['offer_code', 'contribution_cents', 'safe_harbor']],
   ['form_submissions', ['id'], ['data_enc']],
   ['i9_records', ['person_id'], ['section2_enc']],
@@ -244,6 +247,11 @@ export const SEALED = [
   ['reviews', ['id'], ['self_answers', 'manager_answers']],
   ['checkins', ['id'], ['notes', 'private_notes']],
 ];
+/**
+ * Columns sealed by a later KeaS than the first row-bound one. A vault that was already set up holds their plaintext
+ * until its next unlock seals it (vaultstate.mjs sealNewColumns). A column added to SEALED must be added here too.
+ */
+export const SEALED_LATER = ['people.name', 'raises.reason', 'payrun_lines.deposits', 'contractor_payments.memo', 'expenses.amount_cents', 'expenses.description'];
 /** Tables whose writes go on while the vault is locked (sign-in and lock events): their sealed values are dropped then. */
 export const SEALED_SOFT_TABLES = ['audit_log'];
 /** [table, keys, column] for every sealed column. */

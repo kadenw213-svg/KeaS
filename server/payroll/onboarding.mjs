@@ -5,6 +5,7 @@
 import { sha256, canonical } from '../lib/vault.mjs';
 import { addDays, weekday } from '../lib/time.mjs';
 import { toCsv } from '../lib/csv.mjs';
+import { byName } from '../db.mjs';
 import { simplePdf } from '../lib/pdf.mjs';
 import { validateW4, cleanAddress, validSsn, rateFor } from './paystructure.mjs';
 import { policiesFor, balance } from './leave.mjs';
@@ -246,7 +247,7 @@ export function registerOnboarding(c) {
   route('GET', '/v1/i9', ({ me, org }) => {
     need(me, 'payroll');
     const t = today(org);
-    const people = h.all(`SELECT id, name, hire_date, status FROM people WHERE org_id = ? AND worker_type = 'employee' AND status != 'terminated' ORDER BY name`, org.id);
+    const people = byName(h.all(`SELECT id, name, hire_date, status FROM people WHERE org_id = ? AND worker_type = 'employee' AND status != 'terminated'`, org.id));
     return {
       people: people.map((p) => {
         const r = h.get('SELECT * FROM i9_records WHERE person_id = ?', p.id);

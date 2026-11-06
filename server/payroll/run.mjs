@@ -13,6 +13,7 @@ import { rateFor, rowToDiff, diffApplies, depositAccounts, splitNet } from './pa
 import { allocationFor, DEFAULT_GL } from './orgstructure.mjs';
 import { policiesFor, balance, accrualFor, postAccruals, holidaysFor, ptoInPeriod } from './leave.mjs';
 import { sha256, canonical } from '../lib/vault.mjs';
+import { byName } from '../db.mjs';
 
 const J = (s, d) => { try { return s == null ? d : JSON.parse(s); } catch { return d; } };
 const $ = (cents) => (cents < 0 ? '-' : '') + '$' + (Math.abs(cents) / 100).toFixed(2);
@@ -21,11 +22,21 @@ export const PERIODS_PER_YEAR = { weekly: 52, biweekly: 26, semimonthly: 24, mon
 
 /**
  * What a pay-run approval is given for: a hash of the period, every line (pay, taxes, hours, earnings, accounts it
- * goes to) and the totals. Timecard sign-off and time-off balances aren't part of it. Finalizing recomputes the run
- * and refuses when this differs from the approved one.
+ * goes to), each person's direct deposit destinations (routing, account, type and the amount to each) and the totals.
+ * Timecard sign-off and time-off balances aren't part of it. Finalizing recomputes the run and refuses when this
+ * differs from the approved one, so a deposit account changed after approval needs approving again.
  */
 export function payrunHash(pr) {
-  return sha256(canonical({ period: pr.period, payDate: pr.payDate, totals: pr.totals, lines: pr.lines.map(({ approved, flags, balances, ...l }) => l) }));
+  const deposits = pr.lines.map((l) => [l.personId, (pr.deposits?.get?.(l.personId) ?? []).map((a) => [a.routing, a.account, a.accountType, a.cents])]);
+  return sha256(canonical({ period: pr.period, payDate: pr.payDate, totals: pr.totals, lines: pr.lines.map(({ approved, flags, balances, ...l }) => l), deposits }));
+}
+
+/** Where a pay run's lines are paid, by person: kept off the JSON a preview returns (full account numbers). */
+export const DEPOSITS = Symbol('deposits');
+/** A net amount split across a person's deposit accounts: [{ routing, account, accountType, cents }]. */
+export function depositSplit(net, accounts) {
+  if (!(net > 0) || !accounts?.length) return [];
+  return splitNet(net, accounts).map((a) => ({ routing: String(a.routing), account: String(a.account), accountType: a.accountType || 'checking', cents: a.cents }));
 }
 
 /** Split an integer total across weights so the parts add up exactly (largest remainder). */
@@ -254,10 +265,10 @@ export function registerRun(c) {
     const year = Number(addDays(period.end, 6).slice(0, 4));
     const T = tablesFor(org.state, year);
     const rules = c.rulesFor(org);
-    const all = h.all(`SELECT * FROM people WHERE org_id = ? AND status IN ('active','leave','terminated') AND worker_type = 'employee' ORDER BY name`, org.id).map((r) => c.getPerson(r.id, org.id))
+    const all = byName(h.all(`SELECT * FROM people WHERE org_id = ? AND status IN ('active','leave','terminated') AND worker_type = 'employee'`, org.id)).map((r) => c.getPerson(r.id, org.id))
       .filter((p) => p.status !== 'terminated' || (p.termDate && p.termDate >= period.start) || h.get(`SELECT 1 FROM extra_earnings WHERE person_id = ? AND status = 'pending'`, p.id));
     const employeeCount = all.filter((p) => p.status !== 'terminated').length;
-    const lines = [], warnings = [];
+    const lines = [], warnings = [], deposits = new Map();
     if (!T.verified) warnings.push({ code: 'unverified_tables', message: `The tax and labor tables haven’t been verified for ${year} yet, so this pay run can be reviewed but not finalized.` });
     if (!T.state) warnings.push({ code: 'no_state_table', message: `There is no ${org.state} tax table, so state taxes aren’t calculated.` });
     if (org.futaExempt) warnings.push({ code: 'futa_exempt', message: 'Org is marked FUTA-exempt (501(c)(3)); FUTA shows $0.' });
@@ -271,7 +282,9 @@ export function registerRun(c) {
       if (!tc.approved && tc.totals.workedMin > 0) warnings.push({ code: 'timecard_not_approved', personId: p.id, message: `${p.name}: timecard not approved` });
       if (tc.flags.some((f) => f.code === 'missed_punch')) warnings.push({ code: 'missed_punch', personId: p.id, message: `${p.name}: missed punch in this period (hours may be short)` });
       if (tc.pendingRequests) warnings.push({ code: 'pending_requests', personId: p.id, message: `${p.name}: ${tc.pendingRequests} punch request(s) still pending` });
-      if (!depositAccounts(vault.openJson(p.depositRaw)).length) warnings.push({ code: 'no_deposit', personId: p.id, message: `${p.name}: no direct deposit account (pay by check)` });
+      const accts = depositAccounts(vault.openJson(p.depositRaw));
+      deposits.set(p.id, depositSplit(line.net, accts));
+      if (!accts.length) warnings.push({ code: 'no_deposit', personId: p.id, message: `${p.name}: no direct deposit account (pay by check)` });
       if (!vault.openJson(p.piiRaw)?.ssn) warnings.push({ code: 'no_ssn', personId: p.id, message: `${p.name}: no SSN on file` });
       if (mw?.standard != null && !line.salaried) {
         const age = p.birthdate ? ageOn(p.birthdate, period.end) : 99;
@@ -290,11 +303,12 @@ export function registerRun(c) {
     const unapproved = lines.filter((l) => !l.approved && l.hours.regular + l.hours.overtime > 0);
     if (unapproved.length) blockers.push(`${unapproved.length} timecard(s) aren’t approved.`);
     if (needsApproval && ap?.status !== 'approved') blockers.push(ap ? 'The pay run approval isn’t finished.' : 'The pay run needs approval first.');
-    const hash = payrunHash({ period, payDate: addDays(period.end, 6), totals, lines });
+    const hash = payrunHash({ period, payDate: addDays(period.end, 6), totals, lines, deposits });
     const changedSinceApproval = needsApproval && ap?.status === 'approved' && ap.bindHash !== hash;
-    if (changedSinceApproval) blockers.push('The pay run changed after approval (hours, rates, earnings or people are different now), so it needs approving again. Submit it for approval again.');
+    if (changedSinceApproval) blockers.push('The pay run changed after approval (hours, rates, earnings, deposit accounts or people are different now), so it needs approving again. Submit it for approval again.');
     if (finalized) blockers.push('This period is already finalized.');
     return {
+      [DEPOSITS]: deposits,
       period, payDate: addDays(period.end, 6), units: 'cents', year, unverified: !T.verified, tablesVerified: T.verified, canFinalize: blockers.length === 0, blockers,
       tables: T.list, lines, totals, warnings, finalized: finalized ? { id: finalized.id, at: finalized.finalized_at, by: finalized.finalized_by } : null,
       approval: ap ? { id: ap.id, status: ap.status, changedSinceApproval } : null, needsApproval, hash,
@@ -302,12 +316,18 @@ export function registerRun(c) {
   }
   c.payrun = payrun;
 
-  /** Lines of a finalized run, or the live preview when the period isn't finalized. */
+  /**
+   * Lines of a finalized run, or the live preview when the period isn't finalized. deposits: where each line is paid,
+   * by person; for a finalized run, the destinations sealed with it when it was finalized (never today's accounts).
+   */
   function runLines(org, period) {
     const run = h.get(`SELECT * FROM payruns WHERE org_id = ? AND period_start = ? AND status = 'finalized'`, org.id, period.start);
-    if (run) return { run, lines: h.all('SELECT * FROM payrun_lines WHERE run_id = ?', run.id).map((l) => J(l.detail, {})), payDate: run.pay_date, finalized: true };
+    if (run) {
+      const rows = h.all('SELECT person_id, detail, deposits FROM payrun_lines WHERE run_id = ?', run.id);
+      return { run, lines: rows.map((l) => J(l.detail, {})), deposits: new Map(rows.map((l) => [l.person_id, l.deposits == null ? null : J(l.deposits, null)])), payDate: run.pay_date, finalized: true };
+    }
     const pr = payrun(org, period);
-    return { run: null, lines: pr.lines, payDate: pr.payDate, finalized: false };
+    return { run: null, lines: pr.lines, deposits: pr[DEPOSITS], payDate: pr.payDate, finalized: false };
   }
   c.runLines = runLines;
 
@@ -342,7 +362,8 @@ export function registerRun(c) {
       h.run(`INSERT INTO payruns (id,org_id,period_start,period_end,pay_date,status,finalized_by,finalized_at,totals,tables,approval_id) VALUES (?,?,?,?,?,'finalized',?,?,?,?,?)`,
         id, org.id, period.start, period.end, pr.payDate, me.id, isoNow(now()), JSON.stringify(pr.totals), JSON.stringify(pr.tables), pr.approval?.id ?? null);
       for (const l of pr.lines) {
-        h.run('INSERT INTO payrun_lines (run_id,person_id,entity_id,gross,net,withheld,employer_total,detail) VALUES (?,?,?,?,?,?,?,?)', id, l.personId, l.entityId, l.gross, l.net, l.withheld, l.employerTotal, JSON.stringify(l));
+        // The deposit destinations the approval covered are sealed with the line; the bank file is built from them.
+        h.run('INSERT INTO payrun_lines (run_id,person_id,entity_id,gross,net,withheld,employer_total,detail,deposits) VALUES (?,?,?,?,?,?,?,?,?)', id, l.personId, l.entityId, l.gross, l.net, l.withheld, l.employerTotal, JSON.stringify(l), JSON.stringify(pr[DEPOSITS].get(l.personId) ?? []));
         for (const e of l.earnings) if (e.extraId) h.run(`UPDATE extra_earnings SET status = 'paid', paid_run_id = ? WHERE id = ?`, id, e.extraId);
       }
       h.run(`UPDATE expenses SET status = 'reimbursed' WHERE earning_id IN (SELECT id FROM extra_earnings WHERE paid_run_id = ?)`, id);
@@ -362,7 +383,9 @@ export function registerRun(c) {
   route('GET', '/v1/payrun/nacha', ({ me, org, query }) => {
     need(me, 'payroll');
     const period = c.parsePeriod(org, query.periodStart, c.lastCompleted(org));
-    const { lines, payDate, finalized } = runLines(org, period);
+    const { lines, deposits, payDate, finalized } = runLines(org, period);
+    // With a pay-run approval set up, a bank file only comes from the finalized run that approval covered.
+    if (!finalized && approvals.configured(org.id, 'payrun')) throw new HttpError(409, 'Pay runs here need approval, so the bank file is available once this run is approved and finalized.');
     const entityId = query.entityId || null;
     const ent = entityId ? h.get('SELECT * FROM legal_entities WHERE id = ? AND org_id = ?', entityId, org.id) : h.get('SELECT * FROM legal_entities WHERE org_id = ? AND bank_enc IS NOT NULL ORDER BY is_default DESC LIMIT 1', org.id);
     if (entityId && !ent) throw new HttpError(404, 'entity not found');
@@ -371,10 +394,14 @@ export function registerRun(c) {
     const entries = [], skipped = [];
     for (const l of lines) {
       if (ent && entityId && l.entityId !== ent.id) continue;
-      const p = h.get('SELECT deposit FROM people WHERE id = ?', l.personId);
-      const accts = depositAccounts(vault.openJson(p?.deposit));
-      if (!accts.length || l.net <= 0) { if (l.net > 0) skipped.push({ personId: l.personId, name: l.name, reason: 'no deposit account' }); continue; }
-      for (const a of splitNet(l.net, accts)) entries.push({ name: l.name, id: l.personId, routing: a.routing, account: a.account, accountType: a.accountType, amountCents: a.cents });
+      if (l.net <= 0) continue;
+      // A finalized run pays the accounts sealed with it (what was approved); today's deposit settings never count.
+      const split = deposits.get(l.personId);
+      if (split == null) { skipped.push({ personId: l.personId, name: l.name, reason: finalized ? 'this run was finalized before KeaS kept its deposit accounts with it: pay by check or build the bank file by hand' : 'no deposit account' }); continue; }
+      if (!split.length) { skipped.push({ personId: l.personId, name: l.name, reason: 'no deposit account' }); continue; }
+      const sum = split.reduce((a, x) => a + x.cents, 0);
+      if (sum !== l.net) { skipped.push({ personId: l.personId, name: l.name, reason: 'the stored deposit amounts don’t add up to the net pay' }); continue; }
+      for (const a of split) entries.push({ name: l.name, id: l.personId, routing: a.routing, account: a.account, accountType: a.accountType, amountCents: a.cents });
     }
     const file = buildNacha({ company: { name: bank.name || org.name, id: bank.companyId, originRouting: bank.originRouting, destinationRouting: bank.destinationRouting || bank.originRouting, destinationName: bank.destinationName || '' }, entries, effectiveDate: new Date(payDate + 'T12:00:00Z'), now: new Date(now()) });
     audit(org.id, me.id, 'nacha_file', period.start, { entries: file.entryCount, finalized });
