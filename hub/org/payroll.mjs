@@ -41,8 +41,10 @@ const abaOk = (r) => {
   const d = [...r].map(Number);
   return (3 * (d[0] + d[3] + d[6]) + 7 * (d[1] + d[4] + d[7]) + (d[2] + d[5] + d[8])) % 10 === 0;
 };
+// The Hub's own record ids: about 1 in 100 random UUIDs holds nine digits in a row between letters, which isn't an SSN.
+const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
 export function payrollValue(v) {
-  const s = fold(v).replace(/[‐-―−]/g, '-');
+  const s = fold(v).replace(/[‐-―−]/g, '-').replace(UUID, ' ');
   if (SSN.test(s)) return true;
   for (const m of s.matchAll(ROUTING_THEN_ACCOUNT)) if (abaOk(m[1])) return true;
   return false;

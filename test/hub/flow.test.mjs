@@ -157,6 +157,14 @@ test('M-L: a connection that says nothing is closed; a slow download and a trick
     assert.ok(await until(async () => (await stats()).slowDropped >= 1, 10_000), 'slow reader dropped');
     reader.destroy();
 
+    // One that keeps reading, but only a trickle, is dropped too.
+    const seen = (await stats()).slowDropped;
+    const trickler = raw(`GET /v1/files/big.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${a.token}\r\nCf-Connecting-Ip: 198.51.100.22\r\n\r\n`, { paused: true });
+    const sip = setInterval(() => trickler.read(1024), 100);
+    assert.ok(await until(async () => (await stats()).slowDropped > seen, 10_000), 'trickling reader dropped');
+    clearInterval(sip);
+    trickler.destroy();
+
     const before = (await stats()).slowDropped;
     const up = raw(`PUT /v1/files/trickle.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${a.token}\r\nCf-Connecting-Ip: 198.51.100.21\r\nContent-Length: ${1024 * 1024}\r\n\r\n`);
     const drip = setInterval(() => { if (!up.destroyed) up.write(Buffer.alloc(100)); }, 50);

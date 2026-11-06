@@ -495,7 +495,8 @@ export function createHub({
     if (!who) return;
     dayAdd(`out:${who}`, bytes);
     const rate = (Math.max(1, limitsNow().maxSendMbps) * 1e6) / 8 / Math.max(1, activeSenders.size);
-    const wait = buckets.spend(`egress:${who}`, rate, F.smallEgressBurstBytes, Date.now(), bytes);
+    // (Its own count: a big download just finished mustn't hold up the next sync file.)
+    const wait = buckets.spend(`small:${who}`, rate, F.smallEgressBurstBytes, Date.now(), bytes);
     if (wait > 0) await sleep(Math.min(wait, 10_000));
   }
   /** Sends a Buffer or a readable stream (headers already written), paced; `who` is the account it counts for. */
@@ -2534,6 +2535,8 @@ export function createHub({
     } catch (e) {
       if (e instanceof HttpError) { status = e.status; payload = { error: e.message, ...(e.extra || {}) }; }
       else if (e?.busy) { status = 503; payload = { error: e.message, retryAfter: e.retryAfter }; }
+      // The client went away (or was dropped as too slow) in the middle of sending: nothing to answer, nothing wrong here.
+      else if (req.destroyed && !req.complete) { hlog.request(req.method, url.pathname, 499, Date.now() - t0); return; }
       else { status = 500; payload = { error: 'Something went wrong on the Hub.' }; console.error(e); }
     }
     if (res.headersSent) { if (!res.writableEnded) res.destroy(); return; }

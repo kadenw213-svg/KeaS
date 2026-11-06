@@ -11,6 +11,14 @@ import { ownerFetch } from '../../hub/lib/ownerauth.mjs';
 import { clientAddress, cleanIp, ipBucket } from '../../hub/lib/clientip.mjs';
 import { failures, globalLockFor, GLOBAL_FREE, GLOBAL_IPS, GLOBAL_MAX_LOCK_MS } from '../../hub/lib/limiter.mjs';
 import { payrollKey, payrollValue, checkNoPayroll, MAX_NODES } from '../../hub/org/payroll.mjs';
+
+test('a record id is never taken for an SSN (the org tests that failed now and then: about 1% of random ids did)', () => {
+  assert.equal(payrollValue('0f3a2b1c-9d8e-4f7a-8b6c-a123456789bc'), false);
+  assert.equal(payrollValue('see 0f3a2b1c-9d8e-4f7a-8b6c-a123456789bc'), false);
+  // A real one next to an id still counts.
+  assert.equal(payrollValue('0f3a2b1c-9d8e-4f7a-8b6c-a123456789bc 123-45-6789'), true);
+  assert.equal(payrollValue('123456789'), true);
+});
 import { openDb } from '../../hub/db.mjs';
 
 let hub, base, ownerBase, dir;
