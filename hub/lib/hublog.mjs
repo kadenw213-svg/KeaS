@@ -4,7 +4,7 @@
 //   - Routine lines are counted, not written one by one: successful GETs and repeated 401/404/429 answers become one
 //     summary line a minute ("GET 200 x 5231"). Writes (POST/PUT/DELETE) and server errors are written as they happen.
 //   - Writes are buffered and flushed about once a second, off the request path.
-import { appendFile, mkdirSync, renameSync, rmSync, statSync } from 'node:fs';
+import { appendFile, appendFileSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 const COUNTED = new Set([401, 403, 404, 405, 413, 421, 428, 429, 503]);
@@ -59,7 +59,12 @@ export function createHubLog({ file = null, toConsole = false, maxBytes = 10 * 1
     line,
     /** Writes what's waiting now (tests, shutting down). */
     flushNow() { summarize(); flush(); },
-    close() { summarize(); flush(); closed = true; clearInterval(flushTimer); clearInterval(sumTimer); },
+    /** The last lines are on disk when this returns (the Hub may be about to exit). */
+    close() {
+      summarize();
+      if (file && buf.length) { try { appendFileSync(file, buf.join('')); } catch {} buf = []; }
+      closed = true; clearInterval(flushTimer); clearInterval(sumTimer);
+    },
     stats: () => ({ file, bytes: size, pendingLines: buf.length, counted: Object.fromEntries(counts) }),
   };
 }

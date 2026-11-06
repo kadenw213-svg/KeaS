@@ -363,6 +363,7 @@ function payrollAdvanced() {
           h('span', { class: 'muted small' }, ' Each payroll admin can then set a long local password (16 or more characters) in Payroll. It only works while the Hub can’t be reached, still needs the vault passphrase, and skips the Hub’s two-step sign-in, so leave it off unless you need it. Off by default.'))),
       S.ps.exportsDir && h('p', { class: 'muted small' }, `Files Payroll saves (tax form data, bank files, reports) go to ${S.ps.exportsDir}, a folder only your Windows account can open.`),
       S.ps.folderProblem && h('p', { class: 'err' }, `The payroll folder’s permissions: ${S.ps.folderProblem}`),
+      S.ps.ownHubFingerprint && h('p', { class: 'small' }, 'This Hub’s key fingerprint (payroll on another PC asks you to compare it): ', h('code', {}, S.ps.ownHubFingerprint)),
       h('p', { class: 'muted small' }, 'Payroll trusts the Kea Hub’s signing key from when it was set up. If the Hub’s key changes, sign-in is refused until you check the new key here and accept it. Only do this for your own Hub.'),
       h('p', null, h('button', { class: 'btn', onclick: async () => { try { S.hubKey = await call(k.payrollHubKey); S.error = ''; S.repinned = ''; render(); } catch (err) { fail(err); } } }, 'Check the Kea Hub’s key')),
       S.hubKey && hubKeyPanel(S.hubKey),

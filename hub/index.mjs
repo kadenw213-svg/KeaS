@@ -21,7 +21,7 @@ import { consentPage, consentCsp } from './lib/consentPage.mjs';
 import { openDb, DATA_DIR } from './db.mjs';
 import { hashPassword, verifyPassword, needsRehash, passwordProblem } from './lib/passwords.mjs';
 import { newSecret, checkCode, otpauthUri, totpKeyFrom, sealSecret, openSecret, isSealed } from './lib/totp.mjs';
-import { ownerNonces, OWNER_AUTH_HEADER } from './lib/ownerauth.mjs';
+import { ownerNonces, ownerReplyMac, OWNER_AUTH_HEADER, OWNER_CHALLENGE_HEADER, OWNER_REPLY_HEADER } from './lib/ownerauth.mjs';
 import { cleanText, isReservedName } from './lib/names.mjs';
 import { loadOrCreateKey, signToken } from './lib/tokens.mjs';
 import { writeSecretFile } from './lib/secureFile.mjs';
@@ -2663,6 +2663,8 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
   const ownerTotpOff = () => !!h.get("SELECT 1 FROM accounts WHERE role = 'owner' AND totp_enabled = 0");
   async function handleOwner(req, res) {
     let status = 200, payload;
+    // Set once the caller proved it holds the owner key: answers from then on prove the Hub holds it too (ownerauth.mjs).
+    let prove = null;
     try {
       // Belt and braces: the listener is bound to 127.0.0.1, and every call answers a fresh challenge too.
       const addr = req.socket.remoteAddress;
@@ -2670,19 +2672,21 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
       if (req.headers.origin || req.headers['sec-fetch-site']) forbidden('The owner console takes no browser requests.');
       const url = new URL(req.url, 'http://localhost');
       // The challenge (hub/lib/ownerauth.mjs): a nonce, answered with an HMAC made with the owner key.
-      if (req.method === 'GET' && url.pathname === '/owner/nonce') { send(res, 200, { nonce: nonces.issue() }); return; }
+      if (req.method === 'GET' && url.pathname === '/owner/nonce') { send(res, 200, { nonce: nonces.issue(String(addr)) }); return; }
       if (req.headers['x-kea-owner-key'] != null) throw new HttpError(401, 'The owner console no longer takes the owner key itself. Update KeaS and Kea on this PC.');
       const taken = nonces.take(req.headers[OWNER_AUTH_HEADER]);
       if (!taken) throw new HttpError(401, 'Owner sign-in required: answer a fresh challenge from /owner/nonce.');
       const raw = req.method === 'POST' || req.method === 'PUT' ? await readRaw(req, req.method === 'PUT' ? maxFileBytes : MAX_BODY) : Buffer.alloc(0);
-      if (!nonces.check(ownerKeyNow(), taken, req.method, req.url, raw)) throw new HttpError(401, 'Owner sign-in failed.');
+      const signKey = ownerKeyNow();
+      if (!nonces.check(signKey, taken, req.method, req.url, raw)) throw new HttpError(401, 'Owner sign-in failed.');
+      prove = (code, bytes) => ownerReplyMac(signKey, taken.nonce, req.headers[OWNER_CHALLENGE_HEADER], code, req.method, req.url, bytes);
       const { r, params } = own.find(req.method, url.pathname);
       if (!OWNER_OPEN.has(`${req.method} ${url.pathname}`) && ownerTotpOff()) throw new HttpError(403, OWNER_TOTP_MESSAGE, { ownerTotpRequired: true });
       let body = {};
       if (req.method === 'POST') { const text = raw.toString('utf8'); if (text.trim()) { try { body = JSON.parse(text); } catch { bad('Invalid JSON.'); } } body = V.obj(body); }
       payload = await r.handler({ params, body, raw: req.method === 'PUT' ? raw : null, query: Object.fromEntries(url.searchParams) });
       if (payload && payload.__raw) {
-        res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': payload.__raw.length, 'cache-control': 'no-store', ...payload.headers });
+        res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': payload.__raw.length, 'cache-control': 'no-store', ...payload.headers, [OWNER_REPLY_HEADER]: prove(200, payload.__raw) });
         res.end(payload.__raw);
         return;
       }
@@ -2690,6 +2694,7 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
       if (e instanceof HttpError) { status = e.status; payload = { error: e.message, ...(e.extra || {}) }; }
       else { status = 500; payload = { error: 'internal error' }; console.error(e); }
     }
+    if (prove) { const bytes = Buffer.from(JSON.stringify(payload ?? {})); res.setHeader(OWNER_REPLY_HEADER, prove(status, bytes)); res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'x-frame-options': 'DENY' }); res.end(bytes); return; }
     send(res, status, payload);
   }
 
@@ -2762,6 +2767,11 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  // KeaS refused this folder (something another account could have planted is still in it): don't serve from it.
+  if (existsSync(join(DATA_DIR, '.keas-lockdown-pending'))) {
+    console.error('The Kea Hub won’t start: KeaS found this data folder was open to other accounts and hasn’t finished checking it. Open KeaS to see what to clean up.');
+    process.exit(3);
+  }
   // Run by itself (the Hub started before sign-in): its log is a size-limited file in its data folder, and its errors
   // go there too, never to an ever-growing output file.
   const hub = createHub({ logFile: join(DATA_DIR, 'logs', 'hub.log'), log: false });
@@ -2769,5 +2779,12 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   let ports;
   try { ports = await hub.listen(); } catch (e) { console.error(e.message); await hub.close().catch(() => {}); process.exit(1); }
   const { port, ownerPort } = ports;
+  // Which process this is, for stopping it (KeaS's hub:stop step), rather than matching command lines.
+  const pidFile = join(DATA_DIR, 'hub.pid');
+  try {
+    rmSync(pidFile, { force: true });
+    writeSecretFile(pidFile, JSON.stringify({ pid: process.pid, startedAt: Math.round(Date.now() - process.uptime() * 1000) }));
+    process.on('exit', () => { try { rmSync(pidFile, { force: true }); } catch {} });
+  } catch (e) { console.error(`Couldn’t record the Hub’s process: ${e.message}`); }
   console.log(`Kea Hub ${VERSION} on http://${HOST}:${port} (tunnel this one). Owner console on http://${HOST}:${ownerPort} (never tunnel this).`);
 }

@@ -42,7 +42,9 @@ function createPayroll({ getConfig, setConfig, userData, root, hubPort, log = ()
     if (server) return port;
     const { createApp } = await import(pathToFileURL(path.join(root, 'server', 'index.mjs')).href);
     // Only this Windows account (and SYSTEM and Administrators) can open the vault file and the exports.
-    try { await bootstart.secureDataFolder(dir()); folderProblem = null; } catch (e) { folderProblem = e.message; log('payroll folder permissions', e.message); }
+    // A folder it can't vouch for is refused: the vault doesn't start until it's clean.
+    try { await bootstart.secureDataFolder(dir(), { onWasOpen: () => log('the payroll folder was open to other accounts and is locked down now') }); folderProblem = null; }
+    catch (e) { folderProblem = e.message; log('payroll folder permissions', e.message); throw e; }
     fs.mkdirSync(dir(), { recursive: true });
     // When this PC is the Hub, payroll checks whatever answers on the Hub's port against the key in the Hub's data
     // folder (desktop/hubid.cjs) before sending it a password: it must sign a fresh nonce with that key.
@@ -91,7 +93,7 @@ function createPayroll({ getConfig, setConfig, userData, root, hubPort, log = ()
     return true;
   }
   /** The payroll settings only this app can change. */
-  const settings = () => ({ localSignIn: localSignIn(), hubUrl: hubUrl(), exportsDir: exportsDir(), folderProblem });
+  const settings = async () => ({ localSignIn: localSignIn(), hubUrl: hubUrl(), exportsDir: exportsDir(), folderProblem, ownHubFingerprint: await localHubFingerprint() });
   function setLocalSignIn(on) { setConfig({ payrollLocalSignIn: !!on }); log('payroll local sign-in', on ? 'on' : 'off'); return settings(); }
   /** This PC's own Hub key (when this PC is the Hub): its fingerprint, to check the key the Hub offers against. */
   async function localHubFingerprint() {

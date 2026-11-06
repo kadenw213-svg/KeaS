@@ -47,11 +47,11 @@ async function secureFolders() {
     // (A storage folder inside the data folder already inherits its permissions.)
     if (!dir || (dir !== config.dataDir && dir.toLowerCase().startsWith(`${String(config.dataDir).toLowerCase()}\\`))) continue;
     try {
-      const r = await bootstart.secureDataFolder(dir);
-      if (r.changed) log('locked down', dir);
       // It was open to other accounts: the Hub's owner key and signing key may have been read, so the Hub makes new
-      // ones as it starts (payroll then asks the owner to check and accept the new signing key).
-      if (r.wasOpen && dir === config.dataDir && config.role === 'hub') log('replaced the Hub keys after locking down its folder:', bootstart.rotateHubSecrets(dir).join(', ') || 'none there');
+      // ones as it starts (payroll then asks the owner to check and accept the new signing key). Once, even if the
+      // folder had to be refused at first and only comes clean at a later start.
+      const r = await bootstart.secureDataFolder(dir, { onWasOpen: () => { if (dir === config.dataDir && config.role === 'hub') log('replaced the Hub keys after locking down its folder:', bootstart.rotateHubSecrets(dir).join(', ') || 'none there'); } });
+      if (r.changed) log('locked down', dir);
     }
     catch (e) { folderProblem = `${label}: ${e.message}`; log('folder permissions', dir, e.message); }
   }
@@ -75,6 +75,14 @@ function removeKeyFile(file) {
 }
 async function startServices() {
   if (config.dataDir && !hub && !org && !hubExternal) await secureFolders();
+  // A folder that was refused isn't used at all, not even by a Hub that started before sign-in.
+  if (folderProblem) {
+    if (config.role === 'hub') {
+      const stopped = await bootstart.stopRecordedHub(config.dataDir, HUB_PORT);
+      if (stopped) log('stopped the Hub that started before sign-in, because its folder was refused', stopped);
+    }
+    throw new Error(folderProblem);
+  }
   if (config.role === 'hub' && !hub && await bootstart.hubAnswering(HUB_PORT, { dataDir: config.dataDir })) {
     if (!hubExternal) log('hub already running (started before sign-in); using it');
     hubExternal = true;

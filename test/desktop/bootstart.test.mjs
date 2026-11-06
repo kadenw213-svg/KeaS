@@ -33,7 +33,7 @@ function psParse(script) {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 // Every command the elevated scripts may run.
-const ALLOWED = new Set(['Step', 'ConvertFrom-Json', 'ConvertTo-Json', 'Out-Null', 'Join-Path', 'Test-Path', 'New-Item', 'icacls', 'Copy-Item', 'Remove-Item', 'Get-ChildItem', 'ForEach-Object', 'Where-Object', 'Get-CimInstance', 'Stop-Process', 'schtasks', 'powercfg', 'OwnerSid', 'ServiceDir', 'New-Object', 'Get-Acl',
+const ALLOWED = new Set(['Get-Process', 'Get-Content', 'Step', 'ConvertFrom-Json', 'ConvertTo-Json', 'Out-Null', 'Join-Path', 'Test-Path', 'New-Item', 'icacls', 'Copy-Item', 'Remove-Item', 'Get-ChildItem', 'ForEach-Object', 'Where-Object', 'Get-CimInstance', 'Stop-Process', 'schtasks', 'powercfg', 'OwnerSid', 'ServiceDir', 'New-Object', 'Get-Acl',
   'Move-Item', 'Get-Item', 'Select-Object', 'Add-Type', 'Sha256Hex', 'IsLink', 'LinkCount', 'DataProblems', null]);
 
 test('options: defaults, unknown keys dropped, numbers clamped', () => {

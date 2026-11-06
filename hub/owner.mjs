@@ -4,11 +4,12 @@
 //   node hub/owner.mjs console <path> [json]  call the owner console, e.g. `console GET /owner/stats`
 //   node hub/owner.mjs publish-terms [file]   publish edited terms (hub/terms/terms.json); everyone re-agrees
 //   node hub/owner.mjs rotate-key             make a new owner key (the old one stops working at once)
+//   node hub/owner.mjs key-fingerprint        this Hub's signing key fingerprint (payroll on another PC asks you to compare it)
 //   node hub/owner.mjs where                  where the Hub keeps its data
 //
 // The owner console never receives the owner key: each call answers a fresh challenge (hub/lib/ownerauth.mjs).
 import { readFileSync, renameSync, rmSync } from 'node:fs';
-import { randomBytes } from 'node:crypto';
+import { createHash, createPrivateKey, createPublicKey, randomBytes } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
@@ -85,10 +86,13 @@ async function main([cmd, ...args]) {
   } else if (cmd === 'rotate-key') {
     const file = rotateOwnerKey();
     console.log(`New owner key in ${file}. The running Hub uses it at once; the old key no longer works.`);
+  } else if (cmd === 'key-fingerprint') {
+    const { x } = createPublicKey(createPrivateKey(readFileSync(join(DATA_DIR, 'hub-signing-key.pem')))).export({ format: 'jwk' });
+    console.log(createHash('sha256').update(x).digest('hex').toUpperCase().match(/.{4}/g).join(' '));
   } else if (cmd === 'where') {
     console.log(DATA_DIR);
   } else {
-    console.log('Commands: make-owner <email> | publish-terms [file] | console [METHOD] <path> [json] | rotate-key | where');
+    console.log('Commands: make-owner <email> | publish-terms [file] | console [METHOD] <path> [json] | rotate-key | key-fingerprint | where');
   }
 }
 

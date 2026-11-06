@@ -175,6 +175,7 @@ function launcherCmd({ exe, entry, env, logFile, sysRoot = systemRoot() }) {
   checkAbsolute(logFile, 'The Hub’s log file');
   checkAbsolute(sysRoot, 'The Windows folder');
   const sys32 = path.win32.join(sysRoot, 'System32');
+  const tmpDir = path.win32.join(path.win32.dirname(logFile), 'tmp');
   const lines = [
     '@echo off',
     'rem Starts the Kea Hub. Written by KeaS; run at startup by the Scheduled Task "\\KeaS\\Kea Hub". Changing KeaS\'s settings rewrites it.',
@@ -184,6 +185,13 @@ function launcherCmd({ exe, entry, env, logFile, sysRoot = systemRoot() }) {
     ...CLEARED_VARS.map((v) => `set "${v}="`),
     `set "PATH=${cmdSetValue(`${sys32};${sysRoot};${path.win32.join(sys32, 'Wbem')}`)}"`,
     'set "PATHEXT=.COM;.EXE;.BAT;.CMD"',
+    // Windows' own settings, from KeaS rather than the account's environment, and temp files in the service folder.
+    `set "SystemRoot=${cmdSetValue(sysRoot)}"`,
+    `set "windir=${cmdSetValue(sysRoot)}"`,
+    `set "COMSPEC=${cmdSetValue(path.win32.join(sys32, 'cmd.exe'))}"`,
+    `set "TEMP=${cmdSetValue(tmpDir)}"`,
+    `set "TMP=${cmdSetValue(tmpDir)}"`,
+    `if not exist ${cmdQuoted(tmpDir)} mkdir ${cmdQuoted(tmpDir)}`,
     ...Object.entries(env).map(([k, v]) => {
       if (!/^[A-Z0-9_]+$/.test(k)) throw new Error(`Bad setting name ${k}`);
       return `set "${k}=${cmdSetValue(v)}"`;
@@ -392,7 +400,9 @@ const legacyLines = () => [
 // Stops the Hub the task started (its launcher and the Hub from the service copy, or an older copy), matched by command
 // line, so KeaS's own Hub and anything else on the PC are never touched.
 const stopLines = () => [
-  `Step 'hub:stop' { $ErrorActionPreference = 'Continue'; $paths = @($cfg.stopPaths | Where-Object { $_ }); Get-CimInstance Win32_Process | Where-Object { $cl = $_.CommandLine; $cl -and ($paths | Where-Object { $cl.Contains([string]$_) }) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }`,
+  // The Hub records its process when it starts (hub.pid in its data folder): that process is stopped, only if it's still
+  // the same one (its start time) and is KeaS's own executable. Command lines are only for a Hub older than the record.
+  `Step 'hub:stop' { $ErrorActionPreference = 'Continue'; if ($cfg.pidFile -and (Test-Path -LiteralPath $cfg.pidFile)) { try { $r = Get-Content -LiteralPath $cfg.pidFile -Raw | ConvertFrom-Json; $p = Get-Process -Id ([int]$r.pid) -ErrorAction Stop } catch { $p = $null }; if ($p) { $started = ([DateTimeOffset]$p.StartTime).ToUnixTimeMilliseconds(); if ([math]::Abs($started - [double]$r.startedAt) -lt 60000 -and (-not $cfg.exe -or $p.Path -eq $cfg.exe)) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } } } else { $paths = @($cfg.stopPaths | Where-Object { $_ }); Get-CimInstance Win32_Process | Where-Object { $cl = $_.CommandLine; $cl -and ($paths | Where-Object { $cl.Contains([string]$_) }) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } } }`,
 ];
 const taskRemoveLines = (stop) => [
   `Step 'task:end' { $ErrorActionPreference = 'Continue'; schtasks /End /TN ${psq(TASK_NAME)} 2>&1 | Out-Null; $global:LASTEXITCODE = 0 }`,
@@ -447,7 +457,7 @@ function uninstallScript({ previous = null, removeTask = true, stop = false }) {
 }
 
 /** The settings file the elevated script reads (every folder and file name it uses). */
-function scriptSettings({ config, files, ownerSid, manifest = [], resultFile = null }) {
+function scriptSettings({ config, files, ownerSid, manifest = [], resultFile = null, exe = null }) {
   // (install() has already refused a folder name it doesn't accept; these are data for the script, never code.)
   const norm = (d) => (typeof d === 'string' && /^[A-Za-z]:\\/.test(d) ? path.win32.normalize(d).replace(/\\+$/, '') : null);
   const dataDir = norm(config?.dataDir);
@@ -460,6 +470,8 @@ function scriptSettings({ config, files, ownerSid, manifest = [], resultFile = n
     xmlFile: files.xmlFile,
     dataDirs: [dataDir, storageDir && !storageDir.toLowerCase().startsWith(`${(dataDir || '').toLowerCase()}\\`) ? storageDir : null].filter(Boolean),
     secretFiles: dataDir ? SECRET_FILES.map((f) => path.win32.join(dataDir, f)) : [],
+    pidFile: dataDir ? path.win32.join(dataDir, 'hub.pid') : null,
+    exe: exe || null,
     stopPaths: [files.entry, files.launcher, ...(legacy ? [path.win32.join(legacy, 'hub', 'index.mjs'), path.win32.join(legacy, 'start-hub.cmd')] : [])],
     legacy: legacy ? [legacy] : [],
     manifest: manifest.map((m) => ({ path: m.path, sha256: m.sha256 })),
@@ -590,7 +602,7 @@ async function aclReport(dir) {
  * else (their permissions are shared with that other name).
  */
 function walkFolder(dir) {
-  const entries = [], links = [], hardLinks = [];
+  const entries = [], links = [], hardLinks = [], stamps = [];
   const stack = [dir];
   while (stack.length) {
     const d = stack.pop();
@@ -599,34 +611,68 @@ function walkFolder(dir) {
       let st;
       try { st = fs.lstatSync(p); } catch { links.push(p); continue; }
       if (st.isSymbolicLink()) { links.push(p); continue; }
+      if (d === dir && name === CHECKED_FILE) continue;
       entries.push(p);
+      // (Windows' change time moves when a file's owner, permissions or content change.)
+      stamps.push(crypto.createHash('sha256').update(`${path.relative(dir, p)}|${st.ino}|${st.ctimeMs}`).digest('base64').slice(0, 12));
       if (st.isDirectory()) stack.push(p);
       else if (st.nlink > 1) hardLinks.push(p);
     }
   }
-  return { entries, links, hardLinks };
+  return { entries, links, hardLinks, stamps };
 }
-// The owners of many files at once (SIDs, '' when one can't be read). The list goes in on standard input.
-const OWNERS_PS = "$l = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd().Trim())) | ConvertFrom-Json; $t = [Security.Principal.SecurityIdentifier]; $o = @(foreach ($p in @($l)) { try { (Get-Acl -LiteralPath $p).GetOwner($t).Value } catch { '' } }); ConvertTo-Json -Compress -InputObject $o";
+// The owners of many files at once, and who else an entry lets in: "<owner SID> <SID> <SID>...", '' when one can't be
+// read. The list goes in on standard input.
+const OWNERS_PS = "$l = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd().Trim())) | ConvertFrom-Json; $t = [Security.Principal.SecurityIdentifier]; $o = @(foreach ($p in @($l)) { try { $a = Get-Acl -LiteralPath $p; (@($a.GetOwner($t).Value) + @($a.GetAccessRules($true, $true, $t) | Where-Object { $_.AccessControlType -eq 'Allow' } | ForEach-Object { $_.IdentityReference.Value })) -join ' ' } catch { '' } }); ConvertTo-Json -Compress -InputObject $o";
 async function ownersOf(paths) {
-  if (!paths.length) return [];
-  const r = await runInput(powershell(), ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', OWNERS_PS], Buffer.from(JSON.stringify(paths), 'utf8').toString('base64'));
-  try { const j = JSON.parse(r.out); const a = Array.isArray(j) ? j : [j]; return paths.map((_, i) => String(a[i] ?? '')); } catch { return paths.map(() => ''); }
+  const out = [];
+  // (In batches: a big storage folder mustn't run into one call's time limit and read as "can't tell".)
+  for (let i = 0; i < paths.length; i += 5000) {
+    const part = paths.slice(i, i + 5000);
+    const r = await runInput(powershell(), ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', OWNERS_PS], Buffer.from(JSON.stringify(part), 'utf8').toString('base64'));
+    try { const j = JSON.parse(r.out); const a = Array.isArray(j) ? j : [j]; out.push(...part.map((_, k) => String(a[k] ?? ''))); } catch { out.push(...part.map(() => '')); }
+  }
+  return out;
+}
+// In a data folder, once it's locked: what KeaS found clean last time (so a big folder isn't asked about file by file
+// at every start), and the note that the folder was open and its clean-up isn't finished (it outlives a refusal, so the
+// next start still treats the folder as having been open). Nothing else on this PC can write them after the lockdown.
+const CHECKED_FILE = '.keas-lockdown-checked';
+const PENDING_FILE = '.keas-lockdown-pending';
+/** Writes our own small file, never through a link or hard link somebody else planted under that name. */
+function writeOwnFile(file, text) {
+  fs.rmSync(file, { force: true });
+  fs.writeFileSync(file, text, { flag: 'wx', mode: 0o600 });
+}
+function readChecked(dir) {
+  try {
+    const f = path.join(dir, CHECKED_FILE);
+    if (!fs.lstatSync(f).isFile()) return new Set();
+    return new Set(JSON.parse(fs.readFileSync(f, 'utf8')));
+  } catch { return new Set(); }
 }
 const short = (list, root) => list.slice(0, 5).map((p) => path.relative(root, p) || p).join(', ') + (list.length > 5 ? ` and ${list.length - 5} more` : '');
 /**
  * Refuses a folder that holds what another account could have slipped in while it was open: links, hard-linked files,
- * or anything owned by another account (not this one, SYSTEM or Administrators).
+ * or anything owned by another account (not this one, SYSTEM or Administrators). Returns what it saw: `open` lists
+ * entries that let in anyone else, `stamps` what checked clean. `known`: entries already checked clean and unchanged,
+ * which aren't asked about again (links and hard links always are).
  */
-async function checkContents(dir, sid, owners) {
-  const { entries, links, hardLinks } = walkFolder(dir);
-  const ownerOf = await owners(entries);
-  const foreign = entries.filter((_, i) => ![sid, SID.SYSTEM, SID.ADMINS].includes(ownerOf[i]));
+async function checkContents(dir, sid, owners, known = new Set()) {
+  const { entries, links, hardLinks, stamps } = walkFolder(dir);
+  const ask = entries.filter((_, i) => !known.has(stamps[i]));
+  const info = await owners(ask);
+  const allowed = [sid, SID.SYSTEM, SID.ADMINS];
+  const parts = ask.map((_, i) => String(info[i] ?? '').split(' ').filter(Boolean));
+  // (With a Hub running, a temporary file can be gone by the time it's asked about: that's no finding.)
+  const foreign = ask.filter((p, i) => !allowed.includes(parts[i][0]) && (parts[i].length || fs.existsSync(p)));
+  const open = ask.filter((_, i) => parts[i].slice(1).some((s) => !allowed.includes(s)));
   const found = [];
   if (links.length) found.push(`links to other places (${short(links, dir)})`);
   if (hardLinks.length) found.push(`files that also have another name somewhere else (hard links: ${short(hardLinks, dir)})`);
   if (foreign.length) found.push(`files or folders that belong to another Windows account (${short(foreign, dir)})`);
   if (found.length) throw new Error(`KeaS can’t lock this folder down: it has ${found.join('; ')}. Another account on this PC could have put them there while the folder was open to everyone. Remove them (or move your data to a new folder), then start KeaS again.`);
+  return { open, stamps };
 }
 
 /**
@@ -639,8 +685,14 @@ async function checkContents(dir, sid, owners) {
  * owned by another account; see checkContents), then everything inside is made to inherit the folder's permissions
  * (icacls /reset /T), then checked again. Returns { ok, changed, wasOpen }: wasOpen means secrets in it may have been
  * read while it was open, so the caller makes new ones (rotateHubSecrets).
+ *
+ * A right permission on the folder itself proves nothing about what's inside, so the contents are checked at every
+ * start, and an entry inside that lets anyone else in counts as the folder having been open. Refusing leaves a note in
+ * the folder, so the next start still refuses until it's clean, finishes the clean-up, and still reports wasOpen (and
+ * the Hub refuses to start by itself while the note is there). The note goes once onWasOpen, the caller's replacing of
+ * those secrets, has run; without onWasOpen it stays for the next call that has one.
  */
-async function secureDataFolder(dir, { sid, report = aclReport, apply = (d, s) => run(icacls(), dataAclArgs(d, s)), removeGrant = (d, s) => run(icacls(), [d, '/remove:g', `*${s}`, '/C', '/Q']), owners = ownersOf, reset = (p) => run(icacls(), [p, '/reset', '/T', '/C', '/Q'], { timeout: 10 * 60_000 }) } = {}) {
+async function secureDataFolder(dir, { sid, onWasOpen = null, report = aclReport, apply = (d, s) => run(icacls(), dataAclArgs(d, s)), removeGrant = (d, s) => run(icacls(), [d, '/remove:g', `*${s}`, '/C', '/Q']), owners = ownersOf, reset = (p) => run(icacls(), [p, '/reset', '/T', '/C', '/Q'], { timeout: 10 * 60_000 }) } = {}) {
   dir = validateDataDir(dir);
   if (process.platform !== 'win32') { fs.mkdirSync(dir, { recursive: true }); return { ok: true, changed: false, wasOpen: false }; }
   sid = sid || (await currentUserSid());
@@ -650,7 +702,10 @@ async function secureDataFolder(dir, { sid, report = aclReport, apply = (d, s) =
   if (!existed) fs.mkdirSync(dir, { recursive: true });
   const before = await report(dir);
   if (existed && before && ![sid, SID.ADMINS, SID.SYSTEM].includes(before.owner)) throw new Error('That folder belongs to another Windows account. Pick a different folder, or make a new one.');
-  if (!existed || aclProblems(before, sid).length) {
+  const pending = path.join(dir, PENDING_FILE);
+  const rootOpen = !existed || aclProblems(before, sid).length > 0;
+  let changed = false;
+  if (rootOpen) {
     const r = await apply(dir, sid);
     if (r.code !== 0) throw new Error(`Couldn’t set the folder’s permissions (${(r.err || r.out || `code ${r.code}`).trim().slice(0, 200)}). Use a folder on a drive formatted as NTFS, so other accounts on this PC can’t open the data.`);
     let after = await report(dir);
@@ -661,17 +716,31 @@ async function secureDataFolder(dir, { sid, report = aclReport, apply = (d, s) =
     const left = aclProblems(after, sid);
     if (left.length) throw new Error(`The folder’s permissions are still too open: ${left.join('; ')}.`);
     if (!existed && fs.readdirSync(dir).length) throw new Error('Something was put in the new folder before KeaS could lock it. Pick a different folder.');
-    if (existed) {
-      await checkContents(dir, sid, owners);
-      for (const name of fs.readdirSync(dir)) {
-        const rr = await reset(path.join(dir, name));
-        if (rr.code !== 0) throw new Error(`Couldn’t reset the permissions of ${name} (${(rr.err || rr.out || `code ${rr.code}`).trim().slice(0, 200)}).`);
-      }
-      await checkContents(dir, sid, owners);
-    }
-    return { ok: true, changed: true, wasOpen: existed };
+    if (!existed) return { ok: true, changed: true, wasOpen: false };
+    changed = true;
+    // (Only now that nobody else can write here. From here on, a refusal is remembered.)
+    writeOwnFile(pending, new Date().toISOString());
   }
-  return { ok: true, changed: false, wasOpen: false };
+  let wasOpen = fs.existsSync(pending);
+  // The checked list only counts for a folder that has stayed locked since it was written.
+  const useList = !wasOpen && owners === ownersOf;
+  let seen = await checkContents(dir, sid, owners, useList ? readChecked(dir) : new Set());
+  if (seen.open.length && !wasOpen) { writeOwnFile(pending, new Date().toISOString()); wasOpen = true; changed = true; }
+  if (wasOpen) {
+    for (const name of fs.readdirSync(dir)) {
+      if (name === PENDING_FILE || name === CHECKED_FILE) continue;
+      const rr = await reset(path.join(dir, name));
+      if (rr.code !== 0) throw new Error(`Couldn’t reset the permissions of ${name} (${(rr.err || rr.out || `code ${rr.code}`).trim().slice(0, 200)}).`);
+    }
+    seen = await checkContents(dir, sid, owners);
+    if (seen.open.length && owners === ownersOf) throw new Error(`KeaS couldn’t close the permissions of ${short(seen.open, dir)}. Fix them or move your data to a new folder, then start KeaS again.`);
+  }
+  try { writeOwnFile(path.join(dir, CHECKED_FILE), JSON.stringify(seen.stamps)); } catch {}
+  if (wasOpen && onWasOpen) {
+    await onWasOpen(dir);
+    fs.rmSync(pending, { force: true });
+  }
+  return { ok: true, changed, wasOpen };
 }
 
 /**
@@ -692,6 +761,20 @@ function rotateHubSecrets(dataDir) {
     } catch {}
   }
   return gone;
+}
+
+/**
+ * Stops the before-sign-in Hub by the record it wrote when it started (hub.pid in its data folder), when that process
+ * is still the Hub answering for this folder: used when the folder was refused. Returns the process id, or null.
+ */
+async function stopRecordedHub(dataDir, port) {
+  try {
+    const { pid } = JSON.parse(fs.readFileSync(path.join(dataDir, 'hub.pid'), 'utf8'));
+    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return null;
+    if (!(await hubAnswering(port, { dataDir }))) return null;
+    process.kill(pid);
+    return pid;
+  } catch { return null; }
 }
 
 /** The real path of `p` when it's `root` or a folder inside it (links resolved first); otherwise null. */
@@ -835,7 +918,7 @@ async function install({ config, exe, hubSource, version, opts, port = 4860, pre
   const before = previous || (await readPower());
   const power = powerPlan(o, before, powerWasApplied);
   const script = installScript({ power, scheme: before.scheme || 'SCHEME_CURRENT', bootStart: o.bootStart, removeTask: wasInstalled, stop: stopHub });
-  const settings = scriptSettings({ config, files, ownerSid: sid, manifest: files.manifest || [] });
+  const settings = scriptSettings({ config, files, ownerSid: sid, manifest: files.manifest || [], exe });
   const r = await runElevated(script, { dir: stageDir, name: 'install', settings, dryRun });
   if (!dryRun) cleanOldCopies(service);
   return { ...r, previous: before, files, options: o, power, layout: LAYOUT };
@@ -868,7 +951,7 @@ module.exports = {
   TASK_NAME, DEFAULTS, POWER, POWER_LOSS_NOTE, SID, LAYOUT, SECRET_FILES, CLEARED_PREFIXES, CLEARED_VARS,
   options, hubEnv, launcherCmd, taskXml, powerTargets, powerPlan, parsePowerQuery, installScript, uninstallScript, scriptSettings, elevateArgs, parseTaskQuery,
   readPower, taskStatus, prepareFiles, refreshService, planFiles, serviceDir, install, uninstall, hubAnswering, currentUser, currentUserSid, parseWhoami, copyHub, cmdSetValue, psq,
-  validateDataDir, checkUserSid, dataAclArgs, aclProblems, aclReport, secureDataFolder, walkFolder, ownersOf, rotateHubSecrets, folderInside,
+  validateDataDir, checkUserSid, dataAclArgs, aclProblems, aclReport, secureDataFolder, walkFolder, ownersOf, rotateHubSecrets, folderInside, stopRecordedHub, PENDING_FILE,
   composeScript, elevateBootstrap, encodedCommand, writeServiceFiles, cleanOldCopies,
   // For tests: the pieces the scripts are made of.
   scriptParts: { head: SCRIPT_HEAD, tail: SCRIPT_TAIL, serviceLines, serviceOwnerLines, dataAclLines, legacyLines },
