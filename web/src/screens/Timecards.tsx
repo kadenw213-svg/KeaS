@@ -1,14 +1,133 @@
 import { useEffect, useState } from 'react';
 import { Check, ChevronLeft, ChevronRight, TriangleAlert, X } from 'lucide-react';
-import { useWork, can, bumpWork, listOf, addDays, dayKey, fmtDay, fmtTime, hours, type Shift } from '../store';
+import { useWork, can, bumpWork, listOf, addDays, dayKey, fmtDay, fmtTime, hours, takeFocus, type Shift } from '../store';
 import { api } from '../api';
 import { Dialog, Spinner, toast } from '../ui';
 
 export function Timecards() {
+  const { me } = useWork();
+  const manager = can(me, 'manager') || can(me, 'payroll');
+  const [focus] = useState(takeFocus);
+  // Managers start on the whole team for the pay run's period; one person's card is a click away.
+  const [one, setOne] = useState<{ personId: string; periodStart: string | null } | null>(manager && !focus?.personId ? null : { personId: focus?.personId || me?.id || '', periodStart: focus?.periodStart || null });
+  if (!one) return <TeamTimecards initialPeriod={focus?.periodStart || null} open={(personId, periodStart) => setOne({ personId, periodStart })} />;
+  return <PersonTimecard initialPerson={one.personId} initialPeriod={one.periodStart} toTeam={manager ? () => setOne(null) : null} />;
+}
+
+/** Everyone's timecard for one pay period: hours and flags at a glance, and approving several at once. */
+function TeamTimecards({ initialPeriod, open }: { initialPeriod: string | null; open: (personId: string, periodStart: string) => void }) {
+  const { me, tick } = useWork();
+  const [periodStart, setPeriodStart] = useState<string | null>(initialPeriod);
+  const [data, setData] = useState<any | null>(null);
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [busy, setBusy] = useState(false);
+  const [requests, setRequests] = useState<any[]>([]);
+  useEffect(() => {
+    setData(null);
+    api('GET', `/v1/timecards/period${periodStart ? `?periodStart=${periodStart}` : ''}`)
+      .then((d: any) => {
+        setData(d);
+        setPicked(new Set(listOf(d.people, 'people').filter((p: any) => !p.approved && !p.mine && p.workedMin > 0).map((p: any) => p.personId)));
+      })
+      .catch((e) => (toast(e.message), setData({ error: e.message })));
+    api('GET', '/v1/punch-requests?status=pending')
+      .then((r) => setRequests(listOf(r, 'requests')))
+      .catch(() => setRequests([]));
+  }, [periodStart, tick]);
+  const rows = listOf(data?.people, 'people');
+  const canApprove = can(me, 'manager');
+  const approveSelected = async () => {
+    setBusy(true);
+    try {
+      const r: any = await api('POST', '/v1/timecards/approve-many', { periodStart: data.period.start, personIds: [...picked] });
+      const failed = listOf(r.results, 'results').filter((x: any) => !x.ok);
+      toast(failed.length ? `${picked.size - failed.length} approved. Not approved: ${failed.map((x: any) => `${rows.find((p: any) => p.personId === x.personId)?.name}: ${x.error}`).join('; ')}` : `${picked.size} timecard${picked.size === 1 ? '' : 's'} approved.`);
+      bumpWork();
+    } catch (e: any) {
+      toast(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="work-page">
+      <div className="work-head">
+        <h1 className="work-title">Timecards</h1>
+      </div>
+      {requests.length > 0 && canApprove && <div className="work-banner warn">{requests.length} punch fix{requests.length === 1 ? '' : 'es'} waiting: open a person’s timecard or Approvals to decide.</div>}
+      {!data ? (
+        <Spinner />
+      ) : data.error ? null : (
+        <>
+          <div className="work-period muted">
+            <button className="icon-btn" aria-label="Previous pay period" title="Previous pay period" onClick={() => setPeriodStart(addDays(data.period.start, -14))}>
+              <ChevronLeft size={20} />
+            </button>
+            <span>
+              Pay period {fmtDay(data.period.start)} – {fmtDay(data.period.end)}
+            </span>
+            <button className="icon-btn" aria-label="Next pay period" title="Next pay period" onClick={() => setPeriodStart(addDays(data.period.start, 14))}>
+              <ChevronRight size={20} />
+            </button>
+          </div>
+          <table className="work-table stack">
+            <thead>
+              <tr>
+                <th></th>
+                <th>Person</th>
+                <th>Worked</th>
+                <th>Overtime</th>
+                <th>Needs a look</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((p: any) => (
+                <tr key={p.personId}>
+                  <td data-label="Pick">
+                    {!p.approved && !p.mine && canApprove && (
+                      <input
+                        type="checkbox"
+                        aria-label={`Approve ${p.name}`}
+                        checked={picked.has(p.personId)}
+                        onChange={(e) => {
+                          const n = new Set(picked);
+                          e.target.checked ? n.add(p.personId) : n.delete(p.personId);
+                          setPicked(n);
+                        }}
+                      />
+                    )}
+                  </td>
+                  <td data-label="Person" className="stack-title">
+                    <button className="btn sm" onClick={() => open(p.personId, data.period.start)}>
+                      {p.name}
+                    </button>
+                  </td>
+                  <td data-label="Worked">{hours(p.workedMin)}</td>
+                  <td data-label="Overtime">{p.overtimeMin ? hours(p.overtimeMin) : ''}</td>
+                  <td data-label="Needs a look">{[p.flags ? `${p.flags} flag${p.flags === 1 ? '' : 's'}` : '', p.pendingRequests ? `${p.pendingRequests} punch fix${p.pendingRequests === 1 ? '' : 'es'}` : ''].filter(Boolean).join(' · ')}</td>
+                  <td data-label="Status">{p.approved ? <span className="work-tag ok">Approved</span> : p.workedMin > 0 ? <span className="work-tag">Waiting</span> : <span className="muted">No hours</span>}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {canApprove && (
+            <button className="btn primary" disabled={busy || picked.size === 0} onClick={approveSelected}>
+              Approve selected ({picked.size})
+            </button>
+          )}
+          <p className="muted small">Your own timecard is approved by someone else. Hours come from the time clock, or from Import → Hours worked.</p>
+        </>
+      )}
+    </div>
+  );
+}
+
+function PersonTimecard({ initialPerson, initialPeriod, toTeam }: { initialPerson: string; initialPeriod: string | null; toTeam: (() => void) | null }) {
   const { me, people, tick } = useWork();
   const manager = can(me, 'manager') || can(me, 'payroll');
-  const [personId, setPersonId] = useState(me?.id || '');
-  const [periodStart, setPeriodStart] = useState<string | null>(null);
+  const [personId, setPersonId] = useState(initialPerson);
+  const [periodStart, setPeriodStart] = useState<string | null>(initialPeriod);
   const [card, setCard] = useState<any | null>(null);
   const [requests, setRequests] = useState<any[]>([]);
   const [asking, setAsking] = useState(false);
@@ -50,6 +169,11 @@ export function Timecards() {
     <div className="work-page">
       <div className="work-head">
         <h1 className="work-title">Timecards</h1>
+        {toTeam && (
+          <button className="btn" onClick={toTeam}>
+            Whole team
+          </button>
+        )}
         {manager && (
           <select value={personId} onChange={(e) => setPersonId(e.target.value)} aria-label="Whose timecard">
             {people.map((p) => (

@@ -475,10 +475,33 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     const person = getPerson(pid, org.id);
     return computeTimecard(org, person, parsePeriod(org, query.periodStart, currentPeriod(org)));
   });
+  // Everyone's timecard for one pay period (default: the period the pay run is on), for approving them together.
+  route('GET', '/v1/timecards/period', ({ me, org, query }) => {
+    need(me, 'manager', 'payroll');
+    const period = parsePeriod(org, query.periodStart, lastCompleted(org));
+    const rows = h.all(`SELECT id FROM people WHERE org_id = ? AND status IN ('active','leave') AND worker_type = 'employee' ORDER BY name`, org.id).map((r) => getPerson(r.id, org.id));
+    const people = rows.map((p) => {
+      const tc = computeTimecard(org, p, period);
+      return { personId: p.id, name: p.name, workedMin: tc.totals?.workedMin || 0, overtimeMin: tc.totals?.overtimeMin || 0, approved: !!tc.approved, flags: (tc.flags || []).length, pendingRequests: tc.pendingRequests || 0, mine: p.id === me.id };
+    });
+    return { period, people };
+  });
+  route('POST', '/v1/timecards/approve-many', ({ me, org, body }) => {
+    need(me, 'manager');
+    const ids = Array.isArray(body.personIds) ? body.personIds.slice(0, 500) : bad('personIds must be a list');
+    const results = ids.map((id) => {
+      try { return { personId: id, ok: true, ...approveTimecard(me, org, V.id(id, 'personId'), body.periodStart) }; }
+      catch (e) { return { personId: id, ok: false, error: e.message }; }
+    });
+    return { results };
+  });
   route('POST', '/v1/timecards/approve', ({ me, org, body }) => {
     need(me, 'manager');
-    const person = getPerson(V.id(body.personId, 'personId'), org.id);
-    const period = parsePeriod(org, V.date(body.periodStart, 'periodStart'), null);
+    return approveTimecard(me, org, V.id(body.personId, 'personId'), body.periodStart);
+  });
+  function approveTimecard(me, org, personId, periodStart) {
+    const person = getPerson(personId, org.id);
+    const period = parsePeriod(org, V.date(periodStart, 'periodStart'), null);
     if (person.id === me.id && !me.roles.includes('owner')) throw new HttpError(403, 'you cannot approve your own timecard');
     if (h.get('SELECT 1 FROM timecard_approvals WHERE person_id = ? AND period_start = ?', person.id, period.start)) throw new HttpError(409, 'already approved');
     if (approvals.configured(org.id, 'timecard')) {
@@ -493,7 +516,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     h.run('INSERT INTO timecard_approvals (person_id,period_start,approved_by,at) VALUES (?,?,?,?)', person.id, period.start, me.id, iso(now()));
     audit(org.id, me.id, 'timecard_approve', person.id, { periodStart: period.start });
     return { approved: { by: me.id, at: iso(now()) }, personId: person.id, period };
-  });
+  }
 
   // ---------- payroll and HR ----------
   const approvals = makeApprovals({ h, now, iso, uid: (p) => `${p}-${randomUUID()}`, audit, HttpError });
