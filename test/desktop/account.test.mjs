@@ -162,6 +162,10 @@ test('people asking to join, verifying their email, and new backup codes, from K
     const setup = await (await fetch(`${url}/v1/me/totp/setup`, { method: 'POST', headers: auth, body: JSON.stringify({ password: 'correct horse battery staple' }) })).json();
     await fetch(`${url}/v1/me/totp/enable`, { method: 'POST', headers: auth, body: JSON.stringify({ code: codeAt(setup.secret, stepOf(clock)) }) });
     clock += 30_000;
+    // Turning two-step on (from another sign-in) ended KeaS's sign-in, which never passed it: KeaS signs in again with a code.
+    assert.equal((await sam.status()).signedIn, false);
+    await sam.login({ email: 'sam@school.edu', password: 'correct horse battery staple', code: codeAt(setup.secret, stepOf(clock)) });
+    clock += 30_000;
     await assert.rejects(sam.backupCodes({ password: 'correct horse battery staple', code: '000000' }), (e) => e.status === 401);
     assert.equal(sam.signedIn(), true, 'a wrong code there doesn’t sign KeaS out');
     const r = await sam.backupCodes({ password: 'correct horse battery staple', code: codeAt(setup.secret, stepOf(clock)) });
