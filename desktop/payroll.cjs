@@ -42,7 +42,7 @@ class PayrollError extends Error { constructor(m, data) { super(m); this.data = 
  * getConfig() -> the KeaS config; userData: the app's data folder; root: the app folder; hubPort: the local Hub's
  * port; account: the signed-in Kea account (account.cjs); onLocked(why): payroll locked itself and its window closed.
  */
-function createPayroll({ getConfig, setConfig, userData, root, hubPort, account, icon, onLocked = () => {}, onSaved = (file) => shell.showItemInFolder(file), log = () => {} }) {
+function createPayroll({ getConfig, setConfig, userData, root, hubPort, account, icon, onLocked = () => {}, onClosed = () => {}, onSaved = (file) => shell.showItemInFolder(file), log = () => {} }) {
   let server = null, port = null, win = null, downloads = false, folderProblem = null, idleMs = 15 * 60_000;
   const keeper = createPassKeeper();
   const dir = () => getConfig().payrollDir || path.join(userData, 'Payroll');
@@ -190,6 +190,7 @@ function createPayroll({ getConfig, setConfig, userData, root, hubPort, account,
     w.webContents.on('will-navigate', (e, url) => { if (!url.startsWith(origin + '/')) e.preventDefault(); });
     w.on('closed', () => {
       if (win === w) win = null;
+      onClosed();
       // Closed: the vault stops; the passphrase is forgotten after the same quiet spell that would have locked it.
       stop().then(() => keeper.idle(idleMs));
     });

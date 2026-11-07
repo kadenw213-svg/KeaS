@@ -306,6 +306,8 @@ const payroll = () => (payrollApi ||= require('./payroll.cjs').createPayroll({
   account: account(), icon: appIcon(),
   // Locked (a quiet spell, or Lock): the Payroll window closes and KeaS asks for the passphrase again when it's opened.
   onLocked: (why) => navigate('payroll', { locked: why }),
+  // (Closed: the KeaS window's Payroll panel and checklist catch up.)
+  onClosed: () => setTimeout(() => send('navigate', { view: 'payrollClosed' }), 1500),
 }));
 const openPayroll = () => payroll().open().catch((e) => { log('payroll', e.message); throw e; });
 app.on('before-quit', () => { payrollApi?.forget(); });

@@ -743,7 +743,13 @@ function signup() {
   return [
     h('h1', null, 'Create a Kea account'),
     h('p', { class: 'muted' }, 'One account for Kea and KeaS.'),
-    form(() => { if (ok) { f.part = 'terms'; S.error = ''; render(); } },
+    form(() => {
+      // (Checked now, not when the screen was drawn: the fields change without redrawing it.)
+      const why = !f.name.trim() ? 'Enter your name.' : !f.email.trim() ? 'Enter your email.' : f.password.length < 10 ? 'The password needs 10 or more characters.' : !f.age13 ? 'Kea accounts are for people 13 and older.' : '';
+      S.error = why;
+      if (!why) f.part = 'terms';
+      render();
+    },
       h('label', { class: 'field' }, 'Name', h('input', { type: 'text', placeholder: 'What people see', value: f.name, oninput: (e) => { f.name = e.target.value; syncNext(); } })),
       h('label', { class: 'field' }, 'Email', h('input', { type: 'email', autocomplete: 'username', value: f.email, oninput: (e) => { f.email = e.target.value; syncNext(); } })),
       h('label', { class: 'field' }, 'Password (10+ characters; a few random words works well)', h('input', { type: 'password', autocomplete: 'new-password', value: f.password, oninput: (e) => { f.password = e.target.value; syncNext(); } })),
@@ -965,6 +971,10 @@ k.onNavigate((nav) => {
     if (nav.open && nav.open.need) { S.payForm = nav.open; S.payData = {}; }
     S.step = S.hub && S.config.setupDone ? 'status' : S.acct ? 'home' : 'signin';
     render();
+  } else if (view === 'payrollClosed') {
+    S.pay = null;
+    if (['home', 'status'].includes(S.step) && !S.busy && !typingNow()) render();
+    loadChecklist();
   } else if (view === 'signin' && !S.busy) { S.error = ''; go('signin'); }
 });
 load().catch(fail);

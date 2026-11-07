@@ -297,8 +297,8 @@
 
 /* Get set up: one card per step */
 .pr-checklist { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
-.pr-step { padding: 12px 14px; }
-.pr-step-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pr-step { display: block; padding: 12px 14px; }
+.pr-step-head { display: flex; width: 100%; align-items: center; gap: 8px; flex-wrap: wrap; }
 .pr-step.done { opacity: 0.8; }
 .pr-step p { margin: 6px 0 0; }
 .pr-step .ok { color: var(--ok, #137333); }

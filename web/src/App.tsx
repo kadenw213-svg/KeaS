@@ -68,11 +68,11 @@ function Work() {
   const P = 'Payroll and HR',
     S = 'Setup and reports';
   const nav: NavItem[] = [
+    { id: 'setup', label: 'Get set up', short: 'Setup', icon: <ListChecks size={20} />, show: pay && vault },
     { id: 'today', label: 'Today', short: 'Today', icon: <Clock size={20} />, show: !vault },
     { id: 'schedule', label: 'Schedule', short: 'Schedule', icon: <CalendarDays size={20} />, show: !vault },
     { id: 'timecards', label: 'Timecards', short: 'Timecards', icon: <FileClock size={20} />, show: true },
     { id: 'people', label: 'People & certifications', short: 'People', icon: <Users size={20} />, show: !vault && mgr },
-    { id: 'setup', label: 'Get set up', short: 'Setup', icon: <ListChecks size={20} />, show: pay && vault },
     { id: 'pay', label: 'Pay run', short: 'Pay', icon: <Wallet size={20} />, show: pay, group: P },
     { id: 'employees', label: 'Employees', short: 'Staff', icon: <Users size={20} />, show: pay, group: P },
     { id: 'approvals', label: 'Approvals', short: 'Approve', icon: <CheckSquare size={20} />, show: true, group: P },
