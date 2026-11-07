@@ -55,6 +55,7 @@ contextBridge.exposeInMainWorld('keas', {
   updateState: call('update:state'),
   checkUpdates: call('update:check'),
   installUpdate: call('update:install'),
+  setNightlyUpdate: call('update:nightly'),
   onUpdate: (cb) => {
     const fn = (_e, s) => cb(s);
     ipcRenderer.on('update', fn);

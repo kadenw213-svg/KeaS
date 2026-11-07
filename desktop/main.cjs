@@ -395,6 +395,8 @@ async function saveCodesFile() {
 }
 // ---------- updates (updates.cjs) ----------
 let updates = null;
+/** The nightly install setting ({ on, from, to }; updates.cjs fills in what's missing or wrong). */
+const nightlySetting = () => require('./updates.cjs').nightlyOf(config?.nightlyUpdate);
 function startUpdates() {
   let told = null;
   updates = createUpdates({
@@ -406,10 +408,20 @@ function startUpdates() {
       // Once per version: the tray says it's ready.
       if (s.status === 'ready' && told !== s.version && tray) {
         told = s.version;
-        try { tray.displayBalloon({ iconType: 'info', title: 'KeaS update ready', content: `KeaS ${s.version} is downloaded. Choose "Restart to update" when it suits you; the Hub is offline for a moment while KeaS restarts.` }); } catch {}
+        const n = s.nightly;
+        try { tray.displayBalloon({ iconType: 'info', title: 'KeaS update ready', content: n?.on ? `KeaS ${s.version} is downloaded. It installs tonight between ${n.hours} (or choose "Restart to update"); the Hub is offline for a moment while KeaS restarts.` : `KeaS ${s.version} is downloaded. Choose "Restart to update" when it suits you; the Hub is offline for a moment while KeaS restarts.` }); } catch {}
       }
     },
-    beforeInstall: () => { app.isQuitting = true; },
+    // The nightly install (updates.cjs): the owner's setting, and never while Payroll is open or in use (a pay run is
+    // worked on only in an open Payroll; its vault runs only then, or for a moment while KeaS reads its status).
+    nightly: () => nightlySetting(),
+    busy: () => (payrollApi?.isOpen() ? 'Payroll is open' : payrollApi?.running() ? 'Payroll is in use' : null),
+    beforeInstall: ({ nightly } = {}) => {
+      app.isQuitting = true;
+      // Installed at night by itself: KeaS starts again in the tray (as at Windows start-up), with the Hub, not with a
+      // window open on an empty desk.
+      if (nightly) { try { config = writeConfig({ ...config, startHiddenOnce: true }); } catch (e) { log('update', e.message); } }
+    },
   });
   updates.start();
 }
@@ -418,6 +430,15 @@ function registerIpc() {
   handle('update:state', () => updates.state());
   handle('update:check', () => updates.check());
   handle('update:install', () => updates.install());
+  // The nightly install's setting: on (default) and the hours (Advanced).
+  handle('update:nightly', ({ on, from, to } = {}) => {
+    const cur = nightlySetting();
+    const next = { on: on === undefined ? cur.on : on !== false, from: from === undefined ? cur.from : Number(from), to: to === undefined ? cur.to : Number(to) };
+    config = writeConfig({ ...config, nightlyUpdate: next });
+    const s = updates.state();
+    send('update', s);
+    return s;
+  });
   handle('state', async () => {
     const hub = hubMode();
     const defaults = hub && !config.setupDone ? { hubData: await defaultFolder('Kea Hub') } : {};
@@ -661,7 +682,10 @@ app.whenReady().then(async () => {
     if (config.role === 'hub' && config.boot?.installed && config.boot.layout === bootstart.LAYOUT && !DEV) await refreshBoot(false);
     makeTray();
   } else if (!hubMode() && flow.startWithWindows(config)) makeTray();
-  if (!process.argv.includes('--hidden') || !tray) showWindow();
+  // (After an update installed by itself at night: in the tray, like a start with Windows. Just this once.)
+  const hiddenOnce = !!config.startHiddenOnce;
+  if (hiddenOnce) config = writeConfig({ ...config, startHiddenOnce: false });
+  if (!(process.argv.includes('--hidden') || hiddenOnce) || !tray) showWindow();
 });
 // (With a tray, closing the window keeps KeaS running; without one, it quits.)
 app.on('window-all-closed', () => { if (!tray) app.quit(); });

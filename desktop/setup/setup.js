@@ -449,37 +449,70 @@ function done() {
   ];
 }
 
+/** The nightly install setting as saved (desktop/updates.cjs has the same defaults): { on, from, to }. */
+function nightlySaved() {
+  const n = (S.config && S.config.nightlyUpdate) || {};
+  const hr = (v, d) => (Number.isInteger(v) && v >= 0 && v <= 23 ? v : d);
+  const from = hr(n.from, 3);
+  let to = hr(n.to, 5);
+  if (to === from) to = (from + 2) % 24;
+  return { on: n.on !== false, from, to };
+}
+/** "3 and 5 a.m." */
+function nightlyHours({ from, to }) {
+  const half = (x) => (x < 12 ? 'a.m.' : 'p.m.');
+  const num = (x) => String(x % 12 === 0 ? 12 : x % 12);
+  return half(from) === half(to) && from < to ? `${num(from)} and ${num(to)} ${half(to)}` : `${num(from)} ${half(from)} and ${num(to)} ${half(to)}`;
+}
+async function setNightly(change) {
+  try {
+    const next = { ...nightlySaved(), ...change };
+    S.update = await call(k.setNightlyUpdate, next);
+    S.config = { ...S.config, nightlyUpdate: next };
+    render();
+  } catch (e) { fail(e); }
+}
+
 /** The Updates panel: the version, what the updater is doing, and the buttons. */
 function updatePanel() {
   const u = S.update || { status: 'idle' };
   const busy = u.status === 'checking' || u.status === 'downloading';
+  const n = nightlySaved();
+  const hourOptions = (sel) => Array.from({ length: 24 }, (_, x) => h('option', { value: String(x), selected: x === sel }, nightlyHours({ from: x, to: x }).split(' and ')[0]));
   const line = {
     idle: '',
     dev: 'Updates work in the installed KeaS.',
     checking: 'Checking for updates…',
     latest: 'KeaS is up to date.',
     downloading: `Downloading KeaS ${u.version || ''}… ${u.percent || 0}%`,
-    ready: `KeaS ${u.version} is downloaded and ready to install.`,
+    ready: n.on ? `KeaS ${u.version} is downloaded. Installs tonight between ${nightlyHours(n)}.` : `KeaS ${u.version} is downloaded and ready to install.`,
     error: u.message || 'The update check didn’t work.',
   }[u.status] || '';
   return h('div', { class: 'panel' },
     h('p', null, h('b', null, 'Updates'), h('span', { class: 'muted small' }, `  KeaS ${S.version || ''}`)),
     line && h('p', { class: u.status === 'error' ? 'err' : 'muted small' }, line),
     u.status === 'ready' && h('p', { class: 'muted small' }, S.hubExternal
-      ? 'KeaS restarts to install it. The installer stops the Hub that started before sign-in too, so KeaS runs the Hub itself until Windows next starts, when the start-up task runs the new version. The Hub is offline for about a minute.'
-      : 'KeaS restarts to install it, and the Hub is offline for about a minute.'),
+      ? 'KeaS restarts to install it, and starts the Hub again by itself. The installer stops the Hub that started before sign-in too, so KeaS runs the Hub itself until Windows next starts, when the start-up task runs the new version. The Hub is offline for about a minute.'
+      : 'KeaS restarts to install it and starts the Hub again by itself; the Hub is offline for about a minute.'),
+    u.status === 'ready' && n.on && h('p', { class: 'muted small' }, 'Not while Payroll is open or in use: then it waits for the next night.'),
     h('div', { class: 'row' },
       u.status === 'ready'
         ? h('button', { class: 'btn primary', onclick: async () => {
           // (Payroll open: restarting locks it and loses whatever isn't saved there.)
           const st = await call(k.state).catch(() => ({}));
-          if (!(await askInPage(`Restart KeaS now to install ${u.version}?`, st.payrollOpen ? 'Payroll is open: restarting locks it, and anything not saved there is lost. Save your work first.' : '', 'Restart and update'))) return;
+          if (!(await askInPage(`Restart KeaS now to install ${u.version}?`, st.payrollOpen ? 'Payroll is open: restarting locks it, and anything not saved there is lost. Save your work first.' : '', 'Install now'))) return;
           try { await call(k.installUpdate); } catch (e) { S.update = { ...u, status: 'error', message: e.message }; render(); }
-        } }, 'Restart and update')
+        } }, 'Install now')
         : h('button', { class: 'btn', disabled: busy || u.status === 'dev', onclick: async () => {
           // (A failed check shows in this panel only, not twice.)
           try { S.update = { status: 'checking' }; render(); S.update = await call(k.checkUpdates); render(); } catch (e) { S.update = { status: 'error', message: e.message }; render(); }
-        } }, 'Check for updates')));
+        } }, 'Check for updates')),
+    h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: n.on, onchange: (e) => setNightly({ on: e.target.checked }) }), `Install updates by themselves at night (between ${nightlyHours(n)})`),
+    h('details', { open: !!S.updAdv, ontoggle: (e) => (S.updAdv = e.target.open) }, h('summary', null, 'Advanced'),
+      h('p', { class: 'muted small' }, 'The hours for installing at night (this computer’s time). KeaS looks every few minutes inside them.'),
+      h('div', { class: 'row' },
+        h('label', null, 'From ', h('select', { onchange: (e) => setNightly({ from: Number(e.target.value) }) }, ...hourOptions(n.from))),
+        h('label', null, ' to ', h('select', { onchange: (e) => setNightly({ to: Number(e.target.value) }) }, ...hourOptions(n.to))))));
 }
 
 function status() {

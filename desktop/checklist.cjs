@@ -30,7 +30,7 @@ function keasSteps(f = {}) {
     steps.push(step('boot', 'Start before sign-in and keep the PC awake', !!c.boot?.installed,
       c.boot?.installed ? 'The Hub starts when Windows starts.' : 'So the Hub comes back by itself after Windows restarts. Windows asks for permission once.', 'settings', { optional: true }));
     steps.push(step('updates', 'KeaS is up to date', f.update?.status !== 'ready',
-      f.update?.status === 'ready' ? `KeaS ${f.update.version} is downloaded. Restart to install it.` : 'KeaS checks for updates by itself.', 'update'));
+      f.update?.status === 'ready' ? (f.update.nightly?.on ? `KeaS ${f.update.version} is downloaded. It installs tonight between ${f.update.nightly.hours}, or install it now.` : `KeaS ${f.update.version} is downloaded. Restart to install it.`) : 'KeaS checks for updates by itself.', 'update'));
   }
 
   const a = f.account || {};
