@@ -34,7 +34,19 @@ import { clientAddress, ipBucket, isLoopback } from './lib/clientip.mjs';
 import { scoreAnswer, capped, levelOf, weekStart, dayKey, streak } from './lib/study.mjs';
 import { mountOrgs } from './org/routes.mjs';
 
-export const VERSION = '0.4.2';
+// The version the Hub reports (/v1/health; Kea reads it to tell which Hub it talks to). It comes from KeaS's own
+// package.json, or from version.txt beside the before-sign-in copy, so a release can't leave it behind.
+function readVersion() {
+  for (const f of ['../package.json', '../version.txt']) {
+    try {
+      const t = readFileSync(fileURLToPath(new URL(f, import.meta.url)), 'utf8');
+      const v = f.endsWith('.json') ? JSON.parse(t).version : t.trim();
+      if (/^\d+\.\d+\.\d+/.test(String(v))) return String(v);
+    } catch {}
+  }
+  return '0.0.0';
+}
+export const VERSION = readVersion();
 const HOST = '127.0.0.1';
 const MAX_BODY = 2 * 1024 * 1024;
 const SESSION_DAYS = 30;
@@ -273,10 +285,12 @@ export function createHub({
       : 'That was your last one. Make new backup codes in Kea: Kea account, Sign-in and security.', { data: { left } });
     return true;
   }
+  /** The authenticator app's code, its time step claimed (once only: see claimStep): { step }, or null. */
+  const appCode = (a, code) => { const step = checkTotp(a, code); return step != null && claimStep(a.id, step) ? { step } : null; };
   /** A two-step code: the authenticator app's ({ step }), or one of the backup codes ({ backup: true }). Null: neither. */
   function secondFactor(a, code, ip) {
-    const step = checkTotp(a, code);
-    if (step != null) return { step };
+    const f = appCode(a, code);
+    if (f) return f;
     return useBackupCode(a, code, ip) ? { backup: true } : null;
   }
   const CODE_ASK = 'Enter the 6-digit code from your authenticator app, or one of your backup codes.';
@@ -403,6 +417,9 @@ export function createHub({
   };
   const markGoogleVerified = (accountId, g) =>
     h.run("UPDATE accounts SET email_verified = 1, verified_by = 'Google', google_sub = ?, updated_at = ? WHERE id = ?", g.sub, now(), accountId);
+  // A code's time step is used once: the step is claimed in one statement, so two sign-ins sent at the same moment with
+  // the same code (read before either awaited the password check) can't both get in.
+  const claimStep = (id, step) => Number(h.run('UPDATE accounts SET totp_last_step = ? WHERE id = ? AND (totp_last_step IS NULL OR totp_last_step < ?)', step, id, step).changes) === 1;
   // Two-step sign-in. A missing code counts as a failure too: "code needed" only comes after a correct password, so it
   // would otherwise let someone test passwords without ever being throttled. (Kea's normal first try without a code
   // costs one count, which the successful sign-in right after clears.)
@@ -411,7 +428,6 @@ export function createHub({
     if (code == null || code === '') { fails.fail(nh, ipKey); throw new HttpError(401, CODE_ASK, { totpRequired: true, backupCodes: true }); }
     const f = secondFactor(a, code, ip);
     if (f == null) { fails.fail(nh, ipKey); audit(a.id, 'auth.fail_totp', null, null, ip); throw new HttpError(401, 'That code is wrong or already used.', { totpRequired: true, backupCodes: true }); }
-    if (f.step != null) h.run('UPDATE accounts SET totp_last_step = ? WHERE id = ?', f.step, a.id);
   };
   const lockedError = (ms, everywhere) => new HttpError(429, everywhere
     ? `Too many wrong tries for this account from many places. Wait ${Math.ceil(ms / 1000)} seconds, or sign in with Google.`
@@ -855,7 +871,6 @@ export function createHub({
         if (hasCode) { fails.fail(nh, ipKey); audit(a?.id ?? null, 'auth.fail', null, { lockedEverywhere: true }, ip); }
         throw lockedError(globalMs, true);
       }
-      if (f.step != null) h.run('UPDATE accounts SET totp_last_step = ? WHERE id = ?', f.step, a.id);
       fails.clear(nh, ipKey);
       audit(a.id, 'auth.login', null, { lockedEverywhere: true }, ip);
       const token = newSession(a.id, client);
@@ -1199,13 +1214,12 @@ export function createHub({
     const globalMs = fails.globalLocked(nh);
     if (globalMs > 0) throw lockedError(globalMs, true);
     const pwOk = await verifyPassword(typeof password === 'string' ? password : '', me.pw_hash);
-    const f = code === undefined ? {} : !pwOk ? null : backup ? secondFactor(me, code, ip) : (() => { const step = checkTotp(me, code); return step == null ? null : { step }; })();
+    const f = code === undefined ? {} : !pwOk ? null : backup ? secondFactor(me, code, ip) : appCode(me, code);
     if (!pwOk || f == null) {
       fails.fail(nh, ipKey);
       audit(me.id, 'auth.fail_reauth', null, null, ip);
       throw new HttpError(401, message);
     }
-    if (f.step != null) h.run('UPDATE accounts SET totp_last_step = ? WHERE id = ?', f.step, me.id);
     fails.clear(nh, ipKey);
   }
   /** Password, a fresh Google sign-in for my email, or (when `recent`) a proof given in this session in the last minutes. */
@@ -1259,6 +1273,9 @@ export function createHub({
     const step = checkTotp(me, body.code);
     if (step == null) bad('That code is wrong. Check the time on your phone and try the newest code.');
     h.run('UPDATE accounts SET totp_enabled = 1, totp_last_step = ?, updated_at = ? WHERE id = ?', step, now(), me.id);
+    // Sign-ins made before two-step was on never passed it: they end (this one stays), so a session someone got with
+    // the password alone doesn't keep working, or become an owner's, once the code is required.
+    h.run('DELETE FROM sessions WHERE account_id = ? AND token_hash != ?', me.id, sha(ctx.token));
     audit(me.id, 'account.totp_on', me.id, null, ip);
     // Ten one-time backup codes, shown this once (only their hashes are kept). Older apps just ignore them.
     const backupCodes = issueBackupCodes(me.id);

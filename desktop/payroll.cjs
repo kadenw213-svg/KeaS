@@ -53,7 +53,14 @@ function createPayroll({ getConfig, setConfig, userData, root, hubPort, account,
   /** The states KeaS has tax tables for (shared/tax/<ST>-<year>.json). */
   const taxStates = () => { try { return [...new Set(fs.readdirSync(path.join(root, 'shared', 'tax')).map((f) => /^([A-Z]{2})-\d{4}\.json$/.exec(f)?.[1]).filter((s) => s && s !== 'US'))]; } catch { return []; } };
 
-  async function start() {
+  // (Two callers at once, like the window and the checklist as KeaS starts, share one start: otherwise both got past
+  // the check above and two vault servers opened the same vault file.)
+  let starting = null;
+  function start() {
+    if (server) return Promise.resolve(port);
+    return (starting ||= startOnce().finally(() => { starting = null; }));
+  }
+  async function startOnce() {
     if (server) return port;
     const { createApp } = await import(pathToFileURL(path.join(root, 'server', 'index.mjs')).href);
     // Only this Windows account (and SYSTEM and Administrators) can open the vault file and the exports.

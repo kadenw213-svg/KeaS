@@ -466,7 +466,7 @@ function updatePanel() {
     h('p', null, h('b', null, 'Updates'), h('span', { class: 'muted small' }, `  KeaS ${S.version || ''}`)),
     line && h('p', { class: u.status === 'error' ? 'err' : 'muted small' }, line),
     u.status === 'ready' && h('p', { class: 'muted small' }, S.hubExternal
-      ? 'KeaS restarts to install it. The Hub started before sign-in keeps running and moves to the new version the next time Windows starts.'
+      ? 'KeaS restarts to install it. The installer stops the Hub that started before sign-in too, so KeaS runs the Hub itself until Windows next starts, when the start-up task runs the new version. The Hub is offline for about a minute.'
       : 'KeaS restarts to install it, and the Hub is offline for about a minute.'),
     h('div', { class: 'row' },
       u.status === 'ready'
