@@ -150,7 +150,13 @@ function createAccount({ dir, protect, getUrl, setUrl, fetchImpl = fetch, client
     finally { req('POST', '/v1/auth/logout', {}, { token: r.token }).catch(() => {}); }
   }
 
-  return { url, status, login, register, logout, changeUrl, terms, acceptTerms, adopt, payrollToken, freshPayrollToken, cached, signedIn: () => !!readToken(), forget: signOutHere };
+  // The organizations this account belongs to on the Hub (create, join with a code, the state where people work).
+  const orgs = async () => (await req('GET', '/v1/orgs')).orgs || [];
+  const createOrg = ({ name, state, tz }) => req('POST', '/v1/orgs', { name: String(name || '').trim(), kind: 'private', state: state || null, tz: tz || 'America/Denver' });
+  const joinOrg = ({ code }) => req('POST', '/v1/orgs/join', { code: String(code || '').trim() });
+  const updateOrg = ({ id, state }) => req('POST', `/v1/orgs/${encodeURIComponent(String(id))}`, { state: state || null });
+
+  return { url, status, login, orgs, createOrg, joinOrg, updateOrg, register, logout, changeUrl, terms, acceptTerms, adopt, payrollToken, freshPayrollToken, cached, signedIn: () => !!readToken(), forget: signOutHere };
 }
 
 module.exports = { createAccount, checkUrl, AccountError, DEFAULT_HUB_URL };

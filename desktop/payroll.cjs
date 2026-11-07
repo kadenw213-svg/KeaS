@@ -79,8 +79,12 @@ function createPayroll({ getConfig, setConfig, userData, root, hubPort, account,
   async function stop() {
     const s = server;
     server = null; port = null;
-    if (s) { try { idleMs = s.keas.status().idleMinutes * 60_000; } catch {} await s.close().catch(() => {}); }
+    if (s) { try { idleMs = s.keas.status().idleMinutes * 60_000; noteSummary(s); } catch {} await s.close().catch(() => {}); }
   }
+  // What Payroll's own "Get set up" said the last time the vault was open: step titles and done or not only (no
+  // names or pay), in memory only, for the KeaS window's checklist.
+  let summary = null;
+  const noteSummary = (s = server) => { try { const v = s?.keas.checklist?.(); if (v) summary = v; } catch {} };
   /** The vault locked itself (a quiet spell) or Lock was chosen: the passphrase is forgotten and the window closes. */
   function locked(why) {
     keeper.forget();
@@ -96,7 +100,8 @@ function createPayroll({ getConfig, setConfig, userData, root, hubPort, account,
     try {
       await start();
       const st = server.keas.status();
-      const out = { ...base, initialized: st.initialized, org: st.org, ownHub: st.ownHub };
+      noteSummary();
+      const out = { ...base, initialized: st.initialized, org: st.org, ownHub: st.ownHub, summary: st.initialized ? summary : null };
       if (!win) await stop();
       return out;
     } catch (e) { return { ...base, initialized: null, error: e.message }; }
@@ -194,6 +199,7 @@ function createPayroll({ getConfig, setConfig, userData, root, hubPort, account,
   /** Forget the passphrase and close Payroll (signing out, another Hub, the setting turned on). */
   async function forget() {
     keeper.forget();
+    summary = null;
     if (win) { const w = win; win = null; w.destroy(); }
     await stop();
   }

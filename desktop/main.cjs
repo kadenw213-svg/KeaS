@@ -427,6 +427,20 @@ function registerIpc() {
   handle('account:acceptTerms', (a) => account().acceptTerms(a));
   handle('account:logout', async () => { payrollApi?.forget?.(); return account().logout(); });
   handle('account:setUrl', async ({ url }) => { payrollApi?.forget?.(); return account().changeUrl(url); });
+  // ---------- Get set up (checklist.cjs): every step until this person is good to go, checked again each time ----------
+  handle('checklist', async () => {
+    const hub = hubMode();
+    const a = await account().status().catch((e) => ({ signedIn: account().signedIn(), reachable: false, account: account().cached(), error: e.message }));
+    let orgs = null, orgsError = null;
+    if (a.signedIn && a.reachable !== false) { try { orgs = await account().orgs(); } catch (e) { orgsError = e.message; } }
+    let owner = null;
+    if (hub && config.ownerEmail && hubRunning()) { try { owner = ownerLib.ownerState(await hubDb(), config.ownerEmail); } catch {} }
+    const p = a.signedIn ? await payroll().status().catch(() => null) : null;
+    return require('./checklist.cjs').keasSteps({ hub, config, folderProblem, hubRunning: hubRunning(), lastStartError, owner, update: updates?.state(), account: a, orgs, orgsError, payroll: p });
+  });
+  handle('org:create', (a) => account().createOrg(a));
+  handle('org:join', (a) => account().joinOrg(a));
+  handle('org:update', (a) => account().updateOrg(a));
   handle('settings:startWithWindows', ({ on }) => {
     config = writeConfig({ ...config, startWithWindows: !!on });
     if (!DEV) app.setLoginItemSettings({ openAtLogin: !!on, args: ['--hidden'] });

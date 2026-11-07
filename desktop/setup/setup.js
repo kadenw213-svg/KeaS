@@ -437,6 +437,7 @@ function status() {
   const c = S.config;
   return [
     h('h1', null, c.role === 'hub' ? 'Kea Hub' : 'KeaS server'),
+    checklistPanel(),
     h('div', { class: 'panel' },
       h('p', null, h('span', { class: `dot ${S.running ? 'ok' : 'bad'}`, style: 'display:inline-block;vertical-align:-4px;margin-right:8px' }), S.running ? 'Running' : 'Not running'),
       // Why it didn't start, and what to do about it.
@@ -499,7 +500,7 @@ async function openPay() {
   }
 }
 /** After opening: secrets typed into the forms are dropped from the page. */
-function payOpened() { S.payForm = null; S.payData = null; S.payLocked = null; S.pay = null; S.busy = false; render(); }
+function payOpened() { S.payForm = null; S.payData = null; S.payLocked = null; S.pay = null; S.busy = false; render(); setTimeout(loadChecklist, 1500); }
 function payrollPanel() {
   const p = S.pay;
   if (!p) { loadPayroll(); return h('div', { class: 'panel' }, h('p', { class: 'muted small' }, 'Loading…')); }
@@ -534,6 +535,9 @@ function payrollPanel() {
     ];
   } else if (f.need === 'setup') {
     const zone = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { return 'America/Denver'; } })();
+    // (Starts from the organization on the Kea Hub, when there is one.)
+    const o = S.cl && S.cl.org;
+    if (o && d.orgName === undefined) { d.orgName = o.name; d.state = d.state || o.state || ''; if (o.tz) d.tz = o.tz; }
     if (!d.tz) d.tz = zone;
     const zones = TIME_ZONES.includes(d.tz) ? TIME_ZONES : [d.tz, ...TIME_ZONES];
     const a = S.acct || {};
@@ -544,7 +548,7 @@ function payrollPanel() {
       if (why) { S.payError = why; render(); return; }
       S.busy = true; S.payError = ''; render();
       try {
-        await call(k.payrollSetup, { passphrase: d.passphrase, hubKeyFingerprint: confirmKey ? f.fingerprint : undefined, org: { name: d.orgName, state: d.state, tz: d.tz, payPeriodAnchor: d.anchor || undefined, futaExempt: !!d.futa, sutaRate: d.suta ? Number(d.suta) : undefined } });
+        await call(k.payrollSetup, { passphrase: d.passphrase, hubKeyFingerprint: confirmKey ? f.fingerprint : undefined, org: { name: d.orgName, state: d.state, tz: d.tz, workCity: d.workCity || undefined, payPeriodAnchor: d.anchor || undefined, futaExempt: !!d.futa, sutaRate: d.suta ? Number(d.suta) : undefined } });
         payOpened();
       } catch (e) { S.busy = false; S.payError = e.message; render(); }
     },
@@ -555,6 +559,7 @@ function payrollPanel() {
       h('option', { value: '' }, 'Pick a state'),
       US_STATES.map((s) => h('option', { value: s, selected: d.state === s }, tables.includes(s) ? `${s} (state tax tables included)` : s)))),
     d.state && !tables.includes(d.state) && h('p', { class: 'muted small' }, `KeaS doesn’t have ${d.state} tax tables yet, so state taxes aren’t worked out for you.`),
+    field('City or county where people work', 'workCity'),
     h('label', { class: 'field' }, 'Time zone', h('select', { onchange: (e) => (d.tz = e.target.value) }, zones.map((z) => h('option', { value: z, selected: d.tz === z }, z.replace('_', ' '))))),
     field('Vault passphrase (12+ characters)', 'passphrase', 'password', { autocomplete: 'new-password' }),
     field('Vault passphrase again', 'passphrase2', 'password', { autocomplete: 'new-password' }),
@@ -788,10 +793,81 @@ function accountPanel() {
       try { S.acctStatus = await call(k.accountLogout); S.acct = null; go(S.hub ? 'status' : 'signin'); } catch (e) { fail(e); }
     } }, 'Sign out'));
 }
+// ---------- Get set up: every step until this person is good to go (desktop/checklist.cjs decides the steps) ----------
+function loadChecklist() {
+  if (S.clLoading) return;
+  S.clLoading = true;
+  call(k.checklist).then((v) => { S.cl = v; S.clLoading = false; if (['home', 'status'].includes(S.step) && !S.busy && !typingNow()) render(); }).catch(() => { S.clLoading = false; });
+}
+const typingNow = () => !!document.activeElement && ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName);
+// (Each step checks itself again when KeaS comes back to the front, and every half minute while the list is open.)
+window.addEventListener('focus', () => { if (['home', 'status'].includes(S.step)) loadChecklist(); });
+setInterval(() => { if (['home', 'status'].includes(S.step) && !document.hidden && S.cl && !S.cl.allSet) loadChecklist(); }, 30_000);
+const STATES = ['AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'DC', 'FL', 'GA', 'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD', 'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ', 'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC', 'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY'];
+/** Where each step's button takes the person. */
+async function stepAction(s) {
+  S.clOpen = s.id;
+  switch (s.action) {
+    case 'status': return go('status');
+    case 'startHub': S.busy = true; render(); try { await call(k.start); } catch {} S.busy = false; await load(); return loadChecklist();
+    case 'reach': S.reach = 'tailscale'; S.tsChecked = false; S.ts = {}; S.log = []; S.publicUrl = null; return go('reachSettings');
+    case 'settings': S.bs = null; S.bo = null; S.bootScript = null; S.bootResult = null; return go('settings');
+    case 'update': { const u = S.update || {}; if (await askInPage(`Restart KeaS now to install ${u.version || 'the update'}?`, '', 'Restart and update')) call(k.installUpdate).catch(fail); return; }
+    case 'signin': return go('signin');
+    case 'termsAccept': S.acctTerms = null; return go('termsAccept');
+    case 'payroll': return openPay();
+    case 'org': case 'orgEdit': S.orgForm = S.orgForm || { name: '', state: '', code: '' }; return render();
+    default: return loadChecklist();
+  }
+}
+/** Create or join the organization, or set where people work (inside its step). */
+function orgForm(s) {
+  const f = S.orgForm;
+  const err = S.orgError && h('div', { class: 'err' }, S.orgError);
+  const done = async (p) => { S.busy = true; S.orgError = ''; render(); try { await p; S.orgForm = null; S.busy = false; loadChecklist(); render(); } catch (e) { S.busy = false; S.orgError = e.message; render(); } };
+  const stateSel = h('select', { onchange: (e) => (f.state = e.target.value) }, h('option', { value: '' }, 'State where people work'), STATES.map((x) => h('option', { value: x, selected: f.state === x }, x)));
+  const tz = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { return 'America/Denver'; } })();
+  if (s.action === 'orgEdit')
+    return form(() => done(call(k.orgUpdate, { id: S.cl.org.id, state: f.state })), h('div', { class: 'row' }, stateSel, h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, 'Save')), err);
+  return h('div', null,
+    form(() => done(call(k.orgCreate, { name: f.name, state: f.state, tz })),
+      h('label', { class: 'field' }, 'Organization name', h('input', { type: 'text', value: f.name, oninput: (e) => (f.name = e.target.value) })),
+      h('div', { class: 'row' }, stateSel, h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, 'Create it'))),
+    h('p', { class: 'muted small' }, 'The Kea Hub’s owner approves new organizations. Or join one with the code someone gave you:'),
+    form(() => done(call(k.orgJoin, { code: f.code })),
+      h('div', { class: 'row' }, h('input', { type: 'text', placeholder: 'Join code', value: f.code, oninput: (e) => (f.code = e.target.value), style: 'max-width:260px' }), h('button', { class: 'btn', type: 'submit', disabled: S.busy }, 'Join'))),
+    err);
+}
+function checklistPanel() {
+  const cl = S.cl;
+  if (!cl) { loadChecklist(); return h('div', { class: 'panel' }, h('p', { class: 'muted small' }, 'Checking what’s left to set up…')); }
+  // All set: one small line, with a way back to the steps.
+  if (cl.allSet && !S.clShow)
+    return h('p', { class: 'ok small' }, h('span', { class: 'dot ok', style: 'display:inline-block;vertical-align:-5px;margin-right:8px' }),
+      cl.waiting ? 'All set. Tax tables are waiting for a KeaS update. ' : 'All set. ',
+      h('button', { class: 'btn', onclick: () => { S.clShow = true; render(); } }, 'Show setup steps'));
+  return h('div', { class: 'panel' },
+    h('div', { class: 'row', style: 'justify-content:space-between' },
+      h('h2', { style: 'margin:0' }, cl.allSet ? 'Setup steps' : `Get set up: ${cl.left} step${cl.left === 1 ? '' : 's'} left`),
+      h('div', { class: 'row' },
+        h('button', { class: 'btn', disabled: S.clLoading, onclick: () => loadChecklist() }, S.clLoading ? 'Checking…' : 'Check again'),
+        cl.allSet && h('button', { class: 'btn', onclick: () => { S.clShow = false; render(); } }, 'Hide'))),
+    h('ul', { class: 'steps', style: 'margin-top:12px' }, cl.steps.map((s) => h('li', null,
+      h('span', { class: `dot ${s.done ? 'ok' : s.waiting ? 'run-static' : ''}` }),
+      h('div', { style: 'flex:1' },
+        h('b', null, s.title), s.optional && h('span', { class: 'tag' }, 'Optional'), s.waiting && h('span', { class: 'tag' }, 'Waiting for an update'),
+        h('div', { class: 'muted small' }, s.text),
+        !s.done && S.orgForm && (s.action === 'org' || s.action === 'orgEdit') && orgForm(s)),
+      !s.done && s.action && s.action !== 'recheck' && !(S.orgForm && (s.action === 'org' || s.action === 'orgEdit')) && h('button', { class: 'btn primary', disabled: S.busy, onclick: () => stepAction(s) }, ACTION_WORDS[s.action] || 'Do this'),
+      !s.done && s.action === 'recheck' && h('button', { class: 'btn', disabled: S.clLoading, onclick: () => loadChecklist() }, 'Check again')))));
+}
+const ACTION_WORDS = { status: 'Open', startHub: 'Start the Hub', reach: 'Set it up', settings: 'Set it up', update: 'Restart and update', signin: 'Sign in', termsAccept: 'Read and agree', payroll: 'Open Payroll', org: 'Create or join', orgEdit: 'Add the state' };
+
 /** The home screen for everyone who isn't running the Hub. */
 function home() {
   return [
     h('h1', null, 'KeaS'),
+    checklistPanel(),
     accountPanel(),
     h('h2', { style: 'margin-top:22px' }, 'Payroll'),
     payrollPanel(),
@@ -844,9 +920,10 @@ async function load() {
     S.drives = [];
     render();
     refreshAccount();
+    if (S.step === 'home') loadChecklist();
     return;
   }
-  if (st.config.setupDone) { S.role = st.config.role; S.step = 'status'; refreshAccount(); }
+  if (st.config.setupDone) { S.role = st.config.role; S.step = 'status'; refreshAccount(); loadChecklist(); }
   else if (!S.resumed && st.resume) {
     // An unfinished setup: back where it stopped, with what was already chosen.
     S.resumed = true;
