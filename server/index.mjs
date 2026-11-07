@@ -15,7 +15,7 @@ import { makeApprovals } from './payroll/approvals.mjs';
 import { registerPayroll } from './payroll/index.mjs';
 import { localDate, zonedToUtc, addDays, dayNum, iso, toMs, ageOn } from './lib/time.mjs';
 
-export const VERSION = '0.3.0';
+export const VERSION = '0.4.0';
 const HOST = '127.0.0.1';
 const MAX_BODY = 1024 * 1024;
 const SESSION_HOURS = 12;
