@@ -63,7 +63,8 @@ function welcome() {
 
 function storage() {
   const name = S.role === 'hub' ? 'Kea Hub' : 'KeaS Server';
-  const pick = (d) => { S.dataDir = `${d.root}${name}`; S.storageDir = ''; render(); };
+  // (Another drive keeps the folder name typed so far; only the drive letter changes.)
+  const pick = (d) => { const rest = /^[a-z]:\\(.+)$/i.exec(S.dataDir.trim())?.[1]; S.dataDir = `${d.root}${rest || name}`; S.storageDir = ''; render(); };
   const onDrive = (d) => S.dataDir.toUpperCase().startsWith(d.root.toUpperCase());
   return [
     h('h1', null, 'Where should the data go?'),
@@ -72,7 +73,7 @@ function storage() {
       : 'Your organization’s schedules, punches and records are kept here.'),
     h('div', { class: 'drives' }, S.drives.map((d) =>
       h('button', { class: `choice drive ${onDrive(d) ? 'on' : ''}`, onclick: () => pick(d) },
-        h('b', null, `${d.letter}: drive`), h('span', { class: 'muted small' }, `${size(d.free)} free of ${size(d.total)}`),
+        h('b', null, `${d.letter}: ${d.label || 'drive'}`), h('span', { class: 'muted small' }, `${size(d.free)} free of ${size(d.total)}`),
         h('div', { class: 'bar' }, h('span', { style: `width:${Math.round((1 - d.free / d.total) * 100)}%` }))))),
     h('label', { class: 'field' }, 'Folder', h('div', { class: 'row' },
       h('input', { type: 'text', value: S.dataDir, oninput: (e) => (S.dataDir = e.target.value) }),
@@ -87,9 +88,10 @@ function storage() {
     h('div', { class: 'actions' },
       h('button', { class: 'btn', onclick: back }, 'Back'),
       h('button', { class: 'btn primary', disabled: S.busy || !S.dataDir.trim(), onclick: async () => {
-        S.busy = true; render();
+        S.busy = true; S.error = ''; render();
         try { const r = await call(k.checkFolder, { dir: S.dataDir }); S.folderWarning = r.warning || null; S.busy = false; go('reach'); } catch (e) { fail(new Error(`Can’t use that folder: ${e.message}`)); }
-      } }, 'Next')),
+      } }, S.busy ? 'Checking…' : 'Next')),
+    h('p', { class: 'muted small' }, 'Only drives inside this PC are shown: cloud drives (Google Drive, OneDrive…), network and removable drives can’t hold the Hub’s data.'),
   ];
 }
 

@@ -15,6 +15,7 @@ const bootstart = require('./bootstart.cjs');
 const { createUpdates } = require('./updates.cjs');
 const ownerLib = require('./owner.cjs');
 const flow = require('./flow.cjs');
+const drivesLib = require('./drives.cjs');
 const { createAccount } = require('./account.cjs');
 
 // Only the Hub's owner runs the Hub: its setup is there only with this switch, or on a PC that already runs a Hub.
@@ -324,14 +325,17 @@ async function installUpdate() {
 }
 
 // ---------- drives ----------
-function drives() {
+/** The drives inside this PC that can hold the Hub's data (drives.cjs: no cloud, network or removable drives). */
+async function drives() {
+  const info = await drivesLib.logicalDisks();
   const out = [];
   for (const L of 'CDEFGHIJKLMNOPQRSTUVWXYZ') {
     const root = `${L}:\\`;
+    if (drivesLib.driveProblem(info[L])) continue;
     try {
       const s = fs.statfsSync(root);
       const total = s.blocks * s.bsize, free = s.bavail * s.bsize;
-      if (total > 0) out.push({ letter: L, root, total, free });
+      if (total > 0) out.push({ letter: L, root, total, free, label: info[L]?.label || null, fileSystem: info[L]?.fileSystem || null });
     } catch {}
   }
   return out;
@@ -339,6 +343,9 @@ function drives() {
 /** A folder KeaS may keep data in: checked (bootstart.validateDataDir), made if needed, locked down to this account if the drive allows it, and written to. */
 async function checkFolder(dir, label) {
   dir = bootstart.validateDataDir(dir, label);
+  const letter = /^([a-z]):/i.exec(dir)?.[1]?.toUpperCase();
+  const why = letter && drivesLib.driveProblem((await drivesLib.logicalDisks())[letter]);
+  if (why) throw new Error(`The Hub’s data can’t go on ${letter}: because ${why}. Pick a drive inside this PC.`);
   const secured = await bootstart.secureDataFolder(dir);
   if (secured.unlocked) log('not locked down', dir, secured.unlocked);
   const probe = path.join(dir, `.keas-write-test-${process.pid}`);
@@ -387,8 +394,8 @@ function registerIpc() {
   handle('update:check', () => updates.check());
   handle('update:install', () => updates.install());
   handle('state', async () => {
-    const defaults = { hubData: defaultFolder('Kea Hub'), orgData: defaultFolder('KeaS Server') };
     const hub = hubMode();
+    const defaults = hub && !config.setupDone ? { hubData: await defaultFolder('Kea Hub') } : {};
     return {
       config: publicConfig(), folderProblem, folderWarning, lastStartError, running: { hub: hubRunning(), org: !!org, hubExternal }, port: servicePort(),
       defaults, resume: hub ? flow.resumeChoices(config, defaults) : null, version: app.getVersion(),
@@ -553,9 +560,9 @@ async function refreshBoot(force) {
   } catch (e) { log('boot files', e.message); }
 }
 
-function defaultFolder(name) {
+async function defaultFolder(name) {
   // The drive with the most free space (often the big data drive), not the system drive if another is bigger.
-  const d = drives().sort((a, b) => b.free - a.free)[0];
+  const d = (await drives()).sort((a, b) => b.free - a.free)[0];
   return d ? path.join(d.root, name) : path.join(os.homedir(), name);
 }
 
