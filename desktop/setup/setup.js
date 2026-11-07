@@ -493,6 +493,8 @@ async function openPay() {
     S.busy = false;
     if (r.opened) { S.payForm = null; S.payLocked = null; S.pay = null; } else { S.payForm = r; S.payData = S.payData || {}; }
     render();
+    // (Opened from the checklist at the top: bring the form it asks for into view.)
+    if (!r.opened) document.getElementById('payroll')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) {
     S.busy = false;
     if (e.data && e.data.need === 'signin') { go('signin'); return; }
@@ -590,7 +592,7 @@ function payrollPanel() {
       err,
       h('div', { class: 'actions' }, cancel, h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, S.busy ? 'Opening…' : 'Open Payroll')));
   }
-  return h('div', { class: 'panel' }, intro, body,
+  return h('div', { class: 'panel', id: 'payroll' }, intro, body,
     !f && err,
     h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !!p.askEveryTime, onchange: async (e) => {
       try { await call(k.payrollAskEveryTime, { on: e.target.checked }); S.pay = null; S.payForm = null; render(); } catch (er) { fail(er); }
