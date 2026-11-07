@@ -7,7 +7,7 @@ import { serveStatic, securityHeaders, DEFAULT_WEB_DIR } from './static.mjs';
 import { fileURLToPath } from 'node:url';
 import { openDb, DEFAULT_DB, byName, rowToPerson, rowToOrg, rowToShift, rowToPosition, rowToCertType, rowToPunch, rowToRequest, rowToSwap } from './db.mjs';
 import { seed } from './seed.mjs';
-import { mergeRules, checkAssignment, timecard, unforceable, isBlocked } from './lib/rules.mjs';
+import { mergeRules, withPlace, checkAssignment, timecard, unforceable, isBlocked } from './lib/rules.mjs';
 import { makeVault, openDevVault, VaultLocked, VaultDamaged, SealError } from './payroll/vaultstate.mjs';
 import { makeHubClient, checkHubUrl, keyFingerprint, KEY_CHANGE_REASONS, KEY_CHANGE_WARNING } from './payroll/hub.mjs';
 import { makeTables } from './payroll/run.mjs';
@@ -85,7 +85,7 @@ function sameOrigin(req, origins) {
 export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = process.env.KEAS_WEB_DIR || DEFAULT_WEB_DIR, log = true, now = () => Date.now(),
   vault: vaultMode = process.env.KEAS_VAULT === '1', hubUrl = process.env.KEAS_HUB_URL || null, sharedDir = SHARED, passphrase = process.env.KEAS_VAULT_PASSPHRASE || null, fetchImpl = globalThis.fetch,
   localSignIn = false, hubTrustKeys = null, devKeyFile = dbFile === DEFAULT_DB || dbFile === ':memory:' || process.env.KEAS_DEV_KEYFILE === '1',
-  demo = process.env.KEAS_DEV_DEMO === '1', publicHosts = [], setupToken = undefined } = {}) {
+  demo = process.env.KEAS_DEV_DEMO === '1', publicHosts = [], setupToken = undefined, onVaultLock = null } = {}) {
   const demoOn = !!demo && !vaultMode;
   const vaultSetupToken = !vaultMode || setupToken === false ? null : setupToken || process.env.KEAS_VAULT_SETUP_TOKEN || randomBytes(32).toString('base64url');
   const extraHosts = (Array.isArray(publicHosts) ? publicHosts : [publicHosts]).filter(Boolean).map((x) => String(x).toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, ''));
@@ -104,7 +104,8 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
   const loadOrg = (id) => rowToOrg(h.get('SELECT * FROM orgs WHERE id = ?', id));
   const rulesFor = (org) => {
     const f = join(sharedDir, 'labor', `${org.state}.json`);
-    return mergeRules(us, existsSync(f) ? readJson(f) : null, org.ruleOverrides);
+    // (A city or county the tables know, like Denver's minimum wage, applies where the org says people work.)
+    return withPlace(mergeRules(us, existsSync(f) ? readJson(f) : null, org.ruleOverrides), org.settings?.workCity);
   };
   const audit = (org, actor, action, target, detail) => h.run('INSERT INTO audit_log (org_id,actor,action,target,detail,at) VALUES (?,?,?,?,?,?)', org, actor, action, target, JSON.stringify(detail ?? null), iso(now()));
 
@@ -475,10 +476,33 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     const person = getPerson(pid, org.id);
     return computeTimecard(org, person, parsePeriod(org, query.periodStart, currentPeriod(org)));
   });
+  // Everyone's timecard for one pay period (default: the period the pay run is on), for approving them together.
+  route('GET', '/v1/timecards/period', ({ me, org, query }) => {
+    need(me, 'manager', 'payroll');
+    const period = parsePeriod(org, query.periodStart, lastCompleted(org));
+    const rows = h.all(`SELECT id FROM people WHERE org_id = ? AND status IN ('active','leave') AND worker_type = 'employee' ORDER BY name`, org.id).map((r) => getPerson(r.id, org.id));
+    const people = rows.map((p) => {
+      const tc = computeTimecard(org, p, period);
+      return { personId: p.id, name: p.name, workedMin: tc.totals?.workedMin || 0, overtimeMin: tc.totals?.overtimeMin || 0, approved: !!tc.approved, flags: (tc.flags || []).length, pendingRequests: tc.pendingRequests || 0, mine: p.id === me.id };
+    });
+    return { period, people };
+  });
+  route('POST', '/v1/timecards/approve-many', ({ me, org, body }) => {
+    need(me, 'manager');
+    const ids = Array.isArray(body.personIds) ? body.personIds.slice(0, 500) : bad('personIds must be a list');
+    const results = ids.map((id) => {
+      try { return { personId: id, ok: true, ...approveTimecard(me, org, V.id(id, 'personId'), body.periodStart) }; }
+      catch (e) { return { personId: id, ok: false, error: e.message }; }
+    });
+    return { results };
+  });
   route('POST', '/v1/timecards/approve', ({ me, org, body }) => {
     need(me, 'manager');
-    const person = getPerson(V.id(body.personId, 'personId'), org.id);
-    const period = parsePeriod(org, V.date(body.periodStart, 'periodStart'), null);
+    return approveTimecard(me, org, V.id(body.personId, 'personId'), body.periodStart);
+  });
+  function approveTimecard(me, org, personId, periodStart) {
+    const person = getPerson(personId, org.id);
+    const period = parsePeriod(org, V.date(periodStart, 'periodStart'), null);
     if (person.id === me.id && !me.roles.includes('owner')) throw new HttpError(403, 'you cannot approve your own timecard');
     if (h.get('SELECT 1 FROM timecard_approvals WHERE person_id = ? AND period_start = ?', person.id, period.start)) throw new HttpError(409, 'already approved');
     if (approvals.configured(org.id, 'timecard')) {
@@ -493,7 +517,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     h.run('INSERT INTO timecard_approvals (person_id,period_start,approved_by,at) VALUES (?,?,?,?)', person.id, period.start, me.id, iso(now()));
     audit(org.id, me.id, 'timecard_approve', person.id, { periodStart: period.start });
     return { approved: { by: me.id, at: iso(now()) }, personId: person.id, period };
-  });
+  }
 
   // ---------- payroll and HR ----------
   const approvals = makeApprovals({ h, now, iso, uid: (p) => `${p}-${randomUUID()}`, audit, HttpError });
@@ -507,6 +531,8 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     // This PC's own Hub's public key (from the KeaS app, when this PC is the Hub): the Hub must prove it holds it.
     hubTrustKeys: typeof hubTrustKeys === 'function' ? hubTrustKeys : () => hubTrustKeys,
     setupToken: vaultSetupToken,
+    // The KeaS app forgets the passphrase it kept for this run when the vault locks (after a quiet spell, or Lock).
+    onVaultLock: typeof onVaultLock === 'function' ? onVaultLock : null,
     uid: (p) => `${p}-${randomUUID()}`, today: (org) => localDate(now(), org.tz),
     getPerson, getShift, loadOrg, rulesFor, tablesFor, computeTimecard, positionsOf,
     periodOf, currentPeriod, lastCompleted, parsePeriod, newSession, sessionCookie,
@@ -616,6 +642,8 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
   const ownOrigins = () => new Set([...localHosts().map((x) => `http://${x}`), ...extraHosts.map((x) => `https://${x}`)]);
   return {
     server, h, vault, setupToken: vaultSetupToken,
+    /** The KeaS app's own sign-in and setup with its signed-in Kea account (in this process only; see vaultauth.mjs). */
+    keas: ctx.keas,
     /**
      * The Kea Hub's current signing key next to the one payroll trusts: fingerprints to compare, and why a key changes.
      * The KeaS app shows this before the owner accepts a new key (repinHub).

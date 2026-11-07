@@ -17,6 +17,11 @@ Needs Node 24.
 
 ## The Hub
 
+- **Running the Hub from the KeaS app (the owner only):** start KeaS with `--host-hub` (for example
+  `KeaS.exe --host-hub`, or `npm run desktop -- --host-hub`). That opens the Hub setup wizard; nothing else in KeaS
+  leads there. Once a PC runs a Hub (setup finished), KeaS shows the Hub's status page without the switch. Everyone
+  else gets "Sign in to Kea" / "Create an account" (the Hub address is under Advanced; `desktop/account.cjs`).
+  Setup remembers its step (`setupStep` in `keas-config.json`), so it picks up where it stopped.
 - **Data:** `hub/data/` (or `KEA_HUB_DATA`); account files in `KEA_HUB_STORAGE`.
 - **Owner tools** (run on the Hub's own computer):
   - `node hub/owner.mjs make-owner <email>`;

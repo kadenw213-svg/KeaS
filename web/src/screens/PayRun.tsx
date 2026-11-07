@@ -1,6 +1,6 @@
 import { Fragment, useState } from 'react';
 import { ChevronDown, ChevronLeft, ChevronRight, ShieldAlert, ShieldCheck, TriangleAlert } from 'lucide-react';
-import { listOf, fmtDay, money, addDays } from '../store';
+import { listOf, fmtDay, money, addDays, go } from '../store';
 import { api } from '../api';
 import { ask, toast } from '../ui';
 import { act, download, saveText, useLoad, Loading, Stat, Table, Tag, human } from '../kit';
@@ -67,7 +67,23 @@ export function PayRun() {
       ) : null}
       {groupWarnings(listOf(run.warnings, 'warnings'), lines).map((x, i) => (
         <div key={i} className="work-banner warn">
-          <TriangleAlert size={15} /> {x}
+          <TriangleAlert size={15} /> {x.text}{' '}
+          {/* Each warning leads to where it's fixed. */}
+          {fixFor(x.code) === 'timecards' ? (
+            <button className="btn sm" onClick={() => go('timecards', { team: true, periodStart: ps })}>
+              Open timecards
+            </button>
+          ) : fixFor(x.code) === 'org' ? (
+            <button className="btn sm" onClick={() => go('org')}>
+              Open Org and pay setup
+            </button>
+          ) : fixFor(x.code) ? (
+            x.people.slice(0, 4).map((p) => (
+              <button key={p.id} className="btn sm" onClick={() => go('employees', { personId: p.id, edit: fixFor(x.code) as any })}>
+                Fix {x.people.length > 1 ? p.name : ''}
+              </button>
+            ))
+          ) : null}
         </div>
       ))}
       <div className="work-totals">
@@ -232,8 +248,13 @@ export function PayRun() {
   );
 }
 
+/** Where each warning is fixed: a card in the person's profile, the timecards, or Org and pay setup. */
+function fixFor(code: string): 'tax' | 'deposit' | 'rate' | 'timecards' | 'org' | null {
+  return ({ no_ssn: 'tax', no_w4: 'tax', no_deposit: 'deposit', below_minimum_wage: 'rate', timecard_not_approved: 'timecards', missed_punch: 'timecards', pending_requests: 'timecards', no_state_table: 'org' } as const)[code] || null;
+}
+
 /** One line per kind of warning instead of a row per person. The unverified-tables notice is already the red banner. */
-function groupWarnings(warnings: any[], lines: any[]): string[] {
+function groupWarnings(warnings: any[], lines: any[]): { text: string; code: string; people: { id: string; name: string }[] }[] {
   const name = (id: string) => lines.find((l) => l.personId === id)?.name || 'someone';
   const groups = new Map<string, any[]>();
   for (const w of warnings) {
@@ -241,16 +262,17 @@ function groupWarnings(warnings: any[], lines: any[]): string[] {
     const key = w.personId ? w.code || w.message : w.message || w.code;
     groups.set(key, [...(groups.get(key) || []), w]);
   }
-  const out: string[] = [];
+  const out: { text: string; code: string; people: { id: string; name: string }[] }[] = [];
   for (const [, list] of groups) {
+    const people = list.filter((w) => w.personId).map((w) => ({ id: w.personId, name: name(w.personId) }));
     if (list.length === 1 || !list[0].personId) {
-      out.push(list[0].message || String(list[0].code));
+      out.push({ text: list[0].message || String(list[0].code), code: list[0].code, people });
       continue;
     }
-    const who = list.map((w) => name(w.personId));
+    const who = people.map((p) => p.name);
     const shown = who.length > 4 ? who.slice(0, 4).join(', ') + ` and ${who.length - 4} more` : who.join(', ');
     const what = (list[0].message || '').replace(/^[^:]+:\s*/, '');
-    out.push(`${what.charAt(0).toUpperCase() + what.slice(1)} for ${list.length} people: ${shown}.`);
+    out.push({ text: `${what.charAt(0).toUpperCase() + what.slice(1)} for ${list.length} people: ${shown}.`, code: list[0].code, people });
   }
   return out;
 }

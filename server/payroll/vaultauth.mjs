@@ -14,7 +14,7 @@
 import { timingSafeEqual, createHash } from 'node:crypto';
 import { hashLocalPassword, checkLocalPassword } from '../lib/vault.mjs';
 import { byName } from '../db.mjs';
-import { HubUnreachable, HubRefused, ISSUER, keyFingerprint } from './hub.mjs';
+import { HubUnreachable, HubRefused, ISSUER, KEY_CHANGED, keyFingerprint } from './hub.mjs';
 import { addDays, weekStartOf } from '../lib/time.mjs';
 
 /** Where wrong-try counts live: in memory (tests), or a table (the vault: survives restarts). */
@@ -65,7 +65,10 @@ export function checkLocalStrength(pw, { email, passphrase } = {}) {
 }
 
 const LOCAL_OFF = 'Signing in with a local password is turned off. The owner can turn it on in the KeaS app on this computer (Payroll, Advanced).';
-const LOCAL_HUB_UP = 'The Kea Hub can be reached, so sign in with your Kea Hub account. A local password only works while the Hub can’t be reached.';
+const VERIFY_EMAIL = 'Verify your email address in your Kea account first (in the Kea app: Kea account, Verify with Google), then open Payroll again.';
+const CODE_NEEDED = 'Enter the two-step code from your authenticator app.';
+const CODE_USED = 'That two-step code was already used or has expired. Wait for the next one and try again.';
+const LOCAL_HUB_UP ='The Kea Hub can be reached, so sign in with your Kea Hub account. A local password only works while the Hub can’t be reached.';
 const isLoopback = (ip) => !ip || ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
 
 export function registerVaultAuth(c) {
@@ -86,6 +89,7 @@ export function registerVaultAuth(c) {
     audit(orgId, 'keas', 'vault_lock', null, { why });
     h.run('DELETE FROM sessions');
     vault.lock();
+    c.onVaultLock?.(why);
     return true;
   };
   c.checkIdle = () => {
@@ -126,7 +130,12 @@ export function registerVaultAuth(c) {
   async function identifyAtHub(user, { email, password, code }) {
     let who;
     try { who = await hub.signIn(hubUrl(), { email, password, code }, { pin: pin(), trust: c.hubTrustKeys?.() }); }
-    catch (e) { if (e instanceof HubRefused && (e.status === 401 || e.status === 403) && !e.extra?.hubKeyChanged) return null; throw hubError(e, user); }
+    catch (e) {
+      // The password was right but the Hub wants a code (or the code was used up): say which, instead of "wrong".
+      if (e instanceof HubRefused && e.extra?.totpRequired) throw new HttpError(401, code ? CODE_USED : CODE_NEEDED, { totpRequired: true });
+      if (e instanceof HubRefused && (e.status === 401 || e.status === 403) && !e.extra?.hubKeyChanged) return null;
+      throw hubError(e, user);
+    }
     if (!user || who.email !== user.email || (user.hub_sub && user.hub_sub !== who.sub)) return null;
     if (!user.hub_sub) {
       // Linking an account for the first time: only one whose email the Hub has verified.
@@ -195,19 +204,115 @@ export function registerVaultAuth(c) {
       if (await hub.reachable(hubUrl())) throw new HttpError(409, 'The Kea Hub can be reached, so set up payroll with your Kea Hub account.');
       localPw = strong(s.password);
     }
+    const pid = createVault({ passphrase, keys, o, state, tz, name, email, hubSub, localPw, mode });
+    return c.newSession(pid, secure);
+  }, { auth: false, open: true });
+
+  /** Makes the vault, its organization and its first payroll admin; returns the admin's person id. */
+  function createVault({ passphrase, keys, o, state, tz, name, email, hubSub, localPw, mode }) {
+    const orgName = V.str(o.name, 'org name', { min: 1, max: 120 });
+    const today = new Date(now()).toISOString().slice(0, 10);
+    const anchor = o.payPeriodAnchor ? V.date(o.payPeriodAnchor, 'payPeriodAnchor') : weekStartOf(today, 0);
     vault.create(passphrase);
     if (keys) savePin(keys);
     const orgId = uid('org'), pid = uid('p');
-    const today = new Date(now()).toISOString().slice(0, 10);
-    const anchor = o.payPeriodAnchor ? V.date(o.payPeriodAnchor, 'payPeriodAnchor') : weekStartOf(today, 0);
     h.tx(() => {
-      h.run(`INSERT INTO orgs (id,name,state,tz,pay_frequency,pay_period_anchor,futa_exempt,suta_rate,bank,settings) VALUES (?,?,?,?,?,?,?,?,?,?)`, orgId, V.str(o.name, 'org name', { min: 1, max: 120 }), state, tz, 'biweekly', anchor, o.futaExempt ? 1 : 0, Number(o.sutaRate) || 0, '{}', '{}');
+      h.run(`INSERT INTO orgs (id,name,state,tz,pay_frequency,pay_period_anchor,futa_exempt,suta_rate,bank,settings) VALUES (?,?,?,?,?,?,?,?,?,?)`, orgId, orgName, state, tz, 'biweekly', anchor, o.futaExempt ? 1 : 0, Number(o.sutaRate) || 0, '{}', JSON.stringify(o.workCity ? { workCity: String(o.workCity).trim().slice(0, 60) } : {}));
       h.run(`INSERT INTO people (id,org_id,name,email,roles,positions,status,w4,ytd_wages_cents,hire_date) VALUES (?,?,?,?,?,?,?,?,0,?)`, pid, orgId, name, email, '["member","owner","payroll"]', '[]', 'active', '{}', null);
       h.run('INSERT INTO vault_users (id,person_id,email,hub_sub,local_pw,created_at) VALUES (?,?,?,?,?,?)', uid('vu'), pid, email, hubSub, localPw, iso(now()));
     });
     audit(orgId, pid, 'vault_setup', orgId, { mode });
-    return c.newSession(pid, secure);
-  }, { auth: false, open: true });
+    return pid;
+  }
+
+  // ---------- the KeaS app's own sign-in (in this process only: nothing here is reachable over HTTP) ----------
+  // The KeaS app is already signed in to the payroll admin's Kea account. It gets a short-lived token for the audience
+  // "keas-payroll" from that Hub and hands it over here with the passphrase, so nobody types their email and password
+  // again. The token must be signed by the Hub key this vault trusts (pinned at setup, or this PC's own Hub key).
+  function verifyGrant(hubToken, keys, iss = ISSUER) {
+    try { return hub.verifyWith(keys, String(hubToken || ''), { iss }); }
+    catch (e) {
+      if (e instanceof HubRefused && e.extra?.hubKeyChanged) throw new HttpError(401, KEY_CHANGED, { hubKeyChanged: true });
+      throw new HttpError(401, 'Payroll couldn’t confirm your Kea sign-in with the Kea Hub it trusts. Sign out of KeaS and in again.');
+    }
+  }
+  /** The admin a verified grant belongs to (linking the Hub account the first time, as the HTTP sign-in does). */
+  function userForGrant(p) {
+    const email = String(p.email || '').toLowerCase();
+    const user = h.get('SELECT * FROM vault_users WHERE hub_sub = ?', p.sub) || h.get('SELECT * FROM vault_users WHERE email = ? AND hub_sub IS NULL', email);
+    if (!user) throw new HttpError(403, `${email || 'This Kea account'} isn’t a payroll admin in this vault. Ask the owner to add you (Payroll, Vault and settings).`);
+    if (!user.hub_sub) {
+      if (p.ev !== true) throw new HttpError(403, VERIFY_EMAIL);
+      h.run('UPDATE vault_users SET hub_sub = ? WHERE id = ?', p.sub, user.id);
+    }
+    return user;
+  }
+  c.keas = {
+    status: () => ({ initialized: vault.initialized(), unlocked: vault.unlocked(), idleMinutes: idleMinutes(), hubUrl: hubUrl(), ownHub: !!c.hubTrustKeys?.()?.length, org: vault.initialized() ? h.get('SELECT name FROM orgs LIMIT 1')?.name ?? null : null }),
+    /** The Hub's key fingerprint to confirm before setting up with a Hub on another PC (none needed for this PC's own). */
+    async setupKey() {
+      if (vault.initialized()) throw new HttpError(409, 'This vault is already set up.');
+      if (!hubUrl()) throw new HttpError(409, 'No Kea Hub is set for payroll on this computer.');
+      const own = c.hubTrustKeys?.();
+      if (own?.length) return { url: hubUrl(), ownHub: true, fingerprint: keyFingerprint(own) };
+      try { return { url: hubUrl(), ownHub: false, fingerprint: keyFingerprint(await hub.fetchKeys(hubUrl())) }; } catch (e) { throw hubError(e, null); }
+    },
+    /** Sets up an empty vault for the signed-in account. Returns a session for the payroll window. */
+    async setup({ hubToken, passphrase, org = {}, hubKeyFingerprint }) {
+      if (c.mode !== 'vault') throw new HttpError(404, 'not found');
+      if (vault.initialized()) throw new HttpError(409, 'This vault is already set up.');
+      const pass = V.str(passphrase, 'passphrase', { min: 12, max: 500 });
+      const state = V.str(org.state, 'state', { min: 2, max: 2 }).toUpperCase();
+      const tz = V.str(org.tz ?? 'America/Denver', 'tz', { min: 3, max: 60 });
+      try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); } catch { bad('unknown time zone'); }
+      const keys = (await setupTrust(hubKeyFingerprint)) || (await hub.fetchKeys(hubUrl()).catch((e) => { throw hubError(e, null); }));
+      const p = verifyGrant(hubToken, keys);
+      if (p.ev !== true) throw new HttpError(403, VERIFY_EMAIL);
+      const email = String(p.email || '').toLowerCase();
+      const pid = createVault({ passphrase: pass, keys, o: org, state, tz, name: String(p.name || email).slice(0, 120), email, hubSub: p.sub, localPw: null, mode: 'keas' });
+      lastUse = now();
+      return c.newSession(pid, false);
+    },
+    /** Opens the vault for the signed-in account with the passphrase. Returns a session for the payroll window. */
+    signIn({ hubToken, passphrase }) {
+      if (c.mode !== 'vault') throw new HttpError(404, 'not found');
+      if (!vault.initialized()) throw new HttpError(409, 'Set up the vault first.');
+      let p0 = pin();
+      if (p0 && p0.url !== hubUrl()) throw new HttpError(401, KEY_CHANGED, { hubKeyChanged: true });
+      const own = c.hubTrustKeys?.();
+      const p = verifyGrant(hubToken, p0?.keys || own || [], p0?.iss || ISSUER);
+      const user = userForGrant(p);
+      if (!p0 && own?.length) savePin(own);
+      const mine = `user:${user.id}`;
+      guard(mine);
+      const wasLocked = !vault.unlocked();
+      if (!vault.unlock(V.str(passphrase, 'passphrase', { min: 1, max: 500 }))) {
+        limiter.fail(mine);
+        if (wasLocked && !h.get('SELECT 1 FROM sessions')) vault.lock();
+        throw new HttpError(401, 'That isn’t the vault passphrase.', { passphrase: true });
+      }
+      limiter.clear(mine);
+      lastUse = now();
+      h.run('UPDATE vault_users SET last_login = ? WHERE id = ?', iso(now()), user.id);
+      const orgId = h.get('SELECT org_id FROM people WHERE id = ?', user.person_id).org_id;
+      audit(orgId, user.person_id, 'vault_signin', user.id, { mode: 'keas' });
+      return c.newSession(user.person_id, false);
+    },
+    /**
+     * Checks a payroll admin's passphrase before the two-step code is asked for (so the code doesn't run out while
+     * they type). Changes nothing; wrong tries count as at sign-in.
+     */
+    checkPassphrase({ email, passphrase }) {
+      if (!vault.initialized()) throw new HttpError(409, 'Set up the vault first.');
+      const user = h.get('SELECT * FROM vault_users WHERE email = ?', String(email || '').trim().toLowerCase());
+      if (!user) throw new HttpError(403, `${email || 'This Kea account'} isn’t a payroll admin in this vault.`);
+      const mine = `user:${user.id}`;
+      guard(mine);
+      if (!vault.check(String(passphrase ?? ''))) { limiter.fail(mine); throw new HttpError(401, 'That isn’t the vault passphrase.', { passphrase: true }); }
+      return true;
+    },
+    lock: (why) => c.lockVault(why),
+  };
 
   route('POST', '/v1/vault/signin', async ({ body, secure, ip }) => {
     if (c.mode !== 'vault') throw new HttpError(404, 'not found');
@@ -251,7 +356,7 @@ export function registerVaultAuth(c) {
 
   route('POST', '/v1/vault/lock', ({ me, org, secure }) => {
     h.run('DELETE FROM sessions');
-    if (c.mode === 'vault') vault.lock();
+    if (c.mode === 'vault') { vault.lock(); c.onVaultLock?.('locked'); }
     audit(org.id, me.id, 'vault_lock', null, null);
     return { ok: true, cookies: [c.sessionCookie('', 0, secure)] };
   });
@@ -316,6 +421,8 @@ export function registerVaultAuth(c) {
     if (body.cobra !== undefined) s.cobra = { groupHealthPlan: !!body.cobra?.groupHealthPlan, stateContinuation: !!body.cobra?.stateContinuation };
     if (body.fmla !== undefined) s.fmla = { worksiteEmployees: body.fmla?.worksiteEmployees == null || body.fmla.worksiteEmployees === '' ? null : Math.round(num(body.fmla.worksiteEmployees, 'worksiteEmployees', 1e6)) };
     if (body.aca !== undefined) s.aca = { ale: !!body.aca?.ale };
+    // Where people work (a city or county): local rules KeaS knows about, like a city minimum wage, follow it.
+    if (body.workCity !== undefined) s.workCity = body.workCity == null || String(body.workCity).trim() === '' ? null : V.str(String(body.workCity).trim(), 'workCity', { max: 60 });
     if (body.offerTemplate !== undefined) s.offerTemplate = body.offerTemplate ? V.str(body.offerTemplate, 'offerTemplate', { max: 20000 }) : null;
     // Pay amounts in managers' reports: off unless the owner turns it on.
     if (body.managersSeePay !== undefined) { need(me, 'owner'); s.managersSeePay = !!body.managersSeePay; }

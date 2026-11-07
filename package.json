@@ -57,7 +57,8 @@
     "win": {
       "target": [
         "nsis"
-      ]
+      ],
+      "icon": "desktop/icon.png"
     },
     "nsis": {
       "oneClick": false,

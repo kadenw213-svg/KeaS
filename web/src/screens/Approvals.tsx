@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Check, Plus, X } from 'lucide-react';
-import { useWork, can } from '../store';
+import { useWork, can, go, fmtDay, fmtTime } from '../store';
 import { api } from '../api';
 import { act, useLoad, Loading, Page, Table, Tabs, Tag, FormDialog, statusTone, human } from '../kit';
 
@@ -24,8 +24,49 @@ export function Approvals() {
         value={tab}
         onChange={setTab}
       />
+      {tab === 'mine' && can(me, 'manager') && <PunchFixes />}
       {tab === 'chains' ? <Chains /> : <List scope={tab} />}
     </Page>
+  );
+}
+
+/** Punch fixes and timecards waiting on a manager live here too, not only on the Timecards screen. */
+function PunchFixes() {
+  const { me } = useWork();
+  const { data, reload } = useLoad<any>('/v1/punch-requests?status=pending');
+  const { data: tc } = useLoad<any>('/v1/timecards/period');
+  const fixes = (data?.requests || []).filter((r: any) => r.personId !== me?.id || can(me, 'owner'));
+  const waiting = (tc?.people || []).filter((p: any) => !p.approved && !p.mine && p.workedMin > 0);
+  if (!fixes.length && !waiting.length) return null;
+  const decide = async (id: string, approve: boolean) => (await act(api('POST', `/v1/punch-requests/${id}/decide`, { approve }), approve ? 'Punch added to the timecard.' : 'Request declined.')) && reload();
+  return (
+    <section className="card work-requests" style={{ marginBottom: 14 }}>
+      {fixes.length > 0 && <h2 className="work-h2">Punch fixes waiting for you</h2>}
+      {fixes.map((r: any) => (
+        <div key={r.id} className="work-swap">
+          <span>
+            <strong>{r.personName}</strong> wants to add a clock-{r.type} at {fmtDay(r.at)} {fmtTime(r.at)}
+            {r.note ? ` · “${r.note}”` : ''}
+          </span>
+          <div className="work-swap-acts">
+            <button className="btn sm primary" onClick={() => decide(r.id, true)}>
+              <Check size={14} /> Approve
+            </button>
+            <button className="btn sm" onClick={() => decide(r.id, false)}>
+              <X size={14} /> Decline
+            </button>
+          </div>
+        </div>
+      ))}
+      {waiting.length > 0 && (
+        <p>
+          {waiting.length} timecard{waiting.length === 1 ? '' : 's'} for {fmtDay(tc.period.start)} – {fmtDay(tc.period.end)} not approved yet.{' '}
+          <button className="btn sm" onClick={() => go('timecards', { team: true, periodStart: tc.period.start })}>
+            Approve timecards
+          </button>
+        </p>
+      )}
+    </section>
   );
 }
 

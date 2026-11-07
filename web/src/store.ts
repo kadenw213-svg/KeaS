@@ -3,8 +3,8 @@ import { api, onSessionEvents } from './api';
 
 export type WorkView =
   | 'today' | 'schedule' | 'timecards' | 'people' | 'pay'
-  | 'employees' | 'org' | 'timeoff' | 'approvals' | 'onboarding' | 'expenses' | 'documents' | 'reports' | 'import' | 'yearend' | 'hiring' | 'performance' | 'settings';
-export const VIEWS: WorkView[] = ['today', 'schedule', 'timecards', 'people', 'pay', 'employees', 'org', 'timeoff', 'approvals', 'onboarding', 'expenses', 'documents', 'reports', 'import', 'yearend', 'hiring', 'performance', 'settings'];
+  | 'setup' | 'employees' | 'org' | 'timeoff' | 'approvals' | 'onboarding' | 'expenses' | 'documents' | 'reports' | 'import' | 'yearend' | 'hiring' | 'performance' | 'settings';
+export const VIEWS: WorkView[] = ['today', 'schedule', 'timecards', 'people', 'pay', 'setup', 'employees', 'org', 'timeoff', 'approvals', 'onboarding', 'expenses', 'documents', 'reports', 'import', 'yearend', 'hiring', 'performance', 'settings'];
 
 export interface Person {
   id: string;
@@ -62,12 +62,14 @@ interface WorkState {
   vault: { initialized: boolean; locked: boolean; hubUrl: string | null; org: string | null; localAccounts: boolean; localSignIn?: boolean } | null;
   error: string | null;
   tick: number;
+  focus: Focus | null;
   set(p: Partial<WorkState>): void;
 }
 
 const viewFromPath = (): WorkView => {
   const v = location.pathname.replace(/^\/+|\/+$/g, '');
-  if (v === 'payroll') return 'pay';
+  // (Payroll opens on Get set up; it leads to the pay run once everything's done.)
+  if (v === 'payroll') return 'setup';
   return VIEWS.includes(v as WorkView) ? (v as WorkView) : 'today';
 };
 
@@ -83,6 +85,7 @@ export const useWork = create<WorkState>((set) => ({
   vault: null,
   error: null,
   tick: 0,
+  focus: null,
   set: (p) => set(p)
 }));
 
@@ -92,9 +95,21 @@ onSessionEvents({
 });
 
 /** Switch view and keep the address bar in step, so reload and back work. */
-export function go(view: WorkView) {
+export function go(view: WorkView, focus: Focus | null = null) {
   if (location.pathname !== '/' + view) history.pushState(null, '', '/' + view);
-  useWork.getState().set({ view });
+  useWork.getState().set({ view, focus });
+}
+/** Where a link points inside a screen: a person's profile card, or a pay period. The screen takes it once. */
+export interface Focus {
+  personId?: string;
+  edit?: 'tax' | 'deposit' | 'rate' | 'basic';
+  periodStart?: string;
+  team?: boolean;
+}
+export function takeFocus(): Focus | null {
+  const f = useWork.getState().focus;
+  if (f) useWork.getState().set({ focus: null });
+  return f;
 }
 window.addEventListener('popstate', () => useWork.getState().set({ view: viewFromPath() }));
 

@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import {
-  BarChart3, Briefcase, CalendarDays, CalendarOff, CheckSquare, Clock, FileClock, FileText, Lock, LogOut, Network, Receipt, RefreshCw, Settings, Target, TriangleAlert, Upload, UserPlus, Users, Wallet, CalendarCheck2
+  BarChart3, Briefcase, CalendarDays, CalendarOff, CheckSquare, Clock, FileClock, FileText, ListChecks, Lock, LogOut, Network, Receipt, RefreshCw, Settings, Target, TriangleAlert, Upload, UserPlus, Users, Wallet, CalendarCheck2
 } from 'lucide-react';
 import { useWork, loadWork, can, go, signOut, type WorkView, type Person } from './store';
 import { api, ApiError } from './api';
@@ -25,6 +25,7 @@ import { YearEnd } from './screens/YearEnd';
 import { Hiring } from './screens/Hiring';
 import { Performance } from './screens/Performance';
 import { VaultSettings } from './screens/VaultSettings';
+import { Setup } from './screens/Setup';
 
 export function App() {
   return (
@@ -67,6 +68,7 @@ function Work() {
   const P = 'Payroll and HR',
     S = 'Setup and reports';
   const nav: NavItem[] = [
+    { id: 'setup', label: 'Get set up', short: 'Setup', icon: <ListChecks size={20} />, show: pay && vault },
     { id: 'today', label: 'Today', short: 'Today', icon: <Clock size={20} />, show: !vault },
     { id: 'schedule', label: 'Schedule', short: 'Schedule', icon: <CalendarDays size={20} />, show: !vault },
     { id: 'timecards', label: 'Timecards', short: 'Timecards', icon: <FileClock size={20} />, show: true },
@@ -87,7 +89,8 @@ function Work() {
     { id: 'settings', label: vault ? 'Vault and settings' : 'Payroll settings', short: 'Settings', icon: <Settings size={20} />, show: pay, group: S }
   ];
   const shown = nav.filter((n) => n.show);
-  const fallback: WorkView = vault ? (pay ? 'pay' : 'timecards') : 'today';
+  // (Payroll opens on Get set up; once everything is done it says so and leads to the pay run.)
+  const fallback: WorkView = vault ? (pay ? 'setup' : 'timecards') : 'today';
   const current = shown.some((n) => n.id === view) ? view : fallback;
   const lock = async () => {
     try {
@@ -142,6 +145,7 @@ function Work() {
         {current === 'timecards' && <Timecards />}
         {current === 'people' && <People />}
         {current === 'pay' && <PayRun />}
+        {current === 'setup' && <Setup />}
         {current === 'employees' && <Employees />}
         {current === 'org' && <OrgSetup />}
         {current === 'timeoff' && <TimeOff />}
@@ -239,9 +243,10 @@ function VaultSetup() {
     { name: 'name', label: 'Your name', required: true },
     { name: 'email', label: local ? 'Your email' : 'Your Kea Hub email', type: 'email', required: true },
     { name: 'password', label: local ? 'A local password (16+ characters; a few unrelated words work well)' : 'Your Kea Hub password', type: 'password', required: true },
-    ...(!local ? [{ name: 'code', label: 'Two-step code (if you use one)', placeholder: '123456' } as Field] : []),
     { name: 'passphrase', label: 'Vault passphrase (12+ characters)', type: 'password', required: true, help: 'Encrypts SSNs, bank details and documents. It can’t be recovered if it’s lost, so keep it somewhere safe.' },
     { name: 'passphrase2', label: 'Vault passphrase again', type: 'password', required: true },
+    // (The code last, so it doesn't run out while the passphrases are typed.)
+    ...(!local ? [{ name: 'code', label: 'Two-step code (if you use one)', placeholder: '123456' } as Field] : []),
     ...(!local && vault?.localSignIn ? [{ name: 'localPassword', label: 'Local password for when the Hub can’t be reached (16+ characters)', type: 'password', advanced: true, help: 'Only works while the Kea Hub can’t be reached, and still needs the vault passphrase.' } as Field] : []),
     { name: 'payPeriodAnchor', label: 'First day of a pay period', type: 'date', advanced: true, help: 'Biweekly periods count from this day. Default: this week’s Sunday.' },
     { name: 'futaExempt', label: '501(c)(3): exempt from FUTA', type: 'checkbox', advanced: true },
@@ -297,8 +302,9 @@ function VaultSignIn() {
   const fields: Field[] = [
     { name: 'email', label: local ? 'Email' : 'Kea Hub email', type: 'email', required: true },
     { name: 'password', label: local ? 'Local password' : 'Kea Hub password', type: 'password', required: true },
-    ...(!local ? [{ name: 'code', label: 'Two-step code (if you use one)' } as Field] : []),
-    { name: 'passphrase', label: 'Vault passphrase', type: 'password', required: true }
+    { name: 'passphrase', label: 'Vault passphrase', type: 'password', required: true },
+    // (The code last, so it doesn't run out while the passphrase is typed.)
+    ...(!local ? [{ name: 'code', label: 'Two-step code (if you use one)' } as Field] : [])
   ];
   return (
     <>

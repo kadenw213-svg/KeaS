@@ -59,6 +59,19 @@ function mergeTwo(a, b) {
   return out;
 }
 
+/** The local minimum wage the tables know for a place (a city or county, matched by name), or null. */
+export function localMinimumWage(rules, place) {
+  const p = String(place || '').trim().toLowerCase().replace(/^(city( and county)? of|county of)\s+/, '').replace(/\s+(city|county)$/, '');
+  if (!p) return null;
+  return (rules?.minimumWage?.localOverrides || []).find((o) => String(o.place || '').toLowerCase() === p) || null;
+}
+/** The rules for a workplace in that place: a known local minimum wage raises the floor (and no youth discount there). */
+export function withPlace(rules, place) {
+  const local = localMinimumWage(rules, place);
+  if (!rules?.minimumWage || !local) return rules;
+  return { ...rules, minimumWage: { ...rules.minimumWage, standard: maxN(rules.minimumWage.standard, local.standard), youthDiscountPct: 0, local } };
+}
+
 /** Strictest-wins merge of federal, state and org rule tables (org overrides may only tighten). */
 export function mergeRules(us, state, orgOverrides) {
   let r = mergeTwo(us, state);

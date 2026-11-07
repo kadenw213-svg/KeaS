@@ -116,6 +116,14 @@ export function makeVault(h) {
       sealNewColumns();
       return true;
     },
+    /** True if the passphrase opens the vault. Changes nothing (it neither unlocks nor upgrades). */
+    check(passphrase) {
+      const m = meta(); if (!m) return false;
+      const r = openVault(passphrase, m);
+      if (!r) return false;
+      if (r.key !== key) r.key.fill(0);
+      return true;
+    },
     /** Locks the vault: the key is wiped from memory. */
     lock() { setKey(null); },
     /** JSON text for a sealed column (the database seals it as it's written). */
