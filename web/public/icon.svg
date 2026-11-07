@@ -1,6 +1,7 @@
-<!-- PLACEHOLDER app icon. The real KeaS logo is being designed separately: replace this one file
-     (it is the only icon the manifest, index.html and the app reference). -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect width="512" height="512" rx="112" fill="#131314"/>
-  <text x="256" y="256" dy="0.35em" text-anchor="middle" font-family="Inter, 'Segoe UI', system-ui, -apple-system, sans-serif" font-size="320" font-weight="600" fill="#a8c7fa">S</text>
+<!-- The KeaS mark: the "K" tile the KeaS window shows in its header (desktop/setup/setup.css .mark), used everywhere
+     (the window, tray, installer and Payroll) until the final KeaS logo lands. desktop/icon.png is drawn from this file
+     (scripts/make-icon.cjs). -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <rect width="256" height="256" rx="79" fill="#e2b13c"/>
+  <text x="128" y="128" dy="0.35em" text-anchor="middle" font-family="'Segoe UI', system-ui, -apple-system, sans-serif" font-size="138" font-weight="400" fill="#1d1d1f">K</text>
 </svg>
