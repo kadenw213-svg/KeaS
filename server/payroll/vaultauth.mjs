@@ -65,7 +65,7 @@ export function checkLocalStrength(pw, { email, passphrase } = {}) {
 }
 
 const LOCAL_OFF = 'Signing in with a local password is turned off. The owner can turn it on in the KeaS app on this computer (Payroll, Advanced).';
-const VERIFY_EMAIL = 'Verify your email address in your Kea account first (in the Kea app: Kea account, Verify with Google), then open Payroll again.';
+const VERIFY_EMAIL = 'Verify your email address in your Kea account first (in the Kea app: Kea account, Verify with Google, or ask your manager to verify it), then open Payroll again.';
 const CODE_NEEDED = 'Enter the two-step code from your authenticator app.';
 const CODE_USED = 'That two-step code was already used or has expired. Wait for the next one and try again.';
 const LOCAL_HUB_UP ='The Kea Hub can be reached, so sign in with your Kea Hub account. A local password only works while the Hub can’t be reached.';
@@ -139,7 +139,7 @@ export function registerVaultAuth(c) {
     if (!user || who.email !== user.email || (user.hub_sub && user.hub_sub !== who.sub)) return null;
     if (!user.hub_sub) {
       // Linking an account for the first time: only one whose email the Hub has verified.
-      if (!who.emailVerified) throw new HttpError(403, 'Verify your email address in your Kea Hub account first, then sign in here.');
+      if (!who.emailVerified) throw new HttpError(403, 'Verify your email address in your Kea Hub account first (Verify with Google, or ask your manager to verify it), then sign in here.');
       h.run('UPDATE vault_users SET hub_sub = ? WHERE id = ?', who.sub, user.id);
     }
     if (!pin()) savePin(who.keys);
@@ -196,7 +196,7 @@ export function registerVaultAuth(c) {
       try { who = await hub.signIn(hubUrl(), { email, password: String(s.password ?? ''), code: s.code ? String(s.code) : undefined }, { trust }); }
       catch (e) { if (e instanceof HubRefused && (e.status === 401 || e.status === 403)) throw new HttpError(401, e.message); throw hubError(e, null); }
       if (who.email !== email) bad('That Kea Hub account has a different email.');
-      if (!who.emailVerified) throw new HttpError(403, 'Verify your email address in your Kea Hub account first, then set up payroll.');
+      if (!who.emailVerified) throw new HttpError(403, 'Verify your email address in your Kea Hub account first (Verify with Google, or ask your manager to verify it), then set up payroll.');
       hubSub = who.sub; keys = who.keys;
       if (s.localPassword) { if (!localOn()) throw new HttpError(403, LOCAL_OFF); localPw = strong(s.localPassword); }
     } else {

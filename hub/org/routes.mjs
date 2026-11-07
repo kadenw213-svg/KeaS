@@ -116,7 +116,8 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   const setSetting = (k, v) => h.run('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', k, JSON.stringify(v));
 
   OR('POST', '/v1/orgs', ({ me, body, ip }) => {
-    if (!me.email_verified && me.role !== 'owner') forbidden('Verify your email first (Settings > Account > Verify with Google), then create the organization.');
+    // (Joining doesn't need this: an unverified person's join waits for a manager. Making one does.)
+    if (!me.email_verified && me.role !== 'owner') forbidden('Verify your email first (Settings > Account > Verify with Google, or ask the Kea Hub’s owner), then create the organization.');
     const name = V.name(body.name, 'Name', { min: 2, max: 120 });
     const kind = V.enum(body.kind ?? 'private', 'Kind', KINDS);
     const tz = validTz(V.str(body.tz ?? 'America/Denver', 'Time zone', { min: 3, max: 60 }));
@@ -135,8 +136,9 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   // (Before /v1/orgs/:id, which would otherwise match "join".)
   OR('POST', '/v1/orgs/join', ({ me, body, ip }) => {
     limit('join', ip); limit('join', me.id);
-    // Managers see the email as who someone is, so it must be proven first.
-    if (!me.email_verified && me.role !== 'owner') forbidden('Verify your email first (Settings > Account > Verify with Google), then join the organization.');
+    // Managers see the email as who someone is. One nobody has proven yet (an Outlook or school address can't be
+    // verified with Google) doesn't get in by the code alone: it becomes a request a manager approves or declines.
+    const unverified = !me.email_verified && me.role !== 'owner';
     const code = normCode(body.code);
     const c = code.length >= 10 ? h.get('SELECT * FROM org_codes WHERE code = ?', code) : null;
     const nope = "That code doesn't work. Check it, or ask for a new one.";
@@ -146,16 +148,31 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     if (o.status === 'pending') forbidden('This organization is still waiting for approval on the Kea Hub. Try again later.');
     const existing = memberRow(o.id, me.id);
     if (existing) return { org: orgOut(o, existing), alreadyMember: true };
-    const pending = !!c.needs_approval && !orgSettings(o).autoApproveJoins;
+    // (An unverified email always waits, even with automatic approval on.)
+    const pending = unverified || (!!c.needs_approval && !orgSettings(o).autoApproveJoins);
     h.tx(() => {
       capRows('org_members', o.id, 5000, 'members');
       h.run('INSERT INTO org_members (org_id,account_id,role,status,department_id,joined_at,via_code) VALUES (?,?,?,?,?,?,?)', o.id, me.id, c.role, pending ? 'pending' : 'active', c.department_id, now(), c.code);
       if (c.position_id) h.run('INSERT OR IGNORE INTO org_member_positions (org_id,account_id,position_id) VALUES (?,?,?)', o.id, me.id, c.position_id);
       h.run('UPDATE org_codes SET uses = uses + 1 WHERE code = ?', c.code);
     });
-    audit(me.id, 'org.join', o.id, { role: c.role, pending }, ip);
-    return { org: orgOut(o, memberRow(o.id, me.id)), alreadyMember: false, pending };
+    audit(me.id, pending ? 'org.join_request' : 'org.join', o.id, { role: c.role, pending, emailVerified: !unverified }, ip);
+    if (pending) tellApprovers(o, me, c.role, !unverified);
+    return { org: orgOut(o, memberRow(o.id, me.id)), alreadyMember: false, pending, ...(pending ? { emailVerified: !unverified, message: 'Request sent. Your manager approves it.' } : {}) };
   });
+  // A new request to join: a notice for everyone who can approve it (people above the role it asks for). An
+  // organization that got a lot of requests today stops getting notices; the requests still wait under Approvals.
+  function tellApprovers(o, me, role, emailVerified) {
+    const today = h.get("SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND status = 'pending' AND joined_at > ?", o.id, now() - 86400_000).n;
+    if (today > 20) return;
+    const approvers = h.all("SELECT account_id, role FROM org_members WHERE org_id = ? AND status = 'active' AND role IN ('owner','admin','manager') ORDER BY joined_at LIMIT 200", o.id)
+      .filter((m) => m.role === 'owner' || RANK[m.role] > RANK[role]).slice(0, 50);
+    for (const m of approvers)
+      notify(m.account_id, 'org_join', `Someone asks to join ${o.name}`, emailVerified
+        ? 'Approve or decline it in Kea: Work, People, Approvals.'
+        : 'Their email isn’t verified. Approve or decline it in Kea (Work, People, Approvals), and verify their email there if you know it’s theirs.',
+      { data: { orgId: o.id, accountId: me.id, name: String(me.display_name ?? '').slice(0, 60), emailVerified } });
+  }
   OR('GET', '/v1/orgs', ({ me }) => ({
     orgs: h.all('SELECT o.*, m.role AS m_role, m.status AS m_status FROM orgs o JOIN org_members m ON m.org_id = o.id WHERE m.account_id = ? ORDER BY o.name', me.id)
       .map((o) => orgOut(o, { role: o.m_role, status: o.m_status })),
@@ -253,6 +270,28 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     if (body.approve === false) notify(t.account_id, 'org', `${o.name} didn’t approve your request to join`, 'Ask someone there for a new join code if you think this was a mistake.', { data: { orgId: o.id, approved: false } });
     else notify(t.account_id, 'org', `You’re in: ${o.name}`, 'Your request to join was approved. It’s in Work mode now.', { data: { orgId: o.id, approved: true } });
     return { ok: true };
+  });
+  // Marks a member's (or someone asking to join's) email as verified, for a manager who knows it's really theirs.
+  // Managers and up, for people below them (an owner for anyone); the Hub's owner for anyone in any organization.
+  // The one verifying must have a verified email themselves. It counts everywhere on the Hub, payroll included.
+  OR('POST', '/v1/orgs/:id/members/:aid/verify-email', ({ me, params, ip }) => {
+    const hubOwner = me.role === 'owner';
+    let o, m = null;
+    if (hubOwner) o = loadOrg(params.id) ?? notFound('Organization not found.');
+    else {
+      ({ o, m } = asOrg(params.id, me, 'manager'));
+      if (!me.email_verified) forbidden('Verify your own email first.');
+    }
+    const t = memberRow(o.id, params.aid);
+    if (!t) notFound('That person isn’t in this organization or asking to join it.');
+    if (!hubOwner && t.account_id !== me.id && RANK[t.role] >= RANK[m.role] && m.role !== 'owner') forbidden('Ask an admin to verify this one.');
+    const a = h.get('SELECT id, email, email_verified, verified_by FROM accounts WHERE id = ?', t.account_id) ?? notFound('Account not found.');
+    if (a.email_verified) return { ok: true, already: true, emailVerified: true, verifiedBy: a.verified_by };
+    const by = hubOwner ? 'Owner' : 'Manager';
+    h.run('UPDATE accounts SET email_verified = 1, verified_by = ?, updated_at = ? WHERE id = ? AND email_verified = 0', by, now(), a.id);
+    audit(me.id, 'account.verify_email', a.id, { by, org: o.id, email: a.email }, ip);
+    notify(a.id, 'account', 'Your email is verified', hubOwner ? 'The Kea Hub’s owner verified it.' : `A manager at ${o.name} verified it.`, { data: { orgId: o.id, by } });
+    return { ok: true, already: false, emailVerified: true, verifiedBy: by };
   });
   OR('POST', '/v1/orgs/:id/members/:aid', ({ me, params, body, ip }) => {
     const { o, m } = asOrg(params.id, me);

@@ -40,7 +40,7 @@ function keasSteps(f = {}) {
   if (!a.signedIn) return finish(steps);
   if (me) {
     steps.push(step('email', 'Email verified', me.emailVerified || me.owner,
-      me.emailVerified || me.owner ? 'Organizations and payroll can use your account.' : 'Organizations and payroll need a verified email. In the Kea app: Kea account, Verify with Google.', 'recheck'));
+      me.emailVerified || me.owner ? 'Organizations and payroll can use your account.' : 'Payroll and making an organization need a verified email. In the Kea app: Kea account, Verify with Google. Or ask your manager to verify it.', 'recheck'));
     if (me.terms?.needsAgreement) steps.push(step('terms', 'The Kea terms', false, 'They changed. Read and agree to keep using your account.', 'termsAccept'));
   }
 
@@ -48,9 +48,13 @@ function keasSteps(f = {}) {
   // come from here too). Approval by the Hub's owner is how the Hub verifies an organization.
   const orgs = f.orgs || [];
   const mine = orgs.filter((o) => ['owner', 'admin'].includes(o.role));
-  const org = mine.find((o) => o.status === 'active') || mine[0] || orgs.find((o) => o.status === 'active') || orgs[0] || null;
+  const inOrg = (o) => o.memberStatus !== 'pending';
+  const org = mine.find((o) => o.status === 'active') || mine[0] || orgs.find((o) => o.status === 'active' && inOrg(o)) || orgs.find(inOrg) || orgs[0] || null;
   if (f.orgs == null) steps.push(step('org', 'Your organization', false, f.orgsError ? `Can’t check right now: ${f.orgsError}` : 'Checking…', 'recheck'));
-  else {
+  else if (org && !inOrg(org)) {
+    // Asked to join (a code that needs approval, or an email that isn't verified yet): a manager decides.
+    steps.push(step('org', 'Your organization', false, `Request sent to ${org.name}. Your manager approves it. This list checks again by itself.`, 'recheck'));
+  } else {
     steps.push(step('org', 'Your organization', !!org,
       org ? `${org.name}${org.role ? ` (you’re ${org.role === 'owner' ? 'the owner' : `a${org.role === 'admin' ? 'n' : ''} ${org.role}`})` : ''}.` : 'Create your organization on the Kea Hub, or join one with a code.', 'org'));
     if (org) {

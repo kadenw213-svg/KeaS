@@ -117,3 +117,69 @@ test('sign in, create an account, two-step code, stay signed in, sign out', asyn
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('people asking to join, verifying their email, and new backup codes, from KeaS', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'keas-people-'));
+  let clock = Date.UTC(2026, 10, 7, 15);
+  const hub = createHub({ dataDir: join(dir, 'hub'), now: () => clock, log: false });
+  try {
+    const { port, ownerPort } = await hub.listen({ port: 0, ownerPort: 0 });
+    const url = `http://127.0.0.1:${port}`;
+    const { ownerFetch } = await import('../../hub/lib/ownerauth.mjs');
+    const make = (name) => { let u = url; return createAccount({ dir: join(dir, name), protect: fakeProtect(), getUrl: () => u, setUrl: (x) => (u = x) }); };
+    const t = (await make('x').terms()).terms;
+    const reg = async (name, email) => { const a = make(name); await a.register({ name, email, password: 'correct horse battery staple', age13: true, termsVersion: t.version, termsSections: t.sections.map((s) => s.id) }); return a; };
+    const boss = await reg('boss', 'boss@camp.org');
+    const sam = await reg('sam', 'sam@school.edu');
+    const bossId = hub.h.get('SELECT id FROM accounts WHERE email = ?', 'boss@camp.org').id;
+    await ownerFetch(`http://127.0.0.1:${ownerPort}`, hub.ownerKey, 'POST', `/owner/accounts/${bossId}`, { emailVerified: true });
+    await ownerFetch(`http://127.0.0.1:${ownerPort}`, hub.ownerKey, 'POST', '/owner/orgs/settings', { autoApprove: true });
+    const org = (await boss.createOrg({ name: 'Camp', state: 'CO' })).org;
+    const bossLogin = await (await fetch(`${url}/v1/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: 'boss@camp.org', password: 'correct horse battery staple' }) })).json();
+    const made = await (await fetch(`${url}/v1/orgs/${org.id}/codes`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${bossLogin.token}` }, body: JSON.stringify({ role: 'member', needsApproval: false }) })).json();
+    const code = made.code.code;
+
+    // Sam's email isn't verified: joining is a request, and the checklist says so.
+    const j = await sam.joinOrg({ code });
+    assert.deepEqual([j.pending, j.emailVerified], [true, false]);
+    const { keasSteps } = require('../../desktop/checklist.cjs');
+    const steps = keasSteps({ account: await sam.status(), orgs: await sam.orgs() });
+    assert.match(steps.steps.find((s) => s.id === 'org').text, /Request sent to Camp\. Your manager approves it/);
+
+    // The boss sees it, verifies the email, approves.
+    let people = await boss.orgPeople();
+    assert.deepEqual(people.map((g) => [g.org.name, g.pending.map((m) => [m.email, m.emailVerified])]), [['Camp', [['sam@school.edu', false]]]]);
+    const samId = people[0].pending[0].id;
+    assert.equal((await boss.orgVerifyEmail({ id: org.id, accountId: samId })).verifiedBy, 'Manager');
+    await boss.orgApprove({ id: org.id, accountId: samId, approve: true });
+    people = await boss.orgPeople();
+    assert.deepEqual([people[0].pending.length, people[0].unverified.length], [0, 0]);
+    assert.equal((await sam.status()).account.emailVerified, true);
+
+    // Backup codes: with two-step sign-in on, the password and the app's code make new ones.
+    const login = await (await fetch(`${url}/v1/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: 'sam@school.edu', password: 'correct horse battery staple' }) })).json();
+    const auth = { 'content-type': 'application/json', authorization: `Bearer ${login.token}` };
+    const setup = await (await fetch(`${url}/v1/me/totp/setup`, { method: 'POST', headers: auth, body: JSON.stringify({ password: 'correct horse battery staple' }) })).json();
+    await fetch(`${url}/v1/me/totp/enable`, { method: 'POST', headers: auth, body: JSON.stringify({ code: codeAt(setup.secret, stepOf(clock)) }) });
+    clock += 30_000;
+    await assert.rejects(sam.backupCodes({ password: 'correct horse battery staple', code: '000000' }), (e) => e.status === 401);
+    assert.equal(sam.signedIn(), true, 'a wrong code there doesn’t sign KeaS out');
+    const r = await sam.backupCodes({ password: 'correct horse battery staple', code: codeAt(setup.secret, stepOf(clock)) });
+    assert.equal(r.backupCodes.length, 10);
+    assert.equal((await sam.status()).account.backupCodesLeft, 10);
+    // A backup code signs KeaS in.
+    await sam.logout();
+    const st = await sam.login({ email: 'sam@school.edu', password: 'correct horse battery staple', code: r.backupCodes[0] });
+    assert.equal(st.signedIn, true);
+  } finally {
+    await hub.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('against an older Kea Hub without these routes: a plain message', async () => {
+  const fakeFetch = async () => new Response(JSON.stringify({ error: 'Not found.' }), { status: 404, headers: { 'content-type': 'application/json' } });
+  const a = createAccount({ dir: mkdtempSync(join(tmpdir(), 'keas-old-')), protect: fakeProtect(), getUrl: () => 'http://127.0.0.1:1', setUrl: () => {}, fetchImpl: fakeFetch });
+  await assert.rejects(a.orgVerifyEmail({ id: 'o', accountId: 'x' }), /can’t verify emails yet/);
+  await assert.rejects(a.backupCodes({ password: 'p', code: '123456' }), /doesn’t have backup codes yet/);
+});

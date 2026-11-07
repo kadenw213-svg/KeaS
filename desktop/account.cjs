@@ -54,14 +54,15 @@ function createAccount({ dir, protect, getUrl, setUrl, fetchImpl = fetch, client
   function saveCache(me) {
     if (!me) { fs.rmSync(cacheFile(), { force: true }); return null; }
     const a = me.account || me;
-    const c = { id: a.id, email: a.email, name: a.displayName ?? a.name ?? null, owner: !!a.owner, totpEnabled: !!a.totpEnabled, emailVerified: !!a.emailVerified, hub: url(), terms: me.terms ?? null, at: Date.now() };
+    const c = { id: a.id, email: a.email, name: a.displayName ?? a.name ?? null, owner: !!a.owner, totpEnabled: !!a.totpEnabled, backupCodesLeft: a.backupCodesLeft ?? null, emailVerified: !!a.emailVerified, hub: url(), terms: me.terms ?? null, at: Date.now() };
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(cacheFile(), JSON.stringify(c, null, 1));
     return c;
   }
   function signOutHere() { writeToken(null); saveCache(null); }
 
-  async function req(method, p, body, { auth = true, token } = {}) {
+  // reauth: a call that checks the password again, where a 401 can just mean a wrong password (still signed in).
+  async function req(method, p, body, { auth = true, token, reauth = false } = {}) {
     const t = token || (auth ? readToken() : null);
     let r;
     try {
@@ -73,7 +74,7 @@ function createAccount({ dir, protect, getUrl, setUrl, fetchImpl = fetch, client
     } catch { throw new AccountError(`Can’t reach the Kea Hub at ${url()}. Check your internet, or the Hub address under Advanced.`, 0); }
     const j = await r.json().catch(() => ({}));
     // The session ended (signed out elsewhere, password changed, suspended): signed out here too.
-    if (r.status === 401 && auth && !token && t && !j.totpRequired) signOutHere();
+    if (r.status === 401 && auth && !token && t && !j.totpRequired && (!reauth || /^(Sign in|Your sign-in expired)/.test(String(j.error || '')))) signOutHere();
     if (!r.ok) { const { error, ...data } = j; throw new AccountError(error || `The Kea Hub said ${r.status}.`, r.status, data); }
     return j;
   }
@@ -155,8 +156,36 @@ function createAccount({ dir, protect, getUrl, setUrl, fetchImpl = fetch, client
   const createOrg = ({ name, state, tz }) => req('POST', '/v1/orgs', { name: String(name || '').trim(), kind: 'private', state: state || null, tz: tz || 'America/Denver' });
   const joinOrg = ({ code }) => req('POST', '/v1/orgs/join', { code: String(code || '').trim() });
   const updateOrg = ({ id, state }) => req('POST', `/v1/orgs/${encodeURIComponent(String(id))}`, { state: state || null });
+  const oid = (id) => encodeURIComponent(String(id));
+  // (An older Kea Hub answers a route it doesn't have with a bare 404 "Not found.")
+  const missingRoute = (e) => (e.status === 404 || e.status === 405) && e.message === 'Not found.';
+  /**
+   * For each organization this account manages: who's asking to join, and members whose email isn't verified yet.
+   * [{ org: { id, name, role }, pending: [member], unverified: [member] }]. One it can't see the members of is left out.
+   */
+  async function orgPeople() {
+    const out = [];
+    for (const o of await orgs()) {
+      if (!['owner', 'admin', 'manager'].includes(o.role) || o.memberStatus !== 'active' || o.status !== 'active') continue;
+      try {
+        const r = await req('GET', `/v1/orgs/${oid(o.id)}/members`);
+        out.push({ org: { id: o.id, name: o.name, role: o.role }, pending: r.pending || [], unverified: (r.members || []).filter((m) => !m.emailVerified && !m.you) });
+      } catch (e) { if (e.status === 0) throw e; }
+    }
+    return out;
+  }
+  const orgApprove = ({ id, accountId, approve }) => req('POST', `/v1/orgs/${oid(id)}/members/${oid(accountId)}/approve`, { approve: approve !== false });
+  async function orgVerifyEmail({ id, accountId }) {
+    try { return await req('POST', `/v1/orgs/${oid(id)}/members/${oid(accountId)}/verify-email`, {}); }
+    catch (e) { if (missingRoute(e)) throw new AccountError('This Kea Hub can’t verify emails yet. It needs a KeaS update.', 404); throw e; }
+  }
+  /** New two-step backup codes (password and a code from the authenticator app): { backupCodes, left }. */
+  async function backupCodes({ password, code }) {
+    try { return await req('POST', '/v1/me/totp/backup-codes', { password: String(password || ''), code: String(code || '').trim() }, { reauth: true }); }
+    catch (e) { if (missingRoute(e)) throw new AccountError('This Kea Hub doesn’t have backup codes yet. It needs a KeaS update.', 404); throw e; }
+  }
 
-  return { url, status, login, orgs, createOrg, joinOrg, updateOrg, register, logout, changeUrl, terms, acceptTerms, adopt, payrollToken, freshPayrollToken, cached, signedIn: () => !!readToken(), forget: signOutHere };
+  return { url, status, login, orgs, createOrg, joinOrg, updateOrg, orgPeople, orgApprove, orgVerifyEmail, backupCodes, register, logout, changeUrl, terms, acceptTerms, adopt, payrollToken, freshPayrollToken, cached, signedIn: () => !!readToken(), forget: signOutHere };
 }
 
 module.exports = { createAccount, checkUrl, AccountError, DEFAULT_HUB_URL };

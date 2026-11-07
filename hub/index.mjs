@@ -20,7 +20,7 @@ import { googleKeys, verifyGoogleIdToken } from './lib/google.mjs';
 import { consentPage, consentCsp } from './lib/consentPage.mjs';
 import { openDb, DATA_DIR } from './db.mjs';
 import { hashPassword, verifyPassword, needsRehash, passwordProblem } from './lib/passwords.mjs';
-import { newSecret, checkCode, otpauthUri, totpKeyFrom, sealSecret, openSecret, isSealed } from './lib/totp.mjs';
+import { newSecret, checkCode, otpauthUri, totpKeyFrom, sealSecret, openSecret, isSealed, backupKeyFrom, newBackupCodes, normBackupCode, hashBackupCode, backupMatch } from './lib/totp.mjs';
 import { ownerNonces, ownerReplyMac, OWNER_AUTH_HEADER, OWNER_CHALLENGE_HEADER, OWNER_REPLY_HEADER } from './lib/ownerauth.mjs';
 import { cleanText, isReservedName } from './lib/names.mjs';
 import { loadOrCreateKey, signToken } from './lib/tokens.mjs';
@@ -246,6 +246,40 @@ export function createHub({
   /** An account's TOTP secret (base32), or null. A secret that doesn't open (tampered with) counts as none. */
   const totpSecretOf = (a) => { try { return openSecret(totpKey, a.totp_secret, a.id); } catch { return null; } };
   const checkTotp = (a, code) => { const s = totpSecretOf(a); return s ? checkCode(s, code, now(), a.totp_last_step) : null; };
+  // Backup codes (hub/lib/totp.mjs): new ones replace all of an account's old ones; each works once.
+  const backupKey = backupKeyFrom(key.privateKey);
+  const backupLeft = (accountId) => h.get('SELECT COUNT(*) AS n FROM totp_backup_codes WHERE account_id = ? AND used_at IS NULL', accountId).n;
+  const dropBackupCodes = (accountId) => h.run('DELETE FROM totp_backup_codes WHERE account_id = ?', accountId);
+  function issueBackupCodes(accountId) {
+    const codes = newBackupCodes();
+    h.tx(() => {
+      dropBackupCodes(accountId);
+      for (const c of codes) h.run('INSERT INTO totp_backup_codes (account_id,hash,created_at) VALUES (?,?,?)', accountId, hashBackupCode(backupKey, accountId, normBackupCode(c)), now());
+    });
+    return codes;
+  }
+  /** Uses up one of the account's backup codes: true if `code` was one (and unused), else false. */
+  function useBackupCode(a, code, ip) {
+    const c = normBackupCode(code);
+    if (!c || !a.totp_enabled) return false;
+    const hashes = h.all('SELECT hash FROM totp_backup_codes WHERE account_id = ? AND used_at IS NULL', a.id).map((r) => r.hash);
+    const hit = backupMatch(hashBackupCode(backupKey, a.id, c), hashes);
+    // (The update only counts once: two sign-ins racing with the same code can't both get through.)
+    if (!hit || Number(h.run('UPDATE totp_backup_codes SET used_at = ? WHERE account_id = ? AND hash = ? AND used_at IS NULL', now(), a.id, hit).changes) !== 1) return false;
+    const left = backupLeft(a.id);
+    audit(a.id, 'auth.backup_code_used', a.id, { left }, ip);
+    notify(a.id, 'account', 'A backup code was used to sign in', left
+      ? `You have ${left} backup code${left === 1 ? '' : 's'} left. If this wasn’t you, change your password and make new backup codes.`
+      : 'That was your last one. Make new backup codes in Kea: Kea account, Sign-in and security.', { data: { left } });
+    return true;
+  }
+  /** A two-step code: the authenticator app's ({ step }), or one of the backup codes ({ backup: true }). Null: neither. */
+  function secondFactor(a, code, ip) {
+    const step = checkTotp(a, code);
+    if (step != null) return { step };
+    return useBackupCode(a, code, ip) ? { backup: true } : null;
+  }
+  const CODE_ASK = 'Enter the 6-digit code from your authenticator app, or one of your backup codes.';
   const windows = new Windows();
   const fails = failures(h, now);
   // phone: changes to the phone number, per account per day.
@@ -374,10 +408,10 @@ export function createHub({
   // costs one count, which the successful sign-in right after clears.)
   const requireTotp = (a, code, nh, ipKey, ip) => {
     if (!a.totp_enabled) return;
-    if (code == null || code === '') { fails.fail(nh, ipKey); throw new HttpError(401, 'Enter the 6-digit code from your authenticator app.', { totpRequired: true }); }
-    const step = checkTotp(a, code);
-    if (step == null) { fails.fail(nh, ipKey); audit(a.id, 'auth.fail_totp', null, null, ip); throw new HttpError(401, 'That code is wrong or already used.', { totpRequired: true }); }
-    h.run('UPDATE accounts SET totp_last_step = ? WHERE id = ?', step, a.id);
+    if (code == null || code === '') { fails.fail(nh, ipKey); throw new HttpError(401, CODE_ASK, { totpRequired: true, backupCodes: true }); }
+    const f = secondFactor(a, code, ip);
+    if (f == null) { fails.fail(nh, ipKey); audit(a.id, 'auth.fail_totp', null, null, ip); throw new HttpError(401, 'That code is wrong or already used.', { totpRequired: true, backupCodes: true }); }
+    if (f.step != null) h.run('UPDATE accounts SET totp_last_step = ? WHERE id = ?', f.step, a.id);
   };
   const lockedError = (ms, everywhere) => new HttpError(429, everywhere
     ? `Too many wrong tries for this account from many places. Wait ${Math.ceil(ms / 1000)} seconds, or sign in with Google.`
@@ -543,6 +577,7 @@ export function createHub({
     id: a.id, email: a.email, displayName: a.display_name, role: a.role, status: a.status,
     emailVerified: !!a.email_verified, verifiedBy: a.verified_by, identityVerified: !!a.identity_verified,
     canHost: !!a.can_host || a.role === 'owner', totpEnabled: !!a.totp_enabled, owner: a.role === 'owner', createdAt: a.created_at,
+    backupCodesLeft: a.totp_enabled ? backupLeft(a.id) : 0,
     birthYear: a.birth_year ?? null, ...consentOf(a),
     leaderboard: { show: a.board_default || 'name', nickname: a.nickname ?? null },
     supporter: { active: supporterActive(a), until: a.supporter_until ?? null, since: a.supporter_since ?? null },
@@ -746,7 +781,9 @@ export function createHub({
   const api = makeRouter();
   const R = api.add;
 
-  R('GET', '/v1/health', () => ({ ok: true, service: 'kea-hub', version: VERSION }), { auth: false });
+  // features: what newer apps can use on this Hub (an older Hub has no list, so apps keep their old behavior there).
+  const FEATURES = ['orgJoinRequests', 'verifyEmailByManager', 'backupCodes'];
+  R('GET', '/v1/health', () => ({ ok: true, service: 'kea-hub', version: VERSION, features: FEATURES }), { auth: false });
   R('GET', '/v1/keys', () => ({ keys: [key.jwk] }), { auth: false });
   // Proves this is the Hub whose signing key is in its data folder: signs the caller's random nonce. KeaS checks it
   // against the key file before sending the owner's password to whatever answers on 127.0.0.1:4860.
@@ -813,12 +850,12 @@ export function createHub({
       const code = body.code;
       const hasCode = code != null && code !== '';
       const pwOk = hasCode && (await verifyPassword(password, a?.pw_hash ?? null));
-      const step = pwOk && a.totp_enabled && a.status === 'active' ? checkTotp(a, code) : null;
-      if (step == null) {
+      const f = pwOk && a.totp_enabled && a.status === 'active' ? secondFactor(a, code, ip) : null;
+      if (f == null) {
         if (hasCode) { fails.fail(nh, ipKey); audit(a?.id ?? null, 'auth.fail', null, { lockedEverywhere: true }, ip); }
         throw lockedError(globalMs, true);
       }
-      h.run('UPDATE accounts SET totp_last_step = ? WHERE id = ?', step, a.id);
+      if (f.step != null) h.run('UPDATE accounts SET totp_last_step = ? WHERE id = ?', f.step, a.id);
       fails.clear(nh, ipKey);
       audit(a.id, 'auth.login', null, { lockedEverywhere: true }, ip);
       const token = newSession(a.id, client);
@@ -878,7 +915,7 @@ export function createHub({
     const pwHash = await hashPassword(body.password);
     h.tx(() => {
       h.run('UPDATE accounts SET pw_hash = ?, updated_at = ? WHERE id = ?', pwHash, now(), a.id);
-      if (clearTotp) h.run('UPDATE accounts SET totp_enabled = 0, totp_secret = NULL, totp_last_step = -1 WHERE id = ?', a.id);
+      if (clearTotp) { h.run('UPDATE accounts SET totp_enabled = 0, totp_secret = NULL, totp_last_step = -1 WHERE id = ?', a.id); dropBackupCodes(a.id); }
       h.run('DELETE FROM sessions WHERE account_id = ?', a.id);
       markGoogleVerified(a.id, g);
     });
@@ -1153,7 +1190,8 @@ export function createHub({
   const REAUTH_MS = 10 * 60_000;
   const WRONG_CREDS = 'Your password or two-step code is wrong.';
   /** Checks my password (and code, when `code` is given) with the sign-in lockouts; one message for any miss. */
-  async function checkMine(me, { password, code = undefined, ipKey, ip, message = WRONG_CREDS }) {
+  // (backup: a backup code counts as the code too. Making new backup codes needs the app's code itself.)
+  async function checkMine(me, { password, code = undefined, ipKey, ip, message = WRONG_CREDS, backup = true }) {
     limit('pwcheck', me.id);
     const nh = nameHash(me.email);
     const pairMs = fails.pairLocked(nh, ipKey);
@@ -1161,13 +1199,13 @@ export function createHub({
     const globalMs = fails.globalLocked(nh);
     if (globalMs > 0) throw lockedError(globalMs, true);
     const pwOk = await verifyPassword(typeof password === 'string' ? password : '', me.pw_hash);
-    const step = code === undefined ? true : pwOk ? checkTotp(me, code) : null;
-    if (!pwOk || step == null) {
+    const f = code === undefined ? {} : !pwOk ? null : backup ? secondFactor(me, code, ip) : (() => { const step = checkTotp(me, code); return step == null ? null : { step }; })();
+    if (!pwOk || f == null) {
       fails.fail(nh, ipKey);
       audit(me.id, 'auth.fail_reauth', null, null, ip);
       throw new HttpError(401, message);
     }
-    if (code !== undefined) h.run('UPDATE accounts SET totp_last_step = ? WHERE id = ?', step, me.id);
+    if (f.step != null) h.run('UPDATE accounts SET totp_last_step = ? WHERE id = ?', f.step, me.id);
     fails.clear(nh, ipKey);
   }
   /** Password, a fresh Google sign-in for my email, or (when `recent`) a proof given in this session in the last minutes. */
@@ -1222,13 +1260,29 @@ export function createHub({
     if (step == null) bad('That code is wrong. Check the time on your phone and try the newest code.');
     h.run('UPDATE accounts SET totp_enabled = 1, totp_last_step = ?, updated_at = ? WHERE id = ?', step, now(), me.id);
     audit(me.id, 'account.totp_on', me.id, null, ip);
-    return { ok: true };
+    // Ten one-time backup codes, shown this once (only their hashes are kept). Older apps just ignore them.
+    const backupCodes = issueBackupCodes(me.id);
+    audit(me.id, 'account.backup_codes', me.id, { count: backupCodes.length }, ip);
+    return { ok: true, backupCodes };
   }, { basic: true });
+  // New backup codes (the old ones stop working): the password and a code from the authenticator app.
+  R('POST', '/v1/me/totp/backup-codes', async ({ me, body, ip, ipKey }) => {
+    if (!me.totp_enabled) bad('Turn on two-step sign-in first.');
+    if (body.code == null || body.code === '') throw new HttpError(401, 'Enter your password and the 6-digit code from your authenticator app.', { passwordRequired: true });
+    await checkMine(me, { password: body.password, code: body.code, ipKey, ip, backup: false, message: 'Your password or the code from your authenticator app is wrong.' });
+    const backupCodes = issueBackupCodes(me.id);
+    audit(me.id, 'account.backup_codes', me.id, { count: backupCodes.length, replaced: true }, ip);
+    return { backupCodes, left: backupCodes.length };
+  }, { basic: true });
+  R('GET', '/v1/me/totp/backup-codes', ({ me }) => ({ enabled: !!me.totp_enabled, left: me.totp_enabled ? backupLeft(me.id) : 0 }), { terms: false, basic: true });
   R('POST', '/v1/me/totp/disable', async ({ me, body, ip, ipKey }) => {
     if (!me.totp_enabled) return { ok: true };
     if (me.role === 'owner') forbidden('The owner account must keep two-step sign-in on.');
     await checkMine(me, { password: body.password, code: body.code, ipKey, ip });
-    h.run('UPDATE accounts SET totp_enabled = 0, totp_secret = NULL, totp_last_step = -1, updated_at = ? WHERE id = ?', now(), me.id);
+    h.tx(() => {
+      h.run('UPDATE accounts SET totp_enabled = 0, totp_secret = NULL, totp_last_step = -1, updated_at = ? WHERE id = ?', now(), me.id);
+      dropBackupCodes(me.id);
+    });
     audit(me.id, 'account.totp_off', me.id, null, ip);
     return { ok: true };
   });
@@ -2219,7 +2273,8 @@ export function createHub({
   O('POST', '/owner/accounts/:id', ({ params, body }) => {
     const a = getAccount(params.id);
     const set = (col, v) => h.run(`UPDATE accounts SET ${col} = ?, updated_at = ? WHERE id = ?`, v, now(), a.id);
-    if (body.emailVerified != null) { set('email_verified', V.bool(body.emailVerified, 'emailVerified') ? 1 : 0); set('verified_by', body.emailVerified ? 'owner' : null); }
+    // (Already verified, by Google say: it stays as it was.)
+    if (body.emailVerified != null && V.bool(body.emailVerified, 'emailVerified') !== !!a.email_verified) { set('email_verified', body.emailVerified ? 1 : 0); set('verified_by', body.emailVerified ? 'Owner' : null); }
     if (body.identityVerified != null) set('identity_verified', V.bool(body.identityVerified, 'identityVerified') ? 1 : 0);
     if (body.canHost != null) set('can_host', V.bool(body.canHost, 'canHost') ? 1 : 0);
     if ('birthYear' in body) set('birth_year', body.birthYear == null ? null : V.int(body.birthYear, 'birthYear', { min: 1900, max: thisYear() }));
@@ -2278,6 +2333,7 @@ export function createHub({
     const note = V.str(body.note, 'note', { optional: true, max: 2000 });
     h.tx(() => {
       h.run('UPDATE accounts SET totp_enabled = 0, totp_secret = NULL, totp_last_step = -1, updated_at = ? WHERE id = ?', now(), a.id);
+      dropBackupCodes(a.id);
       h.run('DELETE FROM sessions WHERE account_id = ?', a.id);
     });
     audit('owner', 'owner.totp_reset', a.id, { note, wasOn: !!a.totp_enabled }, 'local');

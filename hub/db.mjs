@@ -175,6 +175,13 @@ CREATE TABLE IF NOT EXISTS course_join_requests (
   created_at INTEGER NOT NULL, decided_by TEXT, decided_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS course_join_requests_course ON course_join_requests(course_key, status);
+-- Two-step backup codes: one-time codes for signing in without the authenticator app. Only an HMAC of each is kept
+-- (hub/lib/totp.mjs); used_at is set the moment one is used, so it can't work twice.
+CREATE TABLE IF NOT EXISTS totp_backup_codes (
+  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, hash TEXT NOT NULL,
+  created_at INTEGER NOT NULL, used_at INTEGER,
+  PRIMARY KEY (account_id, hash)
+);
 CREATE TABLE IF NOT EXISTS course_codes (
   course_key TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, created_by TEXT, created_at INTEGER NOT NULL
 );

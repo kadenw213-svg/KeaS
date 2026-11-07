@@ -221,7 +221,7 @@ test('3 M4: join-request notices carry no free text in the title; names go as da
   assert.deepEqual([capped.status, capped.body.code], [429, 'join_requests_daily']);
 });
 
-test('3 M5 + M1: orgs need a verified email to join and show it; pending orgs do nothing; suspension shuts their classes', async () => {
+test('3 M5 + M1: an unverified email only asks to join, and lists show it; pending orgs do nothing; suspension shuts their classes', async () => {
   const boss = await H.person('m5-boss@example.com', 'Org Boss');
   const nov = await H.person('m5-nov@example.com', 'Not Verified', { verified: false });
   const member = await H.person('m5-mem@example.com', 'Member Mo');
@@ -230,11 +230,13 @@ test('3 M5 + M1: orgs need a verified email to join and show it; pending orgs do
   assert.equal((await H.call('POST', `/v1/orgs/${org.id}/classes`, boss.token, { title: 'Pending class' })).status, 403);
   ok(await H.owner('POST', `/owner/orgs/${org.id}/decide`, { approve: true }));
   const code = ok(await H.call('POST', `/v1/orgs/${org.id}/codes`, boss.token, { role: 'member' }), 201).code.code;
-  const refused = await H.call('POST', '/v1/orgs/join', nov.token, { code }, H.freshIp());
-  assert.deepEqual([refused.status, /Verify your email/.test(refused.body.error)], [403, true]);
+  // (A member code that needs no approval: the unverified email still waits for a manager.)
+  const asked = ok(await H.call('POST', '/v1/orgs/join', nov.token, { code }, H.freshIp()));
+  assert.deepEqual([asked.pending, asked.emailVerified, asked.org.memberStatus], [true, false, 'pending']);
   ok(await H.call('POST', '/v1/orgs/join', member.token, { code }, H.freshIp()));
   const list = ok(await H.call('GET', `/v1/orgs/${org.id}/members`, boss.token));
   assert.ok(list.members.every((m) => m.emailVerified === true));
+  assert.deepEqual(list.pending.map((m) => [m.name, m.emailVerified]), [['Not Verified', false]]);
   // An org class: a real Hub class tied to the org.
   const cls = ok(await H.call('POST', `/v1/orgs/${org.id}/classes`, boss.token, { title: 'Lifeguard' }), 201).class;
   assert.equal(H.hub.h.get('SELECT org_id FROM classes WHERE id = ?', cls.id).org_id, org.id);
