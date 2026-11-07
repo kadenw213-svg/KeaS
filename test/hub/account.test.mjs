@@ -434,3 +434,26 @@ test('notifications for existing events: org approved, join approved, sign-off d
   assert.deepEqual([n.kind, n.title], ['material', 'New practice questions: HIS101, spring 2027, section 1, Ch 3']);
   assert.ok(ok(await call('GET', '/v1/files?prefix=kea/Kea/School/Shared/', b.token)).files.length >= 1);
 });
+
+test('a sign-in in use stays signed in (30 days from the last use, at most a year); unused, it ends', async () => {
+  const start = clock;
+  try {
+    const p = await person('session-slide@example.com', 'Sam Slide');
+    const me = () => call('GET', '/v1/me', p.token);
+    // Used every 20 days for 300 days: still signed in, though the first 30 days ran out long ago.
+    for (let d = 20; d <= 300; d += 20) {
+      clock = start + d * DAY;
+      ok(await me());
+    }
+    // A year after signing in, it ends even while in use.
+    for (let d = 320; d <= 380; d += 20) { clock = start + d * DAY; await me(); }
+    assert.equal((await me()).status, 401);
+    // Unused for more than 30 days: ends.
+    clock = start;
+    const q = await person('session-idle@example.com', 'Ida Idle');
+    clock = start + 31 * DAY;
+    assert.equal((await call('GET', '/v1/me', q.token)).status, 401);
+  } finally {
+    clock = start;
+  }
+});

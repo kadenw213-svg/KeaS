@@ -38,6 +38,7 @@ export const VERSION = '0.4.2';
 const HOST = '127.0.0.1';
 const MAX_BODY = 2 * 1024 * 1024;
 const SESSION_DAYS = 30;
+const SESSION_MAX_DAYS = 365;
 const TOKEN_MINUTES = 15;
 export const COOKIE = 'kea_hub';
 
@@ -2474,7 +2475,9 @@ export function createHub({
         }
         const me = h.get('SELECT * FROM accounts WHERE id = ?', s.account_id);
         if (!me || me.status !== 'active') throw new HttpError(401, 'Sign in again.');
-        if (now() - s.last_seen > 3600_000) h.run('UPDATE sessions SET last_seen = ? WHERE token_hash = ?', now(), s.token_hash);
+        // A sign-in in use stays signed in: each use (at most hourly) moves its end to SESSION_DAYS from now, up to
+        // SESSION_MAX_DAYS after it was made. Unused for SESSION_DAYS, it ends.
+        if (now() - s.last_seen > 3600_000) h.run('UPDATE sessions SET last_seen = ?, expires_at = MAX(expires_at, MIN(?, created_at + ?)) WHERE token_hash = ?', now(), now() + SESSION_DAYS * 86400_000, SESSION_MAX_DAYS * 86400_000, s.token_hash);
         ctx.me = me;
         who = me.id;
         // The Hub owner's account has powers over everyone's: none of them work until its two-step sign-in is on. Only
