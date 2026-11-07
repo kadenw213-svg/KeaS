@@ -215,7 +215,7 @@ function showWindow() {
   if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); return; }
   win = new BrowserWindow({
     width: 980, height: 760, minWidth: 420, minHeight: 560, title: 'KeaS', backgroundColor: nativeTheme.shouldUseDarkColors ? '#131314' : '#f7f7f5',
-    autoHideMenuBar: true,
+    autoHideMenuBar: true, icon: appIcon(),
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false },
   });
   win.loadFile(path.join(__dirname, 'setup', 'index.html'));
@@ -241,10 +241,13 @@ function showWindow() {
     }, Number(process.env.KEAS_CAPTURE_DELAY || 1500)));
   }
 }
+/** KeaS's icon (the window, the tray and the installer use the same one). */
+const ICON_FILE = path.join(__dirname, 'icon.png');
+const appIcon = () => { const i = nativeImage.createFromPath(ICON_FILE); return i.isEmpty() ? undefined : i; };
 function makeTray() {
   if (tray) return;
-  const icon = nativeImage.createFromPath(path.join(__dirname, 'icon.png'));
-  tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon.resize({ width: 16, height: 16 }));
+  const icon = appIcon();
+  tray = new Tray(icon ? icon.resize({ width: 16, height: 16, quality: 'best' }) : nativeImage.createEmpty());
   tray.setToolTip(config.role === 'hub' ? 'KeaS · Kea Hub running' : 'KeaS · server running');
   tray.on('click', showWindow);
   refreshTray();
@@ -280,7 +283,7 @@ function refreshTray() {
     ...(isHub ? [
       { type: 'separator' },
       { label: 'Start the Hub before sign-in', type: 'checkbox', checked: installed, click: toggle },
-      { label: 'Power settings…', click: () => { showWindow(); setTimeout(() => send('navigate', 'settings'), win?.webContents.isLoading() ? 800 : 0); } },
+      { label: 'Startup and power…', click: () => navigate('settings') },
     ] : []),
     ...(updates?.state().status === 'ready' ? [{ type: 'separator' }, { label: `Restart to update KeaS to ${updates.state().version}`, click: () => installUpdate() }] : []),
     { type: 'separator' },
@@ -290,13 +293,27 @@ function refreshTray() {
 
 // ---------- Payroll (the payroll vault, on this PC only; see payroll.cjs) ----------
 let payrollApi = null;
-const payroll = () => (payrollApi ||= require('./payroll.cjs').createPayroll({ getConfig: () => config, setConfig: (patch) => { config = writeConfig({ ...config, ...patch }); }, userData: app.getPath('userData'), root: ROOT, hubPort: HUB_PORT, log }));
+const payroll = () => (payrollApi ||= require('./payroll.cjs').createPayroll({
+  getConfig: () => config, setConfig: (patch) => { config = writeConfig({ ...config, ...patch }); }, userData: app.getPath('userData'), root: ROOT, hubPort: HUB_PORT, log,
+  account: account(), icon: appIcon(),
+  // Locked (a quiet spell, or Lock): the Payroll window closes and KeaS asks for the passphrase again when it's opened.
+  onLocked: (why) => navigate('payroll', { locked: why }),
+}));
 const openPayroll = () => payroll().open().catch((e) => { log('payroll', e.message); throw e; });
-app.on('before-quit', () => { payrollApi?.stop(); });
-/** The tray's Payroll: opens it, or says why it can't (with a way into KeaS). */
+app.on('before-quit', () => { payrollApi?.forget(); });
+/** Shows the KeaS window on a screen ('payroll': its Payroll panel; 'settings': Startup and power). */
+function navigate(view, extra) {
+  const had = !!win;
+  showWindow();
+  setTimeout(() => send('navigate', { view, ...extra }), !had || win?.webContents.isLoading() ? 900 : 0);
+}
+/** The tray's Payroll: opens it, asks in the KeaS window what it needs, or says why it can't. */
 async function trayPayroll() {
-  try { await openPayroll(); }
-  catch (e) {
+  try {
+    const r = await openPayroll();
+    if (r?.need) navigate('payroll', { open: r });
+  } catch (e) {
+    if (e.data?.need === 'signin') return navigate('signin');
     const r = await dialog.showMessageBox({ type: 'warning', title: 'KeaS', message: 'Payroll didn’t open.', detail: e.message, buttons: ['Open KeaS', 'Close'], defaultId: 0, cancelId: 1 });
     if (r.response === 0) showWindow();
   }
@@ -494,6 +511,11 @@ function registerIpc() {
     return true;
   });
   handle('payroll:open', () => openPayroll());
+  handle('payroll:status', () => payroll().status());
+  handle('payroll:setup', (a) => payroll().setup(a));
+  handle('payroll:unlock', (a) => payroll().unlock(a));
+  handle('payroll:askEveryTime', ({ on }) => payroll().setAskEveryTime(!!on));
+  handle('payroll:openExports', async () => { const err = await payroll().openExports(); if (err) throw new Error(err); return true; });
   handle('payroll:settings', () => payroll().settings());
   handle('payroll:localSignIn', ({ on }) => payroll().setLocalSignIn(!!on));
   handle('payroll:hubKey', () => payroll().hubKey());

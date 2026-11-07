@@ -85,7 +85,7 @@ function sameOrigin(req, origins) {
 export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = process.env.KEAS_WEB_DIR || DEFAULT_WEB_DIR, log = true, now = () => Date.now(),
   vault: vaultMode = process.env.KEAS_VAULT === '1', hubUrl = process.env.KEAS_HUB_URL || null, sharedDir = SHARED, passphrase = process.env.KEAS_VAULT_PASSPHRASE || null, fetchImpl = globalThis.fetch,
   localSignIn = false, hubTrustKeys = null, devKeyFile = dbFile === DEFAULT_DB || dbFile === ':memory:' || process.env.KEAS_DEV_KEYFILE === '1',
-  demo = process.env.KEAS_DEV_DEMO === '1', publicHosts = [], setupToken = undefined } = {}) {
+  demo = process.env.KEAS_DEV_DEMO === '1', publicHosts = [], setupToken = undefined, onVaultLock = null } = {}) {
   const demoOn = !!demo && !vaultMode;
   const vaultSetupToken = !vaultMode || setupToken === false ? null : setupToken || process.env.KEAS_VAULT_SETUP_TOKEN || randomBytes(32).toString('base64url');
   const extraHosts = (Array.isArray(publicHosts) ? publicHosts : [publicHosts]).filter(Boolean).map((x) => String(x).toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, ''));
@@ -507,6 +507,8 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     // This PC's own Hub's public key (from the KeaS app, when this PC is the Hub): the Hub must prove it holds it.
     hubTrustKeys: typeof hubTrustKeys === 'function' ? hubTrustKeys : () => hubTrustKeys,
     setupToken: vaultSetupToken,
+    // The KeaS app forgets the passphrase it kept for this run when the vault locks (after a quiet spell, or Lock).
+    onVaultLock: typeof onVaultLock === 'function' ? onVaultLock : null,
     uid: (p) => `${p}-${randomUUID()}`, today: (org) => localDate(now(), org.tz),
     getPerson, getShift, loadOrg, rulesFor, tablesFor, computeTimecard, positionsOf,
     periodOf, currentPeriod, lastCompleted, parsePeriod, newSession, sessionCookie,
@@ -616,6 +618,8 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
   const ownOrigins = () => new Set([...localHosts().map((x) => `http://${x}`), ...extraHosts.map((x) => `https://${x}`)]);
   return {
     server, h, vault, setupToken: vaultSetupToken,
+    /** The KeaS app's own sign-in and setup with its signed-in Kea account (in this process only; see vaultauth.mjs). */
+    keas: ctx.keas,
     /**
      * The Kea Hub's current signing key next to the one payroll trusts: fingerprints to compare, and why a key changes.
      * The KeaS app shows this before the owner accepts a new key (repinHub).

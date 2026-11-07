@@ -411,11 +411,119 @@ function status() {
   ];
 }
 
-/** Payroll: opening it with the signed-in Kea account. */
+// ---------- Payroll: opened with the signed-in Kea account; the passphrase asked once per run ----------
+const US_STATES = ['AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'DC', 'FL', 'GA', 'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD', 'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ', 'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC', 'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY'];
+const TIME_ZONES = ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Phoenix', 'America/Los_Angeles', 'America/Anchorage', 'Pacific/Honolulu'];
+function loadPayroll() {
+  if (S.payLoading) return;
+  S.payLoading = true;
+  call(k.payrollStatus).then((v) => { S.pay = v; S.payLoading = false; render(); }).catch((e) => { S.payLoading = false; S.pay = { error: e.message }; render(); });
+}
+async function openPay() {
+  S.busy = true; S.payError = ''; render();
+  try {
+    const r = await call(k.openPayroll);
+    S.busy = false;
+    if (r.opened) { S.payForm = null; S.payLocked = null; S.pay = null; } else { S.payForm = r; S.payData = S.payData || {}; }
+    render();
+  } catch (e) {
+    S.busy = false;
+    if (e.data && e.data.need === 'signin') { go('signin'); return; }
+    S.payError = e.message; render();
+  }
+}
+/** After opening: secrets typed into the forms are dropped from the page. */
+function payOpened() { S.payForm = null; S.payData = null; S.payLocked = null; S.pay = null; S.busy = false; render(); }
 function payrollPanel() {
-  return h('div', { class: 'panel' },
-    h('p', null, 'Pay runs, tax forms and HR records for your organization. Payroll runs only on this computer: SSNs and bank details are encrypted with a passphrase you choose and never go to the Hub.'),
-    h('p', null, h('button', { class: 'btn primary', onclick: async () => { try { await call(k.openPayroll); } catch (e) { fail(e); } } }, 'Open Payroll')),
+  const p = S.pay;
+  if (!p) { loadPayroll(); return h('div', { class: 'panel' }, h('p', { class: 'muted small' }, 'Loading…')); }
+  const intro = h('p', null, 'Pay runs, tax forms and HR records for your organization. Payroll runs only on this computer: SSNs and bank details are encrypted with a passphrase you choose and never go to the Hub.');
+  if (!p.signedIn)
+    return h('div', { class: 'panel' }, intro, h('p', null, h('button', { class: 'btn primary', onclick: () => go('signin') }, 'Sign in to use Payroll')));
+  const f = S.payForm;
+  const d = S.payData || (S.payData = {});
+  const field = (label, key, type = 'text', extra = {}) => h('label', { class: 'field' }, label, h('input', { type, value: d[key] || '', oninput: (e) => (d[key] = e.target.value), ...extra }));
+  const err = S.payError && h('div', { class: 'err' }, S.payError);
+  const cancel = h('button', { class: 'btn', type: 'button', disabled: S.busy, onclick: () => { S.payForm = null; S.payData = null; S.payError = ''; render(); } }, 'Cancel');
+  const sendUnlock = async () => {
+    S.busy = true; S.payError = ''; render();
+    try {
+      const r = await call(k.payrollUnlock, { passphrase: d.passphrase, password: d.password, code: f.need === 'code' ? d.code : undefined });
+      if (r.need === 'code') { S.payForm = { ...f, need: 'code' }; d.code = ''; S.busy = false; render(); return; }
+      payOpened();
+    } catch (e) {
+      S.busy = false;
+      if (f.need === 'code') d.code = '';
+      if (e.data && e.data.passphrase && f.need === 'code') { S.payForm = { ...f, need: 'unlock' }; d.passphrase = ''; }
+      S.payError = e.message; render();
+    }
+  };
+  let body;
+  if (!f) {
+    body = [
+      S.payLocked && h('p', { class: 'muted small' }, S.payLocked === 'idle' ? 'Payroll locked itself after a quiet spell. Open it again with the passphrase.' : 'Payroll is locked. Open it again with the passphrase.'),
+      p.folderProblem && h('p', { class: 'err' }, `The payroll folder’s permissions: ${p.folderProblem}`),
+      h('p', null, h('button', { class: 'btn primary', disabled: S.busy, onclick: openPay }, p.open ? 'Show Payroll' : 'Open Payroll'),
+        p.remembered && !p.open ? h('span', { class: 'muted small' }, '  The passphrase is remembered until KeaS closes or payroll locks.') : null),
+    ];
+  } else if (f.need === 'setup') {
+    const zone = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { return 'America/Denver'; } })();
+    if (!d.tz) d.tz = zone;
+    const zones = TIME_ZONES.includes(d.tz) ? TIME_ZONES : [d.tz, ...TIME_ZONES];
+    const a = S.acct || {};
+    const tables = (p.taxStates || []);
+    const confirmKey = !f.ownHub && f.fingerprint;
+    body = form(async () => {
+      const why = !(d.orgName || '').trim() ? 'Enter the organization’s name.' : !d.state ? 'Pick the state.' : (d.passphrase || '').length < 12 ? 'The passphrase needs 12 or more characters.' : d.passphrase !== d.passphrase2 ? 'The two passphrases don’t match.' : confirmKey && !d.keyOk ? 'Compare the Kea Hub’s key fingerprint first.' : '';
+      if (why) { S.payError = why; render(); return; }
+      S.busy = true; S.payError = ''; render();
+      try {
+        await call(k.payrollSetup, { passphrase: d.passphrase, hubKeyFingerprint: confirmKey ? f.fingerprint : undefined, org: { name: d.orgName, state: d.state, tz: d.tz, payPeriodAnchor: d.anchor || undefined, futaExempt: !!d.futa, sutaRate: d.suta ? Number(d.suta) : undefined } });
+        payOpened();
+      } catch (e) { S.busy = false; S.payError = e.message; render(); }
+    },
+    h('h3', null, 'Set up payroll on this computer'),
+    h('p', { class: 'muted small' }, `Payroll admin: ${a.name || ''} ${a.email ? `(${a.email})` : ''}, your Kea account.`),
+    field('Organization', 'orgName'),
+    h('label', { class: 'field' }, 'State', h('select', { onchange: (e) => (d.state = e.target.value) },
+      h('option', { value: '' }, 'Pick a state'),
+      US_STATES.map((s) => h('option', { value: s, selected: d.state === s }, tables.includes(s) ? `${s} (state tax tables included)` : s)))),
+    d.state && !tables.includes(d.state) && h('p', { class: 'muted small' }, `KeaS doesn’t have ${d.state} tax tables yet, so state taxes aren’t worked out for you.`),
+    h('label', { class: 'field' }, 'Time zone', h('select', { onchange: (e) => (d.tz = e.target.value) }, zones.map((z) => h('option', { value: z, selected: d.tz === z }, z.replace('_', ' '))))),
+    field('Vault passphrase (12+ characters)', 'passphrase', 'password', { autocomplete: 'new-password' }),
+    field('Vault passphrase again', 'passphrase2', 'password', { autocomplete: 'new-password' }),
+    h('p', { class: 'muted small' }, 'It encrypts SSNs, bank details and documents. It can’t be recovered if it’s lost, so keep it somewhere safe. KeaS asks for it once each time you start KeaS.'),
+    confirmKey && h('div', { class: 'panel' },
+      h('p', { class: 'small' }, 'Kea Hub key fingerprint: ', h('code', null, f.fingerprint)),
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !!d.keyOk, onchange: (e) => { d.keyOk = e.target.checked; render(); } }), 'It matches the one shown on the Hub’s PC (KeaS there: Payroll, Advanced)')),
+    h('details', null, h('summary', null, 'Advanced'),
+      field('First day of a pay period', 'anchor', 'date'),
+      h('p', { class: 'muted small' }, 'Biweekly periods count from this day. Empty: this week’s Sunday.'),
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !!d.futa, onchange: (e) => (d.futa = e.target.checked) }), '501(c)(3): exempt from FUTA'),
+      field('State unemployment rate (for example 0.0305)', 'suta', 'number', { step: '0.0001', min: '0', max: '0.2' })),
+    err,
+    h('div', { class: 'actions' }, cancel, h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, S.busy ? 'Setting up…' : 'Set up payroll')));
+  } else if (f.need === 'code') {
+    body = form(sendUnlock,
+      h('h3', null, 'Two-step sign-in'),
+      h('p', { class: 'muted small' }, 'The passphrase is right. Now the 6-digit code from your authenticator app.'),
+      field('Code', 'code', 'text', { inputmode: 'numeric', maxlength: '6', autocomplete: 'one-time-code' }),
+      err,
+      h('div', { class: 'actions' }, cancel, h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, S.busy ? 'Opening…' : 'Open Payroll')));
+  } else {
+    body = form(sendUnlock,
+      h('h3', null, f.askEveryTime ? 'Sign in to Payroll' : 'Unlock Payroll'),
+      h('p', { class: 'muted small' }, f.askEveryTime ? `${f.org ? `${f.org}. ` : ''}Your Kea password and the vault passphrase. A two-step code comes next if your account uses one.` : `${f.org ? `${f.org}. ` : ''}The vault passphrase. KeaS remembers it until you close KeaS or payroll locks.`),
+      f.askEveryTime && field('Kea password', 'password', 'password', { autocomplete: 'current-password' }),
+      field('Vault passphrase', 'passphrase', 'password'),
+      err,
+      h('div', { class: 'actions' }, cancel, h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, S.busy ? 'Opening…' : 'Open Payroll')));
+  }
+  return h('div', { class: 'panel' }, intro, body,
+    !f && err,
+    h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !!p.askEveryTime, onchange: async (e) => {
+      try { await call(k.payrollAskEveryTime, { on: e.target.checked }); S.pay = null; S.payForm = null; render(); } catch (er) { fail(er); }
+    } }), h('span', null, 'Ask for my sign-in every time I open Payroll', h('span', { class: 'muted small' }, ' Your Kea password, the passphrase and the two-step code, at every open. Off: KeaS uses your Kea sign-in and asks for the passphrase once each time KeaS starts.'))),
     payrollAdvanced());
 }
 
@@ -429,7 +537,8 @@ function payrollAdvanced() {
         h('input', { type: 'checkbox', checked: S.ps.localSignIn, onchange: async (e) => { try { S.ps = await call(k.payrollLocalSignIn, { on: e.target.checked }); render(); } catch (err) { fail(err); } } }),
         h('span', null, 'Allow a local password while the Kea Hub can’t be reached',
           h('span', { class: 'muted small' }, ' Each payroll admin can then set a long local password (16 or more characters) in Payroll. It only works while the Hub can’t be reached, still needs the vault passphrase, and skips the Hub’s two-step sign-in, so leave it off unless you need it. Off by default.'))),
-      S.ps.exportsDir && h('p', { class: 'muted small' }, `Files Payroll saves (tax form data, bank files, reports) go to ${S.ps.exportsDir}, a folder only your Windows account can open.`),
+      S.ps.exportsDir && h('p', { class: 'muted small' }, `Files Payroll saves (tax form data, bank files, reports) go to ${S.ps.exportsDir}, a folder only your Windows account can open. `,
+        h('button', { class: 'btn', onclick: () => call(k.payrollOpenExports).catch(fail) }, 'Open Exports folder')),
       S.ps.folderProblem && h('p', { class: 'err' }, `The payroll folder’s permissions: ${S.ps.folderProblem}`),
       S.ps.ownHubFingerprint && h('p', { class: 'small' }, 'This Hub’s key fingerprint (payroll on another PC asks you to compare it): ', h('code', {}, S.ps.ownHubFingerprint)),
       h('p', { class: 'muted small' }, 'Payroll trusts the Kea Hub’s signing key from when it was set up. If the Hub’s key changes, sign-in is refused until you check the new key here and accept it. Only do this for your own Hub.'),
@@ -517,7 +626,7 @@ function signin() {
         S.error && h('div', { class: 'err' }, S.error),
         h('div', { class: 'actions' },
           h('button', { class: 'btn', type: 'button', disabled: S.busy, onclick: () => { S.signStep = null; f.code = ''; S.error = ''; render(); } }, 'Back'),
-          h('button', { class: 'btn primary', type: 'submit', disabled: S.busy || !/^\d{6}$/.test(f.code.trim()) }, S.busy ? 'Signing in…' : 'Sign in'))),
+          h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, S.busy ? 'Signing in…' : 'Sign in'))),
     ];
   return [
     h('h1', null, 'Sign in to Kea'),
@@ -699,10 +808,19 @@ function applyTheme(t) {
 document.getElementById('theme').addEventListener('change', (e) => { applyTheme(e.target.value); k.setTheme({ theme: e.target.value }); });
 k.onUpdate((u) => { S.update = u; if (S.step === 'status') render(); });
 k.onProgress((line) => { S.log.push(line); if (S.step === 'reach') render(); });
-// The tray's "Power settings…" opens the settings page (once setup is done).
-k.onNavigate((view) => {
-  if (view !== 'settings' || !S.config.setupDone || S.busy) return;
-  S.bs = null; S.bo = null; S.bootScript = null; S.bootResult = null;
-  go('settings');
+// The tray (and Payroll) can send the window to a screen: Startup and power, the Payroll panel, or sign-in.
+k.onNavigate((nav) => {
+  const view = typeof nav === 'string' ? nav : nav && nav.view;
+  if (view === 'settings') {
+    if (!S.hub || !S.config.setupDone || S.busy) return;
+    S.bs = null; S.bo = null; S.bootScript = null; S.bootResult = null;
+    go('settings');
+  } else if (view === 'payroll') {
+    S.pay = null; S.payError = ''; S.busy = false;
+    if (nav.locked) { S.payLocked = nav.locked; S.payForm = null; S.payData = null; }
+    if (nav.open && nav.open.need) { S.payForm = nav.open; S.payData = {}; }
+    S.step = S.hub && S.config.setupDone ? 'status' : S.acct ? 'home' : 'signin';
+    render();
+  } else if (view === 'signin' && !S.busy) { S.error = ''; go('signin'); }
 });
 load().catch(fail);

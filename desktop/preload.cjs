@@ -4,6 +4,11 @@ const { contextBridge, ipcRenderer } = require('electron');
 const call = (name) => (arg) => ipcRenderer.invoke(name, arg);
 contextBridge.exposeInMainWorld('keas', {
   openPayroll: call('payroll:open'),
+  payrollStatus: call('payroll:status'),
+  payrollSetup: call('payroll:setup'),
+  payrollUnlock: call('payroll:unlock'),
+  payrollAskEveryTime: call('payroll:askEveryTime'),
+  payrollOpenExports: call('payroll:openExports'),
   payrollSettings: call('payroll:settings'),
   payrollLocalSignIn: call('payroll:localSignIn'),
   payrollHubKey: call('payroll:hubKey'),

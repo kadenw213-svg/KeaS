@@ -239,9 +239,10 @@ function VaultSetup() {
     { name: 'name', label: 'Your name', required: true },
     { name: 'email', label: local ? 'Your email' : 'Your Kea Hub email', type: 'email', required: true },
     { name: 'password', label: local ? 'A local password (16+ characters; a few unrelated words work well)' : 'Your Kea Hub password', type: 'password', required: true },
-    ...(!local ? [{ name: 'code', label: 'Two-step code (if you use one)', placeholder: '123456' } as Field] : []),
     { name: 'passphrase', label: 'Vault passphrase (12+ characters)', type: 'password', required: true, help: 'Encrypts SSNs, bank details and documents. It can’t be recovered if it’s lost, so keep it somewhere safe.' },
     { name: 'passphrase2', label: 'Vault passphrase again', type: 'password', required: true },
+    // (The code last, so it doesn't run out while the passphrases are typed.)
+    ...(!local ? [{ name: 'code', label: 'Two-step code (if you use one)', placeholder: '123456' } as Field] : []),
     ...(!local && vault?.localSignIn ? [{ name: 'localPassword', label: 'Local password for when the Hub can’t be reached (16+ characters)', type: 'password', advanced: true, help: 'Only works while the Kea Hub can’t be reached, and still needs the vault passphrase.' } as Field] : []),
     { name: 'payPeriodAnchor', label: 'First day of a pay period', type: 'date', advanced: true, help: 'Biweekly periods count from this day. Default: this week’s Sunday.' },
     { name: 'futaExempt', label: '501(c)(3): exempt from FUTA', type: 'checkbox', advanced: true },
@@ -297,8 +298,9 @@ function VaultSignIn() {
   const fields: Field[] = [
     { name: 'email', label: local ? 'Email' : 'Kea Hub email', type: 'email', required: true },
     { name: 'password', label: local ? 'Local password' : 'Kea Hub password', type: 'password', required: true },
-    ...(!local ? [{ name: 'code', label: 'Two-step code (if you use one)' } as Field] : []),
-    { name: 'passphrase', label: 'Vault passphrase', type: 'password', required: true }
+    { name: 'passphrase', label: 'Vault passphrase', type: 'password', required: true },
+    // (The code last, so it doesn't run out while the passphrase is typed.)
+    ...(!local ? [{ name: 'code', label: 'Two-step code (if you use one)' } as Field] : [])
   ];
   return (
     <>

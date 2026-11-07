@@ -62,7 +62,8 @@ export function makeHubClient({ fetchImpl = fetch, timeoutMs = 8000, now = () =>
     } catch { throw new HubUnreachable(); }
     const j = await r.json().catch(() => ({}));
     if (r.status >= 500) throw new HubUnreachable(`The Kea Hub had a problem (${r.status}).`);
-    if (!r.ok) throw new HubRefused(j.error || `The Kea Hub said no (${r.status}).`, r.status);
+    // (Whether the Hub wants a two-step code goes along, so a used-up code gets its own message.)
+    if (!r.ok) throw new HubRefused(j.error || `The Kea Hub said no (${r.status}).`, r.status, j.totpRequired ? { totpRequired: true } : undefined);
     return j;
   }
 
