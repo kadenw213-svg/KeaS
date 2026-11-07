@@ -371,6 +371,9 @@ function settings() {
     h('p', { class: 'muted' }, 'Start the Kea Hub before anyone signs in, and keep this PC awake for it. Saving asks Windows for permission once.'),
     S.bs.needsUpdate && h('div', { class: 'err' }, 'Starting before sign-in needs to be set up again: it was set up by an earlier version of KeaS, or the permissions on its folder changed. Click Save to move it to a protected folder.'),
     S.bs.folderProblem && h('div', { class: 'err' }, S.bs.folderProblem),
+    h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !!S.startWithWindows, disabled: S.busy, onchange: async (e) => {
+      try { S.startWithWindows = await call(k.setStartWithWindows, { on: e.target.checked }); render(); } catch (err) { fail(err); }
+    } }), h('span', null, 'Start KeaS when I sign in to Windows', h('span', { class: 'muted small' }, ' It waits in the tray and runs the Hub. Changes right away; no permission needed.'))),
     ...bootForm(),
     S.error && h('div', { class: 'err' }, S.error),
     h('div', { class: 'actions' },
@@ -419,11 +422,14 @@ function updatePanel() {
     h('div', { class: 'row' },
       u.status === 'ready'
         ? h('button', { class: 'btn primary', onclick: async () => {
-          if (!confirm(`Restart KeaS now to install ${u.version}?`)) return;
-          try { await call(k.installUpdate); } catch (e) { fail(e); }
+          // (Payroll open: restarting locks it and loses whatever isn't saved there.)
+          const st = await call(k.state).catch(() => ({}));
+          if (!(await askInPage(`Restart KeaS now to install ${u.version}?`, st.payrollOpen ? 'Payroll is open: restarting locks it, and anything not saved there is lost. Save your work first.' : '', 'Restart and update'))) return;
+          try { await call(k.installUpdate); } catch (e) { S.update = { ...u, status: 'error', message: e.message }; render(); }
         } }, 'Restart and update')
         : h('button', { class: 'btn', disabled: busy || u.status === 'dev', onclick: async () => {
-          try { S.update = { status: 'checking' }; render(); S.update = await call(k.checkUpdates); render(); } catch (e) { fail(e); }
+          // (A failed check shows in this panel only, not twice.)
+          try { S.update = { status: 'checking' }; render(); S.update = await call(k.checkUpdates); render(); } catch (e) { S.update = { status: 'error', message: e.message }; render(); }
         } }, 'Check for updates')));
 }
 
@@ -454,7 +460,7 @@ function status() {
       c.role === 'hub' && h('p', { class: 'muted small' }, `Each account gets ${c.quotaGb || 5} GB of Kea storage. Owner: ${c.ownerEmail || 'not set'}.`)),
     c.role === 'hub' && h('div', { class: 'panel' },
       h('p', null, h('b', null, 'Startup and power')),
-      h('p', { class: 'muted small' }, c.boot?.installed ? 'The Hub starts when Windows starts, before anyone signs in.' : 'The Hub starts when you sign in to Windows.',
+      h('p', { class: 'muted small' }, c.boot?.installed ? 'The Hub starts when Windows starts, before anyone signs in.' : S.startWithWindows ? 'The Hub starts when you sign in to Windows (KeaS starts then).' : 'The Hub runs while KeaS is open. KeaS doesn’t start with Windows.',
         c.boot?.powerApplied ? ' This PC stays awake on AC power.' : '', S.hubExternal ? ' The Hub running now was started before sign-in.' : ''),
       h('button', { class: 'btn', onclick: () => { S.bs = null; S.bo = null; S.bootScript = null; S.bootResult = null; go('settings'); } }, 'Change…')),
     c.role === 'hub' && c.publicUrl && h('p', null, h('button', { class: 'btn', onclick: () => k.openExternal({ url: `${c.publicUrl}/terms` }) }, 'Open the terms page')),

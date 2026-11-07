@@ -253,6 +253,8 @@ function makeTray() {
   tray.on('click', showWindow);
   refreshTray();
 }
+// The before-sign-in steps (bootstart.cjs) in plain words, for when one doesn't work.
+const STEP_WORDS = { 'data:acl': 'Locking down the data folder', 'hub:stop': 'Stopping the Hub', 'legacy:remove': 'Removing the old launcher', 'power:apply': 'Changing the power settings', 'service:clear': 'Clearing the service folder', 'service:copy': 'Copying the Hub’s files', 'service:folder': 'Making the service folder', 'service:owner': 'Protecting the service folder', 'service:remove': 'Removing the service folder', task: 'Adding the start-up task', 'task:delete': 'Removing the start-up task', 'task:end': 'Ending the start-up task' };
 function refreshTray() {
   if (!tray) return;
   const isHub = config.role === 'hub' && hubMode();
@@ -271,10 +273,15 @@ function refreshTray() {
   const installed = !!config.boot?.installed;
   tray.setToolTip(isHub ? (hubExternal ? 'KeaS · Kea Hub running (started before sign-in)' : 'KeaS · Kea Hub running') : 'KeaS · server running');
   const toggle = async () => {
+    // Windows asks for permission for this: say so first, and let it be cancelled.
+    const ask = await dialog.showMessageBox({ type: 'question', title: 'KeaS', message: installed ? 'Stop starting the Hub before sign-in?' : 'Start the Hub before anyone signs in?',
+      detail: installed ? 'Windows asks for permission to remove the task that starts the Hub. The Hub then runs while KeaS is open.' : 'Windows asks for permission so KeaS can add a task that starts the Hub when Windows starts, even before anyone signs in. You can turn it off here or on the Startup and power page.',
+      buttons: ['Continue', 'Cancel'], defaultId: 0, cancelId: 1 });
+    if (ask.response !== 0) { refreshTray(); return; }
     try {
       // (Only the task: the power settings stay as they are. "Power settings…" changes or undoes those.)
       const r = await bootApply({ ...(config.boot?.options || { power: false }), bootStart: !installed });
-      if (!r.ok) dialog.showMessageBox({ type: 'warning', title: 'KeaS', message: 'Part of it didn’t work.', detail: r.steps.filter((s) => !s.ok).map((s) => `${s.step}: ${s.error}`).join('\n') });
+      if (!r.ok) dialog.showMessageBox({ type: 'warning', title: 'KeaS', message: 'Part of it didn’t work.', detail: r.steps.filter((s) => !s.ok).map((s) => `${STEP_WORDS[s.step] || s.step}: ${s.error}`).join('\n') });
     } catch (e) { dialog.showMessageBox({ type: 'warning', title: 'KeaS', message: e.message }); }
     refreshTray();
   };
@@ -321,6 +328,10 @@ async function trayPayroll() {
 }
 /** Restart and update (the tray's item; the page asks first itself). */
 async function installUpdate() {
+  if (payrollApi?.isOpen()) {
+    const r = await dialog.showMessageBox({ type: 'warning', title: 'KeaS', message: 'Payroll is open.', detail: 'Restarting KeaS locks Payroll, and anything not saved there is lost. Save your work first.', buttons: ['Restart and update', 'Cancel'], defaultId: 1, cancelId: 1 });
+    if (r.response !== 0) return;
+  }
   try { updates.install(); } catch (e) { log('update', e.message); }
 }
 
@@ -397,7 +408,7 @@ function registerIpc() {
     const hub = hubMode();
     const defaults = hub && !config.setupDone ? { hubData: await defaultFolder('Kea Hub') } : {};
     return {
-      config: publicConfig(), folderProblem, folderWarning, lastStartError, running: { hub: hubRunning(), org: !!org, hubExternal }, port: servicePort(),
+      config: publicConfig(), folderProblem, folderWarning, lastStartError, payrollOpen: !!payrollApi?.isOpen(), running: { hub: hubRunning(), org: !!org, hubExternal }, port: servicePort(),
       defaults, resume: hub ? flow.resumeChoices(config, defaults) : null, version: app.getVersion(),
       hub, view: flow.firstView({ hub, config, signedIn: account().signedIn() }), account: account().cached(), startWithWindows: flow.startWithWindows(config),
     };
