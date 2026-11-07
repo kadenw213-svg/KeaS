@@ -11,6 +11,7 @@ import { registerReports } from './reports.mjs';
 import { registerImport } from './importer.mjs';
 import { registerYearEnd } from './yearend.mjs';
 import { registerTalent } from './talent.mjs';
+import { registerChecklist, payrollChecklist } from './checklist.mjs';
 
 export function registerPayroll(c) {
   /**
@@ -36,4 +37,14 @@ export function registerPayroll(c) {
   registerImport(c);
   registerYearEnd(c);
   registerTalent(c);
+  registerChecklist(c);
+  // The KeaS app's "Get set up" screen asks for a summary while the vault is open (in this process only).
+  if (c.keas) c.keas.checklist = () => {
+    if (!c.vault.unlocked()) return null;
+    const org = c.h.get('SELECT id FROM orgs LIMIT 1');
+    if (!org) return null;
+    const r = payrollChecklist(c, c.loadOrg(org.id));
+    // (Titles and done/not done only: no names, no pay details leave the vault this way.)
+    return { left: r.left, total: r.total, year: r.year, steps: r.steps.map((s) => ({ id: s.id, title: s.title, done: s.done, optional: !!s.optional, blocking: !!s.blocking })) };
+  };
 }

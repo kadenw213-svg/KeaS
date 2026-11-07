@@ -217,7 +217,7 @@ export function registerVaultAuth(c) {
     if (keys) savePin(keys);
     const orgId = uid('org'), pid = uid('p');
     h.tx(() => {
-      h.run(`INSERT INTO orgs (id,name,state,tz,pay_frequency,pay_period_anchor,futa_exempt,suta_rate,bank,settings) VALUES (?,?,?,?,?,?,?,?,?,?)`, orgId, orgName, state, tz, 'biweekly', anchor, o.futaExempt ? 1 : 0, Number(o.sutaRate) || 0, '{}', '{}');
+      h.run(`INSERT INTO orgs (id,name,state,tz,pay_frequency,pay_period_anchor,futa_exempt,suta_rate,bank,settings) VALUES (?,?,?,?,?,?,?,?,?,?)`, orgId, orgName, state, tz, 'biweekly', anchor, o.futaExempt ? 1 : 0, Number(o.sutaRate) || 0, '{}', JSON.stringify(o.workCity ? { workCity: String(o.workCity).trim().slice(0, 60) } : {}));
       h.run(`INSERT INTO people (id,org_id,name,email,roles,positions,status,w4,ytd_wages_cents,hire_date) VALUES (?,?,?,?,?,?,?,?,0,?)`, pid, orgId, name, email, '["member","owner","payroll"]', '[]', 'active', '{}', null);
       h.run('INSERT INTO vault_users (id,person_id,email,hub_sub,local_pw,created_at) VALUES (?,?,?,?,?,?)', uid('vu'), pid, email, hubSub, localPw, iso(now()));
     });
@@ -421,6 +421,8 @@ export function registerVaultAuth(c) {
     if (body.cobra !== undefined) s.cobra = { groupHealthPlan: !!body.cobra?.groupHealthPlan, stateContinuation: !!body.cobra?.stateContinuation };
     if (body.fmla !== undefined) s.fmla = { worksiteEmployees: body.fmla?.worksiteEmployees == null || body.fmla.worksiteEmployees === '' ? null : Math.round(num(body.fmla.worksiteEmployees, 'worksiteEmployees', 1e6)) };
     if (body.aca !== undefined) s.aca = { ale: !!body.aca?.ale };
+    // Where people work (a city or county): local rules KeaS knows about, like a city minimum wage, follow it.
+    if (body.workCity !== undefined) s.workCity = body.workCity == null || String(body.workCity).trim() === '' ? null : V.str(String(body.workCity).trim(), 'workCity', { max: 60 });
     if (body.offerTemplate !== undefined) s.offerTemplate = body.offerTemplate ? V.str(body.offerTemplate, 'offerTemplate', { max: 20000 }) : null;
     // Pay amounts in managers' reports: off unless the owner turns it on.
     if (body.managersSeePay !== undefined) { need(me, 'owner'); s.managersSeePay = !!body.managersSeePay; }

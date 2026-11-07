@@ -7,7 +7,7 @@ import { serveStatic, securityHeaders, DEFAULT_WEB_DIR } from './static.mjs';
 import { fileURLToPath } from 'node:url';
 import { openDb, DEFAULT_DB, byName, rowToPerson, rowToOrg, rowToShift, rowToPosition, rowToCertType, rowToPunch, rowToRequest, rowToSwap } from './db.mjs';
 import { seed } from './seed.mjs';
-import { mergeRules, checkAssignment, timecard, unforceable, isBlocked } from './lib/rules.mjs';
+import { mergeRules, withPlace, checkAssignment, timecard, unforceable, isBlocked } from './lib/rules.mjs';
 import { makeVault, openDevVault, VaultLocked, VaultDamaged, SealError } from './payroll/vaultstate.mjs';
 import { makeHubClient, checkHubUrl, keyFingerprint, KEY_CHANGE_REASONS, KEY_CHANGE_WARNING } from './payroll/hub.mjs';
 import { makeTables } from './payroll/run.mjs';
@@ -104,7 +104,8 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
   const loadOrg = (id) => rowToOrg(h.get('SELECT * FROM orgs WHERE id = ?', id));
   const rulesFor = (org) => {
     const f = join(sharedDir, 'labor', `${org.state}.json`);
-    return mergeRules(us, existsSync(f) ? readJson(f) : null, org.ruleOverrides);
+    // (A city or county the tables know, like Denver's minimum wage, applies where the org says people work.)
+    return withPlace(mergeRules(us, existsSync(f) ? readJson(f) : null, org.ruleOverrides), org.settings?.workCity);
   };
   const audit = (org, actor, action, target, detail) => h.run('INSERT INTO audit_log (org_id,actor,action,target,detail,at) VALUES (?,?,?,?,?,?)', org, actor, action, target, JSON.stringify(detail ?? null), iso(now()));
 

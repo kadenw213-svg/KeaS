@@ -64,6 +64,7 @@ export function VaultSettings() {
             key={JSON.stringify(settings.data.settings)}
             initial={{
               ...settings.data.org,
+              workCity: settings.data.settings.workCity ?? '',
               mileageRateCents: settings.data.settings.mileageRateCents,
               receiptRequiredCents: settings.data.settings.receiptRequiredCents ?? 7500,
               groupHealthPlan: settings.data.settings.cobra?.groupHealthPlan,
@@ -80,9 +81,10 @@ export function VaultSettings() {
               { name: 'mileageRateCents', label: 'Mileage rate (per mile)', type: 'money', help: 'Set your own rate; KeaS doesn’t assume one.' },
               { name: 'groupHealthPlan', label: 'We have a group health plan (COBRA reminders)', type: 'checkbox' },
               { name: 'ale', label: 'We’re an applicable large employer (ACA forms)', type: 'checkbox' },
-              { name: 'state', label: 'State (two letters)', advanced: true },
+              { name: 'state', label: 'State where people work (two letters)', required: true },
+              { name: 'workCity', label: 'City or county where people work', help: 'Local rules KeaS knows, like a city minimum wage, follow it.' },
+              { name: 'sutaRate', label: 'State unemployment rate (for example 0.0305)', type: 'number', step: '0.0001', help: 'The rate on your state’s rate notice.' },
               { name: 'futaExempt', label: '501(c)(3): exempt from FUTA', type: 'checkbox', advanced: true },
-              { name: 'sutaRate', label: 'State unemployment rate (for example 0.0305)', type: 'number', step: '0.0001', advanced: true },
               { name: 'receiptRequiredCents', label: 'Receipts needed from', type: 'money', advanced: true },
               { name: 'expenseCategories', label: 'Expense categories (comma-separated)', advanced: true },
               { name: 'stateContinuation', label: 'A state continuation law applies to us', type: 'checkbox', advanced: true },
@@ -96,6 +98,7 @@ export function VaultSettings() {
                 api('POST', '/v1/org/settings', {
                   name: v.name,
                   state: v.state,
+                  workCity: v.workCity ?? '',
                   futaExempt: v.futaExempt,
                   sutaRate: v.sutaRate,
                   mileageRateCents: v.mileageRateCents,

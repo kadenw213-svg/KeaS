@@ -3,8 +3,8 @@ import { api, onSessionEvents } from './api';
 
 export type WorkView =
   | 'today' | 'schedule' | 'timecards' | 'people' | 'pay'
-  | 'employees' | 'org' | 'timeoff' | 'approvals' | 'onboarding' | 'expenses' | 'documents' | 'reports' | 'import' | 'yearend' | 'hiring' | 'performance' | 'settings';
-export const VIEWS: WorkView[] = ['today', 'schedule', 'timecards', 'people', 'pay', 'employees', 'org', 'timeoff', 'approvals', 'onboarding', 'expenses', 'documents', 'reports', 'import', 'yearend', 'hiring', 'performance', 'settings'];
+  | 'setup' | 'employees' | 'org' | 'timeoff' | 'approvals' | 'onboarding' | 'expenses' | 'documents' | 'reports' | 'import' | 'yearend' | 'hiring' | 'performance' | 'settings';
+export const VIEWS: WorkView[] = ['today', 'schedule', 'timecards', 'people', 'pay', 'setup', 'employees', 'org', 'timeoff', 'approvals', 'onboarding', 'expenses', 'documents', 'reports', 'import', 'yearend', 'hiring', 'performance', 'settings'];
 
 export interface Person {
   id: string;
@@ -68,7 +68,8 @@ interface WorkState {
 
 const viewFromPath = (): WorkView => {
   const v = location.pathname.replace(/^\/+|\/+$/g, '');
-  if (v === 'payroll') return 'pay';
+  // (Payroll opens on Get set up; it leads to the pay run once everything's done.)
+  if (v === 'payroll') return 'setup';
   return VIEWS.includes(v as WorkView) ? (v as WorkView) : 'today';
 };
 

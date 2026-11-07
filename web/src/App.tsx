@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import {
-  BarChart3, Briefcase, CalendarDays, CalendarOff, CheckSquare, Clock, FileClock, FileText, Lock, LogOut, Network, Receipt, RefreshCw, Settings, Target, TriangleAlert, Upload, UserPlus, Users, Wallet, CalendarCheck2
+  BarChart3, Briefcase, CalendarDays, CalendarOff, CheckSquare, Clock, FileClock, FileText, ListChecks, Lock, LogOut, Network, Receipt, RefreshCw, Settings, Target, TriangleAlert, Upload, UserPlus, Users, Wallet, CalendarCheck2
 } from 'lucide-react';
 import { useWork, loadWork, can, go, signOut, type WorkView, type Person } from './store';
 import { api, ApiError } from './api';
@@ -25,6 +25,7 @@ import { YearEnd } from './screens/YearEnd';
 import { Hiring } from './screens/Hiring';
 import { Performance } from './screens/Performance';
 import { VaultSettings } from './screens/VaultSettings';
+import { Setup } from './screens/Setup';
 
 export function App() {
   return (
@@ -71,6 +72,7 @@ function Work() {
     { id: 'schedule', label: 'Schedule', short: 'Schedule', icon: <CalendarDays size={20} />, show: !vault },
     { id: 'timecards', label: 'Timecards', short: 'Timecards', icon: <FileClock size={20} />, show: true },
     { id: 'people', label: 'People & certifications', short: 'People', icon: <Users size={20} />, show: !vault && mgr },
+    { id: 'setup', label: 'Get set up', short: 'Setup', icon: <ListChecks size={20} />, show: pay && vault },
     { id: 'pay', label: 'Pay run', short: 'Pay', icon: <Wallet size={20} />, show: pay, group: P },
     { id: 'employees', label: 'Employees', short: 'Staff', icon: <Users size={20} />, show: pay, group: P },
     { id: 'approvals', label: 'Approvals', short: 'Approve', icon: <CheckSquare size={20} />, show: true, group: P },
@@ -87,7 +89,8 @@ function Work() {
     { id: 'settings', label: vault ? 'Vault and settings' : 'Payroll settings', short: 'Settings', icon: <Settings size={20} />, show: pay, group: S }
   ];
   const shown = nav.filter((n) => n.show);
-  const fallback: WorkView = vault ? (pay ? 'pay' : 'timecards') : 'today';
+  // (Payroll opens on Get set up; once everything is done it says so and leads to the pay run.)
+  const fallback: WorkView = vault ? (pay ? 'setup' : 'timecards') : 'today';
   const current = shown.some((n) => n.id === view) ? view : fallback;
   const lock = async () => {
     try {
@@ -142,6 +145,7 @@ function Work() {
         {current === 'timecards' && <Timecards />}
         {current === 'people' && <People />}
         {current === 'pay' && <PayRun />}
+        {current === 'setup' && <Setup />}
         {current === 'employees' && <Employees />}
         {current === 'org' && <OrgSetup />}
         {current === 'timeoff' && <TimeOff />}
