@@ -84,7 +84,7 @@ function storage() {
       h('button', { class: 'btn', onclick: back }, 'Back'),
       h('button', { class: 'btn primary', disabled: S.busy || !S.dataDir.trim(), onclick: async () => {
         S.busy = true; render();
-        try { await call(k.checkFolder, { dir: S.dataDir }); S.busy = false; go('reach'); } catch (e) { fail(new Error(`Can’t use that folder: ${e.message}`)); }
+        try { const r = await call(k.checkFolder, { dir: S.dataDir }); S.folderWarning = r.warning || null; S.busy = false; go('reach'); } catch (e) { fail(new Error(`Can’t use that folder: ${e.message}`)); }
       } }, 'Next')),
   ];
 }
@@ -119,6 +119,7 @@ function reach() {
   const allDone = S.reach === 'local' || TS_STEPS.every(([id]) => tsDone(id));
   return [
     h('h1', null, 'Make it reachable from anywhere'),
+    S.folderWarning && h('div', { class: 'err' }, S.folderWarning),
     h('p', { class: 'muted' }, S.role === 'hub' ? 'So people can sign in to Kea from their own homes and phones.' : 'So your staff can clock in and see schedules from their phones.'),
     h('div', { class: 'cards' },
       opt('tailscale', 'Anywhere, free (Tailscale Funnel)', 'KeaS installs and sets it up. Your home address stays hidden and no router settings change.', 'Recommended'),
@@ -341,6 +342,7 @@ function status() {
     c.role === 'hub' && c.publicUrl && h('p', null, h('button', { class: 'btn', onclick: () => k.openExternal({ url: `${c.publicUrl}/terms` }) }, 'Open the terms page')),
     c.role === 'hub' && c.boot?.installed && (c.boot.layout !== 2 || c.boot.repair) && h('div', { class: 'err' }, 'Starting the Hub before sign-in needs to be set up again, so what it runs is kept in a protected folder. ', h('button', { class: 'btn', onclick: () => { S.bs = null; S.bo = null; S.bootScript = null; S.bootResult = null; go('settings'); } }, 'Set it up again')),
     S.folderProblem && h('div', { class: 'err' }, S.folderProblem),
+    S.folderWarning && h('div', { class: 'err' }, S.folderWarning),
     h('h2', { style: 'margin-top:22px' }, 'Payroll'),
     h('div', { class: 'panel' },
       h('p', null, 'Pay runs, tax forms and HR records for your organization. Payroll runs only on this computer: SSNs and bank details are encrypted with a passphrase you choose and never go to the Hub.'),
@@ -396,7 +398,7 @@ function render() {
 
 async function load() {
   const st = await call(k.state);
-  S.config = st.config; S.defaults = st.defaults; S.folderProblem = st.folderProblem || null;
+  S.config = st.config; S.defaults = st.defaults; S.folderProblem = st.folderProblem || null; S.folderWarning = st.folderWarning || S.folderWarning || null;
   S.running = st.running.hub || st.running.org;
   S.hubExternal = !!st.running.hubExternal;
   document.getElementById('theme').value = st.config.theme || 'system';

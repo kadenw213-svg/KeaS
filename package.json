@@ -1,6 +1,6 @@
 {
   "name": "keas",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "description": "KeaS: the Kea Hub (accounts, classes, study, storage and sync for Kea) and a free workforce suite for organizations.",
   "type": "module",

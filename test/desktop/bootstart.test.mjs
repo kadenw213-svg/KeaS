@@ -34,7 +34,7 @@ function psParse(script) {
 }
 // Every command the elevated scripts may run.
 const ALLOWED = new Set(['Get-Process', 'Get-Content', 'Step', 'ConvertFrom-Json', 'ConvertTo-Json', 'Out-Null', 'Join-Path', 'Test-Path', 'New-Item', 'icacls', 'Copy-Item', 'Remove-Item', 'Get-ChildItem', 'ForEach-Object', 'Where-Object', 'Get-CimInstance', 'Stop-Process', 'schtasks', 'powercfg', 'OwnerSid', 'ServiceDir', 'New-Object', 'Get-Acl',
-  'Move-Item', 'Get-Item', 'Select-Object', 'Add-Type', 'Sha256Hex', 'IsLink', 'LinkCount', 'DataProblems', null]);
+  'Move-Item', 'Get-Item', 'Select-Object', 'Add-Type', 'Sha256Hex', 'IsLink', 'NoAcl', 'LinkCount', 'DataProblems', null]);
 
 test('options: defaults, unknown keys dropped, numbers clamped', () => {
   const o = b.options({ delaySeconds: 99999, restartCount: 0, bogus: 1, power: 0 });
@@ -193,7 +193,7 @@ test('install script: locked-down service folder in Program Files, locked-down d
   // The data folder and its secret files.
   assert.ok(s.includes("icacls $d /inheritance:r /grant:r $grantSystem $grantAdmins ($owner + ':(OI)(CI)F') /C /Q"));
   assert.ok(s.includes('icacls $d /setowner $owner /C /Q'));
-  assert.ok(s.includes('foreach ($f in @($cfg.secretFiles)) { if ($f -and (Test-Path -LiteralPath $f)) { icacls $f /setowner $owner /C /Q; icacls $f /reset /C /Q } }'));
+  assert.ok(s.includes('foreach ($f in @($cfg.secretFiles)) { if ($f -and (Test-Path -LiteralPath $f) -and -not (NoAcl $f)) { icacls $f /setowner $owner /C /Q; icacls $f /reset /C /Q } }'));
   assert.ok(s.includes("schtasks /Create /TN '\\KeaS\\Kea Hub' /XML ([string]$cfg.xmlFile) /F"));
   assert.ok(s.indexOf("Step 'service:folder'") < s.indexOf("Step 'service:copy'") && s.indexOf("Step 'service:copy'") < s.indexOf("Step 'task'"), 'permissions before files, files before the task');
   assert.ok(s.includes('powercfg /setacvalueindex 381b4222-f694-41f0-9685-ff5bb260df2e SUB_SLEEP STANDBYIDLE 0'));
@@ -285,7 +285,7 @@ test('C1: the data folder step really locks a folder down, and the PoC name stay
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('C1: secureDataFolder locks a new folder at once, and repairs or refuses an existing one', { skip: !WIN && 'Windows only' }, async () => {
+test('C1: secureDataFolder locks a new folder at once, repairs an existing one, and uses one it can\'t lock with a warning', { skip: !WIN && 'Windows only' }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'keas-acl-'));
   try {
     const sid = await b.currentUserSid();
@@ -298,8 +298,22 @@ test('C1: secureDataFolder locks a new folder at once, and repairs or refuses an
     assert.ok(b.aclProblems(await b.aclReport(dir), sid).length > 0);
     assert.deepEqual(await b.secureDataFolder(dir), { ok: true, changed: true, wasOpen: true });
     assert.deepEqual(b.aclProblems(await b.aclReport(dir), sid), []);
-    // A folder another account owns is refused (simulated report).
-    await assert.rejects(b.secureDataFolder(dir, { sid, report: async () => ({ owner: 'S-1-5-21-9-9-9-1234', protected: true, aces: [] }) }), /another Windows account/);
+    // A folder another account owns is fine (simulated report).
+    const other = await b.secureDataFolder(dir, { sid, report: async () => ({ owner: 'S-1-5-21-9-9-9-1234', protected: true, aces: [] }) });
+    assert.equal(other.ok, true);
+    assert.equal(other.unlocked, undefined);
+    // A drive with no permissions (exFAT, FAT, reported as owned by and open to Everyone) is used, with a warning, and
+    // the keys aren't replaced at every start.
+    const fat = { owner: 'S-1-1-0', protected: false, aces: [{ sid: 'S-1-1-0', rights: 2032127, type: 'Allow' }] };
+    let rotated = 0;
+    for (const apply of [async () => ({ code: 1, err: 'not supported' }), async () => ({ code: 0 })]) {
+      const r = await b.secureDataFolder(dir, { sid, report: async () => fat, apply, removeGrant: async () => ({ code: 0 }), onWasOpen: () => { rotated++; } });
+      assert.equal(r.ok, true);
+      assert.ok(r.unlocked);
+      assert.equal(r.wasOpen, false);
+    }
+    assert.equal(rotated, 0);
+    assert.ok(!existsSync(join(dir, b.PENDING_FILE)), 'no note that would stop the Hub starting by itself');
     await assert.rejects(b.secureDataFolder('D:\\'), /whole drive/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -308,7 +322,8 @@ test('aclProblems: only SYSTEM, Administrators and the owner', () => {
   const good = { owner: OWNER, protected: true, aces: [{ sid: b.SID.SYSTEM, rights: 2032127, type: 'Allow' }, { sid: b.SID.ADMINS, rights: 2032127, type: 'Allow' }, { sid: OWNER, rights: 2032127, type: 'Allow' }] };
   assert.deepEqual(b.aclProblems(good, OWNER), []);
   assert.equal(b.aclProblems({ ...good, protected: false }, OWNER).length, 1);
-  assert.equal(b.aclProblems({ ...good, owner: 'S-1-5-21-1-2-3-4' }, OWNER).length, 1);
+  assert.deepEqual(b.aclProblems({ ...good, owner: 'S-1-5-21-1-2-3-4' }, OWNER), [], 'a data folder may have any owner');
+  assert.equal(b.aclProblems({ ...good, owner: 'S-1-5-21-1-2-3-4' }, OWNER, { owners: [b.SID.ADMINS, b.SID.SYSTEM] }).length, 1, 'the service folder may not');
   const users = { ...good, aces: [...good.aces, { sid: 'S-1-5-32-545', rights: 1179817, type: 'Allow' }] };
   assert.equal(b.aclProblems(users, OWNER).length, 1, 'no read access for Users on the data folder');
   assert.deepEqual(b.aclProblems(users, OWNER, { writeOnly: true }), [], 'read-only is fine for the service code');

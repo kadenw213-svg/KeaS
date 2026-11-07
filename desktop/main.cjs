@@ -39,10 +39,14 @@ app.on('second-instance', () => showWindow());
 
 // ---------- the servers, run inside this app (Electron includes Node 24: SQLite and Argon2 built in) ----------
 // The data folder is locked down (only this Windows account, SYSTEM and Administrators can open it) before anything
-// is written there; an older setup's folder is fixed the next time KeaS starts. A problem is logged and shown.
+// is written there; an older setup's folder is fixed the next time KeaS starts. A problem is logged and shown. A drive
+// that can't hold permissions is still used, with a warning.
 let folderProblem = null;
+let folderWarning = null;
+const FOLDER_WARNING = 'KeaS can’t limit who opens this folder, because of how the drive is formatted or who owns the folder. Anyone with another Windows account on this PC, or a program running under one, may be able to read or change the Hub’s keys and everyone’s files.';
 async function secureFolders() {
   folderProblem = null;
+  folderWarning = null;
   for (const [dir, label] of [[config.dataDir, 'The data folder'], [config.storageDir, 'The storage folder']]) {
     // (A storage folder inside the data folder already inherits its permissions.)
     if (!dir || (dir !== config.dataDir && dir.toLowerCase().startsWith(`${String(config.dataDir).toLowerCase()}\\`))) continue;
@@ -52,6 +56,7 @@ async function secureFolders() {
       // folder had to be refused at first and only comes clean at a later start.
       const r = await bootstart.secureDataFolder(dir, { onWasOpen: () => { if (dir === config.dataDir && config.role === 'hub') log('replaced the Hub keys after locking down its folder:', bootstart.rotateHubSecrets(dir).join(', ') || 'none there'); } });
       if (r.changed) log('locked down', dir);
+      if (r.unlocked) { folderWarning = FOLDER_WARNING; log('not locked down', dir, r.unlocked); }
     }
     catch (e) { folderProblem = `${label}: ${e.message}`; log('folder permissions', dir, e.message); }
   }
@@ -270,15 +275,16 @@ function drives() {
   }
   return out;
 }
-/** A folder KeaS may keep data in: checked (bootstart.validateDataDir), made if needed, and locked down to this account. */
+/** A folder KeaS may keep data in: checked (bootstart.validateDataDir), made if needed, locked down to this account if the drive allows it, and written to. */
 async function checkFolder(dir, label) {
   dir = bootstart.validateDataDir(dir, label);
-  await bootstart.secureDataFolder(dir);
+  const secured = await bootstart.secureDataFolder(dir);
+  if (secured.unlocked) log('not locked down', dir, secured.unlocked);
   const probe = path.join(dir, `.keas-write-test-${process.pid}`);
   fs.writeFileSync(probe, 'ok');
   fs.rmSync(probe, { force: true });
   const s = fs.statfsSync(dir);
-  return { ok: true, free: s.bavail * s.bsize, dir };
+  return { ok: true, free: s.bavail * s.bsize, dir, warning: secured.unlocked ? FOLDER_WARNING : null };
 }
 
 // ---------- IPC for the setup screens ----------
@@ -289,7 +295,7 @@ const handle = (name, fn) => ipcMain.handle(name, async (_e, arg) => {
 
 let ownerToken = null;
 function registerIpc() {
-  handle('state', async () => ({ config: publicConfig(), folderProblem, running: { hub: hubRunning(), org: !!org, hubExternal }, port: servicePort(), defaults: { hubData: defaultFolder('Kea Hub'), orgData: defaultFolder('KeaS Server') }, version: app.getVersion() }));
+  handle('state', async () => ({ config: publicConfig(), folderProblem, folderWarning, running: { hub: hubRunning(), org: !!org, hubExternal }, port: servicePort(), defaults: { hubData: defaultFolder('Kea Hub'), orgData: defaultFolder('KeaS Server') }, version: app.getVersion() }));
   handle('drives', () => drives());
   handle('pickFolder', async ({ start }) => {
     const r = await dialog.showOpenDialog(win, { title: 'Where should KeaS keep its data?', defaultPath: start, properties: ['openDirectory', 'createDirectory'] });

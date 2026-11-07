@@ -323,6 +323,8 @@ function ServiceDir {
 }
 function Sha256Hex([byte[]]$b) { return -join ([Security.Cryptography.SHA256]::Create().ComputeHash($b) | ForEach-Object { $_.ToString('x2') }) }
 function IsLink($i) { return [bool]($i.Attributes -band [IO.FileAttributes]::ReparsePoint) }
+# A drive with no permissions to set (exFAT, FAT): the data folder is used as it is.
+function NoAcl([string]$p) { return (New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($p))).DriveFormat -notin @('NTFS', 'ReFS') }
 $keaLinksSource = @'
 using System; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;
 public static class KeaLinks {
@@ -391,7 +393,7 @@ const serviceOwnerLines = () => [
  * icacls would follow them out of the folder.
  */
 const dataAclLines = () => [
-  `Step 'data:acl' { $owner = '*' + (OwnerSid); $keep = @('${SID.SYSTEM}', '${SID.ADMINS}', (OwnerSid)); foreach ($d in @($cfg.dataDirs)) { if ($d -and (Test-Path -LiteralPath $d)) { if (IsLink (Get-Item -LiteralPath $d -Force)) { throw ('The data folder is a link to somewhere else: ' + $d) }; icacls $d /setowner $owner /C /Q; icacls $d /inheritance:r /grant:r $grantSystem $grantAdmins ($owner + ':(OI)(CI)F') /C /Q; foreach ($r in @((Get-Acl -LiteralPath $d).GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) { $s = $r.IdentityReference.Value; if ([string]$r.AccessControlType -eq 'Allow' -and $keep -notcontains $s) { icacls $d /remove:g ('*' + $s) /C /Q } }; $bad = DataProblems $d; if ($bad.Count -gt 0) { throw ('These must not stay in the data folder (another account may have put them there). Remove them, then run this again: ' + (($bad | Select-Object -First 10) -join '; ')) }; Get-ChildItem -LiteralPath $d -Force | ForEach-Object { icacls $_.FullName /setowner $owner /T /C /Q; icacls $_.FullName /reset /T /C /Q } } }; foreach ($f in @($cfg.secretFiles)) { if ($f -and (Test-Path -LiteralPath $f)) { icacls $f /setowner $owner /C /Q; icacls $f /reset /C /Q } } }`,
+  `Step 'data:acl' { $owner = '*' + (OwnerSid); $keep = @('${SID.SYSTEM}', '${SID.ADMINS}', (OwnerSid)); foreach ($d in @($cfg.dataDirs)) { if ($d -and (Test-Path -LiteralPath $d)) { if (IsLink (Get-Item -LiteralPath $d -Force)) { throw ('The data folder is a link to somewhere else: ' + $d) }; if (NoAcl $d) { continue }; icacls $d /setowner $owner /C /Q; icacls $d /inheritance:r /grant:r $grantSystem $grantAdmins ($owner + ':(OI)(CI)F') /C /Q; foreach ($r in @((Get-Acl -LiteralPath $d).GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) { $s = $r.IdentityReference.Value; if ([string]$r.AccessControlType -eq 'Allow' -and $keep -notcontains $s) { icacls $d /remove:g ('*' + $s) /C /Q } }; $bad = DataProblems $d; if ($bad.Count -gt 0) { throw ('These must not stay in the data folder (another account may have put them there). Remove them, then run this again: ' + (($bad | Select-Object -First 10) -join '; ')) }; Get-ChildItem -LiteralPath $d -Force | ForEach-Object { icacls $_.FullName /setowner $owner /T /C /Q; icacls $_.FullName /reset /T /C /Q } } }; foreach ($f in @($cfg.secretFiles)) { if ($f -and (Test-Path -LiteralPath $f) -and -not (NoAcl $f)) { icacls $f /setowner $owner /C /Q; icacls $f /reset /C /Q } } }`,
 ];
 /** Removes the launcher and Hub copy older KeaS versions kept in "<data folder>\service" (only if it is one). */
 const legacyLines = () => [
@@ -537,13 +539,14 @@ const WRITE_RIGHTS = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x800
 /**
  * What's wrong with a folder's permissions (an empty list when nothing is): report is { owner, protected, aces:
  * [{ sid, rights, type }] } from aclReport(). writeOnly: other accounts may read (the service folder's code), but not
- * change; otherwise they may have no access at all (the data folder).
+ * change; otherwise they may have no access at all (the data folder). owners: who may own it, when that matters (the
+ * service folder, whose code runs before sign-in). A data folder may have any owner.
  */
 function aclProblems(report, ownerSid, { writeOnly = false, owners = null } = {}) {
   if (!report) return ['the permissions couldn’t be read'];
   const ok = new Set([SID.SYSTEM, SID.ADMINS, ownerSid]);
   const out = [];
-  if (!(owners || [...ok]).includes(report.owner)) out.push(`owned by another account (${report.owner})`);
+  if (owners && !owners.includes(report.owner)) out.push(`owned by another account (${report.owner})`);
   if (!report.protected) out.push('inherits permissions from the folder above it');
   for (const a of report.aces || []) {
     if (a.type !== 'Allow' || ok.has(a.sid)) continue;
@@ -653,8 +656,8 @@ function readChecked(dir) {
 }
 const short = (list, root) => list.slice(0, 5).map((p) => path.relative(root, p) || p).join(', ') + (list.length > 5 ? ` and ${list.length - 5} more` : '');
 /**
- * Refuses a folder that holds what another account could have slipped in while it was open: links, hard-linked files,
- * or anything owned by another account (not this one, SYSTEM or Administrators). Returns what it saw: `open` lists
+ * Refuses a folder that holds what another account could have slipped in while it was open: links and hard-linked
+ * files. Who owns an entry doesn't matter. Returns what it saw: `open` lists
  * entries that let in anyone else, `stamps` what checked clean. `known`: entries already checked clean and unchanged,
  * which aren't asked about again (links and hard links always are).
  */
@@ -664,25 +667,25 @@ async function checkContents(dir, sid, owners, known = new Set()) {
   const info = await owners(ask);
   const allowed = [sid, SID.SYSTEM, SID.ADMINS];
   const parts = ask.map((_, i) => String(info[i] ?? '').split(' ').filter(Boolean));
-  // (With a Hub running, a temporary file can be gone by the time it's asked about: that's no finding.)
-  const foreign = ask.filter((p, i) => !allowed.includes(parts[i][0]) && (parts[i].length || fs.existsSync(p)));
   const open = ask.filter((_, i) => parts[i].slice(1).some((s) => !allowed.includes(s)));
   const found = [];
   if (links.length) found.push(`links to other places (${short(links, dir)})`);
   if (hardLinks.length) found.push(`files that also have another name somewhere else (hard links: ${short(hardLinks, dir)})`);
-  if (foreign.length) found.push(`files or folders that belong to another Windows account (${short(foreign, dir)})`);
   if (found.length) throw new Error(`KeaS can’t lock this folder down: it has ${found.join('; ')}. Another account on this PC could have put them there while the folder was open to everyone. Remove them (or move your data to a new folder), then start KeaS again.`);
   return { open, stamps };
 }
 
 /**
- * Makes a data folder safe to use: a new folder is made and locked down at once (and must still be empty afterwards, so
- * nothing could be slipped in first); an existing one must belong to this account, and is locked down if it isn't
- * already. Only SYSTEM, Administrators and this account can then open anything in it. No elevation needed: the owner of
- * a folder may always set its permissions.
+ * Makes a data folder as safe as its drive allows: a new folder is made and locked down at once (and must still be empty
+ * afterwards, so nothing could be slipped in first); an existing one is locked down if it isn't already. Only SYSTEM,
+ * Administrators and this account can then open anything in it. It may belong to anyone.
  *
- * Locking down an existing folder that was open: its contents are checked first (no links, no hard links, nothing
- * owned by another account; see checkContents), then everything inside is made to inherit the folder's permissions
+ * When the permissions can't be set (exFAT and FAT drives have none; on NTFS, a folder this account doesn't own and has
+ * no right to change), the folder is still used: the answer has `unlocked` with the reason, for the caller to tell the
+ * owner, and the keys aren't replaced, since nothing could close the folder afterwards.
+ *
+ * Locking down an existing folder that was open: its contents are checked first (no links, no hard links; see
+ * checkContents), then everything inside is made to inherit the folder's permissions
  * (icacls /reset /T), then checked again. Returns { ok, changed, wasOpen }: wasOpen means secrets in it may have been
  * read while it was open, so the caller makes new ones (rotateHubSecrets).
  *
@@ -701,20 +704,24 @@ async function secureDataFolder(dir, { sid, onWasOpen = null, report = aclReport
   if (existed && !fs.statSync(dir).isDirectory()) throw new Error('That’s a file, not a folder.');
   if (!existed) fs.mkdirSync(dir, { recursive: true });
   const before = await report(dir);
-  if (existed && before && ![sid, SID.ADMINS, SID.SYSTEM].includes(before.owner)) throw new Error('That folder belongs to another Windows account. Pick a different folder, or make a new one.');
   const pending = path.join(dir, PENDING_FILE);
+  const notLocked = async (why) => {
+    await checkContents(dir, sid, async () => []);
+    fs.rmSync(pending, { force: true });
+    return { ok: true, changed: false, wasOpen: false, unlocked: why };
+  };
   const rootOpen = !existed || aclProblems(before, sid).length > 0;
   let changed = false;
   if (rootOpen) {
     const r = await apply(dir, sid);
-    if (r.code !== 0) throw new Error(`Couldn’t set the folder’s permissions (${(r.err || r.out || `code ${r.code}`).trim().slice(0, 200)}). Use a folder on a drive formatted as NTFS, so other accounts on this PC can’t open the data.`);
+    if (r.code !== 0) return notLocked((r.err || r.out || `code ${r.code}`).trim().slice(0, 200));
     let after = await report(dir);
     // /grant:r replaces only the named accounts' entries: take away any other account's own entry too.
     const extra = [...new Set((after?.aces || []).filter((a) => a.type === 'Allow' && ![SID.SYSTEM, SID.ADMINS, sid].includes(a.sid)).map((a) => a.sid))];
     for (const s of extra) if (/^S-1-[0-9-]+$/.test(s)) await removeGrant(dir, s);
     if (extra.length) after = await report(dir);
     const left = aclProblems(after, sid);
-    if (left.length) throw new Error(`The folder’s permissions are still too open: ${left.join('; ')}.`);
+    if (left.length) return notLocked(left.join('; '));
     if (!existed && fs.readdirSync(dir).length) throw new Error('Something was put in the new folder before KeaS could lock it. Pick a different folder.');
     if (!existed) return { ok: true, changed: true, wasOpen: false };
     changed = true;
@@ -730,10 +737,10 @@ async function secureDataFolder(dir, { sid, onWasOpen = null, report = aclReport
     for (const name of fs.readdirSync(dir)) {
       if (name === PENDING_FILE || name === CHECKED_FILE) continue;
       const rr = await reset(path.join(dir, name));
-      if (rr.code !== 0) throw new Error(`Couldn’t reset the permissions of ${name} (${(rr.err || rr.out || `code ${rr.code}`).trim().slice(0, 200)}).`);
+      if (rr.code !== 0) return notLocked(`${name}: ${(rr.err || rr.out || `code ${rr.code}`).trim().slice(0, 200)}`);
     }
     seen = await checkContents(dir, sid, owners);
-    if (seen.open.length && owners === ownersOf) throw new Error(`KeaS couldn’t close the permissions of ${short(seen.open, dir)}. Fix them or move your data to a new folder, then start KeaS again.`);
+    if (seen.open.length && owners === ownersOf) return notLocked(short(seen.open, dir));
   }
   try { writeOwnFile(path.join(dir, CHECKED_FILE), JSON.stringify(seen.stamps)); } catch {}
   if (wasOpen && onWasOpen) {

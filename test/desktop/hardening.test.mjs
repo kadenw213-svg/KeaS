@@ -116,7 +116,7 @@ test('M: the elevated data folder step refuses links and hard links inside, and 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('M: securing a data folder that was open refuses links, hard links and other accounts’ files, then resets everything inside', { skip: !WIN && 'Windows only' }, async () => {
+test('M: securing a data folder that was open refuses links and hard links, then resets everything inside', { skip: !WIN && 'Windows only' }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'keas-secure-'));
   try {
     const sid = await b.currentUserSid();
@@ -139,9 +139,6 @@ test('M: securing a data folder that was open refuses links, hard links and othe
     mklink('/H', join(dir, 'hub.db'), join(elsewhere, 'x.db'));
     await assert.rejects(b.secureDataFolder(dir), /hard links: hub\.db/);
     rmSync(join(dir, 'hub.db'));
-    // ...or a file that belongs to another account (owners as Windows would report them).
-    open();
-    await assert.rejects(b.secureDataFolder(dir, { owners: async (ps) => ps.map((p) => (p.endsWith('owner.key') ? 'S-1-5-21-9-9-9-1234' : sid)) }), /belong to another Windows account \(owner\.key\)/);
     // Clean: locked down, everything inside reset to inherit, and reported as having been open.
     open();
     assert.ok(await everyoneHas(join(dir, 'storage', 'a.bin')));
