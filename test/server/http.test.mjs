@@ -1,6 +1,6 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../../server/index.mjs';
@@ -23,7 +23,7 @@ const future = (days, h) => new Date(Date.now() + days * 86400000 + h * 3600000)
 
 test('health and demo users are public; everything else needs a token', async () => {
   const h = await call('GET', '/v1/health');
-  assert.deepEqual([h.status, h.body.version, h.body.minClient], [200, '0.4.2', '0.58.0']);
+  assert.deepEqual([h.status, h.body.version, h.body.minClient], [200, JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version, '0.58.0']);
   const u = await call('GET', '/v1/auth/demo-users');
   assert.equal(u.body.length, 12);
   assert.equal((await call('GET', '/v1/me')).status, 401);

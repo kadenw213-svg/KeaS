@@ -15,7 +15,18 @@ import { makeApprovals } from './payroll/approvals.mjs';
 import { registerPayroll } from './payroll/index.mjs';
 import { localDate, zonedToUtc, addDays, dayNum, iso, toMs, ageOn } from './lib/time.mjs';
 
-export const VERSION = '0.4.2';
+// KeaS's own version (package.json, or version.txt beside the before-sign-in copy), so a release can't leave it behind.
+function readVersion() {
+  for (const f of ['../package.json', '../version.txt']) {
+    try {
+      const t = readFileSync(fileURLToPath(new URL(f, import.meta.url)), 'utf8');
+      const v = f.endsWith('.json') ? JSON.parse(t).version : t.trim();
+      if (/^[0-9]+[.][0-9]+[.][0-9]+/.test(String(v))) return String(v);
+    } catch {}
+  }
+  return '0.0.0';
+}
+export const VERSION = readVersion();
 const HOST = '127.0.0.1';
 const MAX_BODY = 1024 * 1024;
 const SESSION_HOURS = 12;
