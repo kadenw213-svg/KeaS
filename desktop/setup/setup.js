@@ -169,6 +169,19 @@ function reach() {
   ];
 }
 
+/**
+ * A QR code of the two-step key (the otpauth:// address the Hub gave), drawn right here: nothing is sent anywhere.
+ * (vendor/qrcode-generator-1.4.4.js, MIT, by Kazuhiko Arase.)
+ */
+function qrImage(uri) {
+  if (!uri || typeof window.qrcode !== 'function') return null;
+  try {
+    const q = window.qrcode(0, 'M');
+    q.addData(uri);
+    q.make();
+    return h('img', { class: 'qr', alt: 'QR code for your authenticator app', src: q.createDataURL(6, 2) });
+  } catch { return null; }
+}
 function sectionBody(body) {
   const out = []; let list = null;
   for (const line of body.split('\n')) {
@@ -198,20 +211,26 @@ function owner() {
   if (S.totp && !S.totpDone)
     return [
       h('h1', null, 'Turn on two-step sign-in'),
-      h('p', { class: 'muted' }, 'The owner account controls the whole Hub, so it always needs a code from an authenticator app (Google Authenticator, Microsoft Authenticator, 1Password…). In the app, add an account by entering this key:'),
-      h('div', { class: 'secret' }, S.totp.secret.replace(/(.{4})/g, '$1 ').trim()),
+      h('p', { class: 'muted' }, 'The owner account controls the whole Hub, so it always needs a code from an authenticator app (Google Authenticator, Microsoft Authenticator, 1Password…). In the app, scan this code, or add an account by entering the key:'),
+      qrImage(S.totp.uri),
+      h('div', { class: 'row' },
+        h('div', { class: 'secret' }, S.totp.secret.replace(/(.{4})/g, '$1 ').trim()),
+        h('button', { class: 'btn', type: 'button', onclick: async (e) => {
+          try { await navigator.clipboard.writeText(S.totp.secret); e.target.textContent = 'Copied'; } catch { e.target.textContent = 'Select the key to copy it'; }
+        } }, 'Copy key')),
       h('p', { class: 'muted small', style: 'margin-top:8px' }, `Account: ${S.owner.email} · Issuer: Kea · Time-based`),
-      h('label', { class: 'field' }, 'The 6-digit code it shows', h('input', { type: 'text', id: 'code', inputmode: 'numeric', maxlength: '6', value: S.code || '', oninput: (e) => (S.code = e.target.value) })),
+      form(async () => {
+        // (Read before re-rendering: render() rebuilds the inputs.)
+        const code = S.code || '';
+        S.busy = true; render();
+        try { await call(k.ownerTotp, { code }); S.totpDone = true; S.busy = false; S.ownerState = undefined; next(); } catch (e) { fail(e); }
+      },
+      h('label', { class: 'field' }, 'The 6-digit code it shows', h('input', { type: 'text', id: 'code', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: '6', value: S.code || '', oninput: (e) => (S.code = e.target.value) })),
       S.error && h('div', { class: 'err' }, S.error),
       h('div', { class: 'actions' },
         // (Back to the account form: signing in again there gives a new key, so nothing is ever stuck.)
-        h('button', { class: 'btn', disabled: S.busy, onclick: () => { S.totp = null; S.code = ''; S.error = ''; render(); } }, 'Back'),
-        h('button', { class: 'btn primary', disabled: S.busy, onclick: async () => {
-          // (Read before re-rendering: render() rebuilds the inputs.)
-          const code = S.code || '';
-          S.busy = true; render();
-          try { await call(k.ownerTotp, { code }); S.totpDone = true; S.busy = false; S.ownerState = undefined; next(); } catch (e) { fail(e); }
-        } }, 'Turn it on')),
+        h('button', { class: 'btn', type: 'button', disabled: S.busy, onclick: () => { S.totp = null; S.code = ''; S.error = ''; render(); } }, 'Back'),
+        h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, 'Turn it on'))),
     ];
   const all = S.terms.sections.every((s) => S.agreed.has(s.id));
   const f = S.form || (S.form = { name: '', email: (o && o.email) || '', password: '', code: '' });
