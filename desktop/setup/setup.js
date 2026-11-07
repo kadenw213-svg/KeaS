@@ -225,13 +225,18 @@ function owner() {
     S.needCode && h('label', { class: 'field' }, 'Two-step code from your authenticator app', h('input', { type: 'text', inputmode: 'numeric', maxlength: '6', value: f.code, oninput: (e) => (f.code = e.target.value) })),
     h('h2', { style: 'margin-top:18px' }, `${S.terms.title} · version ${S.terms.version}`),
     h('p', { class: 'muted small' }, 'Like every Kea account, yours agrees to each section. You can change these terms later; everyone then agrees again, seeing only what changed.'),
-    h('div', { class: 'terms' }, S.terms.sections.map((s) =>
-      h('div', { class: `term ${S.agreed.has(s.id) ? 'agreed' : ''}` }, h('h3', null, s.title), sectionBody(s.body),
-        h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: S.agreed.has(s.id), onchange: (e) => { e.target.checked ? S.agreed.add(s.id) : S.agreed.delete(s.id); render(); } }), 'I agree to this section')))),
+    // (You wrote these terms: one box agrees to all of them. Everyone else ticks each section.)
+    h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: all, onchange: (e) => {
+      for (const s of S.terms.sections) { if (e.target.checked) S.agreed.add(s.id); else S.agreed.delete(s.id); }
+      render();
+    } }), h('b', null, 'I agree to all sections')),
+    termsBox(S.terms.sections, S.agreed, 'agreeCreate'),
     S.error && h('div', { class: 'err' }, S.error),
     h('div', { class: 'actions' },
       h('button', { class: 'btn', disabled: S.busy, onclick: back }, 'Back'),
-      h('button', { class: 'btn primary', disabled: S.busy || !all || !f.name.trim() || !f.email.trim() || f.password.length < 10, onclick: async () => {
+      h('button', { class: 'btn primary', id: 'agreeCreate', disabled: S.busy || !all, onclick: async () => {
+        const why = !f.name.trim() ? 'Enter your name.' : !f.email.trim() ? 'Enter your email.' : f.password.length < 10 ? 'The password needs 10 or more characters.' : '';
+        if (why) { S.error = why; render(); return; }
         S.busy = true; render();
         try {
           const r = await call(k.ownerCreate, { name: f.name, email: f.email, password: f.password, code: S.needCode ? f.code : undefined, termsVersion: S.terms.version, termsSections: S.terms.sections.map((s) => s.id) });
