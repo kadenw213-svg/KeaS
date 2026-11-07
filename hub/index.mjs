@@ -114,6 +114,9 @@ const TIME_MIN = Date.UTC(2000, 0, 1), TIME_MAX = Date.UTC(2100, 0, 1);
 export const isoOrNull = (ms) => { const d = new Date(ms); return Number.isFinite(d.getTime()) ? d.toISOString() : null; };
 const sha = (s) => createHash('sha256').update(s).digest('hex');
 export const OWNER_TOTP_MESSAGE = 'The Kea Hub owner account needs two-step sign-in turned on first. Turn it on under Settings > Security (or in KeaS setup), then try again.';
+// An owner's sign-in made with the password alone (Kea and KeaS sign out on a 401 and sign in again, with the code).
+export const OWNER_MFA_MESSAGE = 'The Kea Hub owner account needs a sign-in that used its two-step code. Sign in again with the code from your authenticator app (or a backup code).';
+export const OWNER_TOTP_RESET_REFUSED = 'Two-step sign-in can’t be reset for the Hub owner’s own account. Without the phone, sign in with one of the owner’s backup codes (shown at setup), then make new ones under Kea account, Sign-in and security. Too many wrong codes paused it? Use POST /owner/accounts/<id>/unlock.';
 const nameHash = (email) => sha(`login:${email}`);
 const sessionCookie = (token, maxAge, secure) => `${COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}${secure ? '; Secure' : ''}`;
 function readCookie(header, name) {
@@ -420,14 +423,45 @@ export function createHub({
   // A code's time step is used once: the step is claimed in one statement, so two sign-ins sent at the same moment with
   // the same code (read before either awaited the password check) can't both get in.
   const claimStep = (id, step) => Number(h.run('UPDATE accounts SET totp_last_step = ? WHERE id = ? AND (totp_last_step IS NULL OR totp_last_step < ?)', step, id, step).changes) === 1;
+  // Wrong two-step codes per account, from any address and any route (backup codes count too): CODE_FAILS of them
+  // within CODE_WINDOW_MS pause code entry for the account for CODE_LOCK_MS, doubled for each pause within a day of the
+  // last one, up to CODE_LOCK_MAX_MS; a day without a pause starts over at CODE_LOCK_MS. A code is only ever looked at
+  // after the right password (or a Google sign-in for the email), so nobody without it can pause someone's codes, and a new password ends a
+  // pause. The owner console lifts one by hand (POST /owner/accounts/:id/unlock), the owner's own included.
+  const CODE_FAILS = 10, CODE_WINDOW_MS = 15 * 60_000, CODE_LOCK_MS = 15 * 60_000, CODE_LOCK_MAX_MS = 4 * 3600_000, CODE_CALM_MS = 24 * 3600_000;
+  const codeLocked = (accountId) => { const r = h.get('SELECT locked_until FROM totp_failures WHERE account_id = ?', accountId); return r && r.locked_until > now() ? r.locked_until - now() : 0; };
+  const codeLockedError = (ms) => new HttpError(429, `Too many wrong two-step codes for this account. Wait ${Math.ceil(ms / 60_000)} minutes, then try again with the newest code.`, { retryAfter: Math.ceil(ms / 1000), codeLocked: true });
+  function codeFail(a, ip) {
+    const t = now();
+    const r = h.get('SELECT * FROM totp_failures WHERE account_id = ?', a.id);
+    const fresh = !r || t - r.window_start > CODE_WINDOW_MS;
+    let count = fresh ? 1 : r.count + 1, start = fresh ? t : r.window_start;
+    let until = r?.locked_until ?? 0, level = r?.level ?? 0, lastLock = r?.last_lock_at ?? 0;
+    if (count >= CODE_FAILS) {
+      level = lastLock && t - lastLock < CODE_CALM_MS ? level + 1 : 1;
+      const ms = Math.min(CODE_LOCK_MAX_MS, CODE_LOCK_MS * 2 ** Math.min(level - 1, 10));
+      until = t + ms; lastLock = t; count = 0; start = t;
+      audit(a.id, 'auth.totp_locked', a.id, { minutes: ms / 60_000, level }, ip);
+      notify(a.id, 'account', 'Two-step codes are paused for your account', `There were ${CODE_FAILS} wrong two-step codes for your account after the right password, so codes aren’t taken for ${Math.round(ms / 60_000)} minutes. If this wasn’t you, someone knows your password: change it (that ends the pause).`, { data: { minutes: ms / 60_000 } });
+    }
+    h.run('INSERT INTO totp_failures (account_id,count,window_start,locked_until,level,last_lock_at) VALUES (?,?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET count = excluded.count, window_start = excluded.window_start, locked_until = excluded.locked_until, level = excluded.level, last_lock_at = excluded.last_lock_at',
+      a.id, count, start, until, level, lastLock);
+  }
+  /** A right code: the count starts over (how long the next pause would be stays, until a calm day). */
+  const codeOk = (accountId) => h.run('UPDATE totp_failures SET count = 0, window_start = ? WHERE account_id = ?', now(), accountId);
+  /** A new password, a reset or the owner: no pause and nothing counted. */
+  const codeForget = (accountId) => h.run('DELETE FROM totp_failures WHERE account_id = ?', accountId);
   // Two-step sign-in. A missing code counts as a failure too: "code needed" only comes after a correct password, so it
   // would otherwise let someone test passwords without ever being throttled. (Kea's normal first try without a code
   // costs one count, which the successful sign-in right after clears.)
   const requireTotp = (a, code, nh, ipKey, ip) => {
     if (!a.totp_enabled) return;
     if (code == null || code === '') { fails.fail(nh, ipKey); throw new HttpError(401, CODE_ASK, { totpRequired: true, backupCodes: true }); }
+    const lockMs = codeLocked(a.id);
+    if (lockMs > 0) { audit(a.id, 'auth.fail_totp', null, { paused: true }, ip); throw codeLockedError(lockMs); }
     const f = secondFactor(a, code, ip);
-    if (f == null) { fails.fail(nh, ipKey); audit(a.id, 'auth.fail_totp', null, null, ip); throw new HttpError(401, 'That code is wrong or already used.', { totpRequired: true, backupCodes: true }); }
+    if (f == null) { fails.fail(nh, ipKey); codeFail(a, ip); audit(a.id, 'auth.fail_totp', null, null, ip); throw new HttpError(401, 'That code is wrong or already used.', { totpRequired: true, backupCodes: true }); }
+    codeOk(a.id);
   };
   const lockedError = (ms, everywhere) => new HttpError(429, everywhere
     ? `Too many wrong tries for this account from many places. Wait ${Math.ceil(ms / 1000)} seconds, or sign in with Google.`
@@ -637,10 +671,11 @@ export function createHub({
     audit(c.account_id, 'consent.approve', c.id, { method, parent: c.parent_email }, ip);
     notify(c.account_id, 'parent_signoff', 'Your parent or guardian signed off', 'Kea’s shared Claude works for you now.', { data: { status: 'approved' } });
   }
-  const newSession = (accountId, client) => {
+  // mfa: this sign-in passed two-step (the app's code or a backup code); the owner's powers need one that did.
+  const newSession = (accountId, client, mfa = false) => {
     const token = randomBytes(32).toString('hex');
     const t = now();
-    h.run('INSERT INTO sessions (token_hash,account_id,created_at,expires_at,last_seen,client) VALUES (?,?,?,?,?,?)', sha(token), accountId, t, t + SESSION_DAYS * 86400_000, t, client ?? null);
+    h.run('INSERT INTO sessions (token_hash,account_id,created_at,expires_at,last_seen,client,mfa) VALUES (?,?,?,?,?,?,?)', sha(token), accountId, t, t + SESSION_DAYS * 86400_000, t, client ?? null, mfa ? 1 : 0);
     return token;
   };
   const progressOf = (accountId, classId = null) => {
@@ -866,14 +901,18 @@ export function createHub({
       const code = body.code;
       const hasCode = code != null && code !== '';
       const pwOk = hasCode && (await verifyPassword(password, a?.pw_hash ?? null));
-      const f = pwOk && a.totp_enabled && a.status === 'active' ? secondFactor(a, code, ip) : null;
+      // (Codes paused for the account: even the right one is a miss here, which looks the same as the lock.)
+      const codeOpen = pwOk && a.totp_enabled && a.status === 'active' && codeLocked(a.id) === 0;
+      const f = codeOpen ? secondFactor(a, code, ip) : null;
       if (f == null) {
         if (hasCode) { fails.fail(nh, ipKey); audit(a?.id ?? null, 'auth.fail', null, { lockedEverywhere: true }, ip); }
+        if (codeOpen) codeFail(a, ip);
         throw lockedError(globalMs, true);
       }
+      codeOk(a.id);
       fails.clear(nh, ipKey);
       audit(a.id, 'auth.login', null, { lockedEverywhere: true }, ip);
-      const token = newSession(a.id, client);
+      const token = newSession(a.id, client, true);
       return { body: { token, account: publicAccount(a), terms: termsStatus(a.id) }, token };
     }
     const ok = await verifyPassword(password, a?.pw_hash ?? null);
@@ -888,7 +927,7 @@ export function createHub({
     fails.clear(nh, ipKey);
     if (needsRehash(a.pw_hash)) h.run('UPDATE accounts SET pw_hash = ?, updated_at = ? WHERE id = ?', await hashPassword(password), now(), a.id);
     audit(a.id, 'auth.login', null, null, ip);
-    const token = newSession(a.id, client);
+    const token = newSession(a.id, client, !!a.totp_enabled);
     return { body: { token, account: publicAccount(a), terms: termsStatus(a.id) }, token };
   }, { auth: false });
 
@@ -907,7 +946,7 @@ export function createHub({
     fails.clear(nh, ipKey);
     markGoogleVerified(a.id, g);
     audit(a.id, 'auth.login_google', null, null, ip);
-    const token = newSession(a.id, client);
+    const token = newSession(a.id, client, !!a.totp_enabled);
     return { body: { token, account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', a.id)), terms: termsStatus(a.id) }, token };
   }, { auth: false });
 
@@ -936,8 +975,9 @@ export function createHub({
     });
     // A new password: earlier guesses at the old one don't matter any more.
     fails.clearAll(nh);
+    codeForget(a.id);
     audit(a.id, 'account.reset_google', a.id, clearTotp ? { totpCleared: true } : null, ip);
-    const token = newSession(a.id, client);
+    const token = newSession(a.id, client, !!a.totp_enabled && !clearTotp);
     return { body: { token, account: publicAccount(h.get('SELECT * FROM accounts WHERE id = ?', a.id)), terms: termsStatus(a.id) }, token };
   }, { auth: false });
 
@@ -1214,12 +1254,16 @@ export function createHub({
     const globalMs = fails.globalLocked(nh);
     if (globalMs > 0) throw lockedError(globalMs, true);
     const pwOk = await verifyPassword(typeof password === 'string' ? password : '', me.pw_hash);
+    const withCode = code !== undefined && pwOk && !!me.totp_enabled;
+    if (withCode) { const ms = codeLocked(me.id); if (ms > 0) throw codeLockedError(ms); }
     const f = code === undefined ? {} : !pwOk ? null : backup ? secondFactor(me, code, ip) : appCode(me, code);
     if (!pwOk || f == null) {
       fails.fail(nh, ipKey);
+      if (withCode) codeFail(me, ip);
       audit(me.id, 'auth.fail_reauth', null, null, ip);
       throw new HttpError(401, message);
     }
+    if (withCode) codeOk(me.id);
     fails.clear(nh, ipKey);
   }
   /** Password, a fresh Google sign-in for my email, or (when `recent`) a proof given in this session in the last minutes. */
@@ -1243,6 +1287,7 @@ export function createHub({
     h.run('UPDATE accounts SET pw_hash = ?, updated_at = ? WHERE id = ?', await hashPassword(body.next), now(), me.id);
     h.run('DELETE FROM sessions WHERE account_id = ? AND token_hash != ?', me.id, sha(token));
     fails.clearAll(nameHash(me.email));
+    codeForget(me.id);
     audit(me.id, 'account.password', me.id, null, ip);
     return { ok: true, otherSessionsSignedOut: true };
   }, { basic: true });
@@ -1276,6 +1321,8 @@ export function createHub({
     // Sign-ins made before two-step was on never passed it: they end (this one stays), so a session someone got with
     // the password alone doesn't keep working, or become an owner's, once the code is required.
     h.run('DELETE FROM sessions WHERE account_id = ? AND token_hash != ?', me.id, sha(ctx.token));
+    // This one just gave a right code: it has passed two-step (an owner's setup goes on with it).
+    h.run('UPDATE sessions SET mfa = 1 WHERE token_hash = ?', sha(ctx.token));
     audit(me.id, 'account.totp_on', me.id, null, ip);
     // Ten one-time backup codes, shown this once (only their hashes are kept). Older apps just ignore them.
     const backupCodes = issueBackupCodes(me.id);
@@ -2347,6 +2394,8 @@ export function createHub({
   // and tells them, so a person who didn't ask for it finds out.
   O('POST', '/owner/accounts/:id/totp-reset', ({ params, body }) => {
     const a = getAccount(params.id);
+    // Not the owner's own: the owner account must keep two-step sign-in (its way back without the phone is a backup code).
+    if (a.role === 'owner') forbidden(OWNER_TOTP_RESET_REFUSED);
     const note = V.str(body.note, 'note', { optional: true, max: 2000 });
     h.tx(() => {
       h.run('UPDATE accounts SET totp_enabled = 0, totp_secret = NULL, totp_last_step = -1, updated_at = ? WHERE id = ?', now(), a.id);
@@ -2407,7 +2456,10 @@ export function createHub({
   O('POST', '/owner/accounts/:id/unlock', ({ params }) => {
     const a = getAccount(params.id);
     fails.clearAll(nameHash(a.email));
-    audit('owner', 'owner.unlock', a.id, null, 'local');
+    // (Paused two-step codes too: this is how the owner gets back in when it's the owner's own account.)
+    const paused = codeLocked(a.id) > 0;
+    codeForget(a.id);
+    audit('owner', 'owner.unlock', a.id, paused ? { codesPaused: true } : null, 'local');
     return { ok: true };
   });
   O('GET', '/owner/hosting', ({ query }) => ({
@@ -2556,6 +2608,10 @@ export function createHub({
         // The Hub owner's account has powers over everyone's: none of them work until its two-step sign-in is on. Only
         // what's needed to turn it on (and to read the account and terms) works before that.
         if (me.role === 'owner' && !me.totp_enabled && !r.basic) throw new HttpError(403, OWNER_TOTP_MESSAGE, { ownerTotpRequired: true });
+        // And they work only in a sign-in that passed two-step: one made with the password alone (before two-step was
+        // on, or before sign-ins recorded it) has to sign in again with the code.
+        if (me.role === 'owner' && me.totp_enabled && !s.mfa && !r.basic) throw new HttpError(401, OWNER_MFA_MESSAGE, { mfaRequired: true });
+        ctx.session = s;
         // Nothing else works until the current terms are agreed to (reading them, exporting data and signing out still do).
         if (r.terms) {
           const ts = termsStatus(me.id);

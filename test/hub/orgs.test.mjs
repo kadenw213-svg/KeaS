@@ -383,19 +383,30 @@ test('scheduling: live rule checks (certs, minors, overlap), manual assign, auto
   ok(await call('POST', `/v1/orgs/${pool.id}/schedules/${sched.id}/clear`, mgr.token, { source: 'autofill' }));
   ok(await call('POST', `/v1/orgs/${pool.id}/schedules/${sched.id}/autofill`, mgr.token, {}));
   assert.equal(key(ok(await call('GET', `/v1/orgs/${pool.id}/schedules/${sched.id}`, mgr.token)).shifts), first);
-  // The budget shows the scheduled cost, and publishing over budget needs a yes.
-  const b = view.budget[0];
+  // The budget shows the scheduled cost to admins, and an admin publishing over budget is asked first.
+  const b = ok(await call('GET', `/v1/orgs/${pool.id}/schedules/${sched.id}`, admin.token)).budget[0];
   assert.ok(b.scheduled > 0 && b.hours > 0);
   assert.ok(Math.abs(b.scheduled - b.hours * 16) < 1, `${b.scheduled} for ${b.hours} h at $16`);
+  // A manager sees no cost figures anywhere (they'd give back people's cost rates): the schedule has no budget rows,
+  // and the budgets page has the budgets and hours only.
+  assert.deepEqual([view.budget.length, view.budgetHidden], [0, true]);
+  const mb = ok(await call('GET', `/v1/orgs/${pool.id}/budgets?from=2026-12-01&to=2026-12-31`, mgr.token));
+  assert.deepEqual([mb.costHidden, mb.budgets.length, mb.unbudgeted.length, mb.plans.length], [true, 0, 0, 1]);
+  assert.deepEqual([mb.plans[0].amount, mb.plans[0].hours], [1000, b.hours]);
+  assert.doesNotMatch(JSON.stringify(mb), /"(scheduled|published|worked|pct|warn|over)"/);
+  const ab = ok(await call('GET', `/v1/orgs/${pool.id}/budgets?from=2026-12-01&to=2026-12-31`, admin.token));
+  assert.equal(ab.budgets[0].scheduled, b.scheduled);
   ok(await call('POST', `/v1/orgs/${pool.id}/budgets`, admin.token, { departmentId: deptTree.guards.id, periodStart: '2026-12-01', periodEnd: '2026-12-31', amount: 100, label: 'Revised' }), 201);
-  const pub = await call('POST', `/v1/orgs/${pool.id}/schedules/${sched.id}/publish`, mgr.token, {});
+  const pub = await call('POST', `/v1/orgs/${pool.id}/schedules/${sched.id}/publish`, admin.token, {});
   assert.equal(pub.status, 409);
   assert.equal(pub.body.budgetWarnings[0].label, 'Revised');
-  // Manager to-do: a budget warning.
-  assert.ok(ok(await call('GET', '/v1/todo', mgr.token)).items.some((t) => t.kind === 'budget'));
+  // To-do: the budget warning is the admin's; the manager's has none.
+  assert.ok(ok(await call('GET', '/v1/todo', admin.token)).items.some((t) => t.kind === 'budget'));
+  assert.ok(!ok(await call('GET', '/v1/todo', mgr.token)).items.some((t) => t.kind === 'budget'));
   // Nothing is published yet: Ana sees no shifts.
   assert.equal(ok(await call('GET', `/v1/orgs/${pool.id}/my-shifts?from=2026-12-01&to=2027-01-01`, ana.token)).shifts.length, 0);
-  const done = ok(await call('POST', `/v1/orgs/${pool.id}/schedules/${sched.id}/publish`, mgr.token, { confirmOverBudget: true }));
+  // The manager isn't asked (the question would be a cost figure too).
+  const done = ok(await call('POST', `/v1/orgs/${pool.id}/schedules/${sched.id}/publish`, mgr.token, {}));
   assert.ok(done.published > 20);
   const anaShifts = ok(await call('GET', `/v1/orgs/${pool.id}/my-shifts?from=2026-12-01&to=2027-01-01`, ana.token)).shifts;
   assert.ok(anaShifts.length > 0 && anaShifts.every((s) => s.accountId === ana.id && s.status === 'published'));

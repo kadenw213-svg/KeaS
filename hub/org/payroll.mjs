@@ -10,13 +10,14 @@
 export const MAX_NODES = 20_000;
 export const PAYROLL_MESSAGE = "Payroll details (SSNs, bank accounts, pay runs) stay in the payroll vault on the payroll admin's PC. They are never stored on the Kea Hub.";
 
-const PAYROLL_WORDS = /\b(ssns?|itin|iban|swift|paychecks?|social security( numbers?)?|tax ids?|routing( numbers?)?|bank (accounts?|details|numbers?|info)|account numbers?|acct (no|num|numbers?)|w ?4s?|direct deposits?|pay runs?|payruns?)\b/;
+const PAYROLL_WORDS = /\b(ssns?|itin|iban|swift|paychecks?|social security( numbers?)?|tax ids?|routing( numbers?)?|bank (accounts?|details|numbers?|info)|account numbers?|acct (no|num|numbers?)|w ?4s?|direct deposits?|pay runs?|payruns?|wages?|salary|salaries|pay ?rates?|hourly (rates?|wages?|pay))\b/;
 // The same, written with no spaces or punctuation at all (the whole key, so "classname" never matches "ssn").
 const SQUASHED = new Set([
   'ssn', 'ssns', 'itin', 'iban', 'swift', 'swiftcode', 'paycheck', 'paychecks', 'socialsecurity', 'socialsecuritynumber', 'socialsecuritynumbers',
   'socialsecurityno', 'taxid', 'taxids', 'routing', 'routingnumber', 'routingnumbers', 'routingno', 'aba', 'abanumber', 'bankaccount', 'bankaccounts',
   'bankaccountnumber', 'bankdetails', 'banknumber', 'bankinfo', 'accountnumber', 'accountnumbers', 'acctno', 'acctnum', 'acctnumber',
   'w4', 'w4s', 'directdeposit', 'directdeposits', 'payrun', 'payruns',
+  'wage', 'wages', 'salary', 'salaries', 'payrate', 'payrates', 'payratecents', 'hourlyrate', 'hourlywage', 'hourlypay',
 ]);
 // Cyrillic and Greek letters that look like Latin ones.
 const LOOKALIKE = {

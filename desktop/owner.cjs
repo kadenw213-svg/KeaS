@@ -4,6 +4,7 @@
 // the only place that can happen. Setup can be closed or restarted at any point, so this also has to work for an
 // owner who already exists: one whose two-step sign-in is already on signs in with a code (or the owner step just
 // says it's done), and one whose two-step setup was cut off simply gets a new key.
+const crypto = require('crypto');
 
 /** A Hub error that keeps what the Hub said (totpRequired, field, ...), so the setup page can show the right step. */
 class HubError extends Error {
@@ -47,8 +48,14 @@ async function createOwner({ db, call, name, email, password, code, termsVersion
   const token = (await call('/v1/auth/login', { method: 'POST', body: JSON.stringify({ email: mail, password, ...(code ? { code: String(code).trim() } : {}) }) })).token;
   if (!token) throw new HubError('The Hub didn’t sign the owner account in. Check the password and try again.', 401);
   const a = db.get('SELECT * FROM accounts WHERE email = ?', mail);
-  db.run("UPDATE accounts SET role = 'owner', can_host = 1, email_verified = 1, verified_by = 'owner', identity_verified = 1, updated_at = ? WHERE id = ?", now(), a.id);
-  db.run('INSERT INTO audit (at,actor,action,target,ip) VALUES (?,?,?,?,?)', now(), 'keas-setup', 'owner.make_owner', a.id, 'local');
+  // Made owner, and every other sign-in of the account ends (one made earlier with only the password mustn't carry
+  // owner powers). The one just made stays: it's KeaS's own, and it passed two-step if two-step is on (if not,
+  // turning two-step on next marks it as passed).
+  db.tx(() => {
+    db.run("UPDATE accounts SET role = 'owner', can_host = 1, email_verified = 1, verified_by = 'owner', identity_verified = 1, updated_at = ? WHERE id = ?", now(), a.id);
+    const ended = Number(db.run('DELETE FROM sessions WHERE account_id = ? AND token_hash != ?', a.id, crypto.createHash('sha256').update(token).digest('hex')).changes);
+    db.run('INSERT INTO audit (at,actor,action,target,detail,ip) VALUES (?,?,?,?,?,?)', now(), 'keas-setup', 'owner.make_owner', a.id, JSON.stringify({ sessionsEnded: ended }), 'local');
+  });
   // The owner must use two-step sign-in. (Already on: nothing to set up.) Setting it up needs the password again: a
   // session alone can't change how an account signs in.
   const totp = a.totp_enabled ? null : await call('/v1/me/totp/setup', { method: 'POST', body: JSON.stringify({ password }) }, token);

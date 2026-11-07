@@ -65,9 +65,14 @@ async function main([cmd, ...args]) {
     if (!a) { console.error(`No account for ${email}. Create it in Kea or KeaS first.`); process.exit(1); }
     // Two-step sign-in first: without it, owner powers stay off (here and in the apps).
     if (!a.totp_enabled && !(await enrollTotp(h, a))) { console.error('Two-step sign-in wasn’t turned on, so the account wasn’t made the owner. Run this again.'); h.close(); process.exit(1); }
-    h.run("UPDATE accounts SET role = 'owner', can_host = 1, email_verified = 1, verified_by = 'owner', identity_verified = 1, updated_at = ? WHERE id = ?", Date.now(), a.id);
-    h.run('INSERT INTO audit (at,actor,action,target,ip) VALUES (?,?,?,?,?)', Date.now(), 'local-cli', 'owner.make_owner', a.id, 'local');
-    console.log(`${email} is now the Hub owner, with two-step sign-in on (it can’t be turned off for the owner).`);
+    // Its sign-ins from before end: one made before this (with only the password, say) mustn't carry owner powers.
+    const ended = h.tx(() => {
+      h.run("UPDATE accounts SET role = 'owner', can_host = 1, email_verified = 1, verified_by = 'owner', identity_verified = 1, updated_at = ? WHERE id = ?", Date.now(), a.id);
+      const n = Number(h.run('DELETE FROM sessions WHERE account_id = ?', a.id).changes);
+      h.run('INSERT INTO audit (at,actor,action,target,detail,ip) VALUES (?,?,?,?,?,?)', Date.now(), 'local-cli', 'owner.make_owner', a.id, JSON.stringify({ sessionsEnded: n }), 'local');
+      return n;
+    });
+    console.log(`${email} is now the Hub owner, with two-step sign-in on (it can’t be turned off for the owner).${ended ? ` Signed out of ${ended} place${ended === 1 ? '' : 's'}: sign in again with your two-step code.` : ''}`);
     h.close();
   } else if (cmd === 'console') {
     const [method, raw, json] = args.length === 1 ? ['GET', args[0]] : args;

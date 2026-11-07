@@ -34,6 +34,14 @@ CREATE INDEX IF NOT EXISTS sessions_account ON sessions(account_id);
 CREATE TABLE IF NOT EXISTS login_failures (
   name_hash TEXT PRIMARY KEY, count INTEGER NOT NULL, last_at INTEGER NOT NULL, locked_until INTEGER NOT NULL
 );
+-- Wrong two-step codes per account, from any address (only counted after the right password, so nobody without it
+-- can run this up). Enough in a short time pauses code entry for the account; each pause soon after the last one is
+-- longer, up to a cap, and a quiet day starts over (level back to 0). hub/index.mjs: codeFail, codeLocked.
+CREATE TABLE IF NOT EXISTS totp_failures (
+  account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+  count INTEGER NOT NULL, window_start INTEGER NOT NULL, locked_until INTEGER NOT NULL DEFAULT 0,
+  level INTEGER NOT NULL DEFAULT 0, last_lock_at INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, actor TEXT, action TEXT NOT NULL, target TEXT, detail TEXT, ip TEXT
 );
@@ -221,6 +229,9 @@ const COLUMNS = [
   // What each account stores (bytes and files), kept up to date by the triggers below.
   ['accounts', 'used_bytes', 'INTEGER NOT NULL DEFAULT 0'],
   ['accounts', 'file_count', 'INTEGER NOT NULL DEFAULT 0'],
+  // 1: this sign-in passed two-step (a code from the authenticator app or a backup code). Sign-ins from before this
+  // column existed never said so: they count as not passed (the owner's account needs a sign-in that did).
+  ['sessions', 'mfa', 'INTEGER NOT NULL DEFAULT 0'],
 ];
 
 // accounts.used_bytes and file_count follow every change to files, in the same transaction, so the storage check is

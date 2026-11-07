@@ -325,6 +325,7 @@ test('phone number: shown only to classmates or coworkers it’s shared with, ne
   const hubOwner = await person('ph-owner@example.com', 'Hub Owner');
   // (The owner account has two-step sign-in on: owner powers wait for it.)
   hub.h.run("UPDATE accounts SET role = 'owner', totp_enabled = 1 WHERE id = ?", hubOwner.id);
+  hub.h.run('UPDATE sessions SET mfa = 1 WHERE account_id = ?', hubOwner.id); // (as if it had signed in with the code)
   ok(await owner('POST', `/owner/accounts/${host.id}`, { canHost: true }));
   const cls = ok(await call('POST', '/v1/classes', host.token, { title: 'Chemistry' }), 201).class;
   const code = ok(await call('POST', `/v1/classes/${cls.id}/invites`, host.token, { role: 'student' }), 201).code;

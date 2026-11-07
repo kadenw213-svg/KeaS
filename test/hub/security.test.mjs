@@ -225,9 +225,10 @@ test('lockout bookkeeping: per address, then everywhere only after many failures
 });
 
 test('payroll guard: disguised keys, SSN- and bank-shaped values, no depth limit, oversize refused', () => {
-  for (const k of ['ssn', 'SSN', 'ѕѕn', 'ｓｓｎ', 's.s.n', 'S_S_N', 'socialSecurityNumber', 'bank_account', 'ΒankΑccount', 'routingNo', 'w4', 'directDeposit', 'payRuns', 'acct_no'])
+  for (const k of ['ssn', 'SSN', 'ѕѕn', 'ｓｓｎ', 's.s.n', 'S_S_N', 'socialSecurityNumber', 'bank_account', 'ΒankΑccount', 'routingNo', 'w4', 'directDeposit', 'payRuns', 'acct_no',
+    'wage', 'hourlyWages', 'salary', 'annual_salary', 'payRate', 'pay_rates', 'PAYRATE', 'payRateCents', 'hourlyRate'])
     assert.equal(payrollKey(k), true, k);
-  for (const k of ['className', 'assigned', 'waiting', 'notes', 'account', 'bank', 'route', 'payRate', 'session'])
+  for (const k of ['className', 'assigned', 'waiting', 'notes', 'account', 'bank', 'route', 'session', 'costRate', 'rate', 'pay', 'payDay', 'hourly'])
     assert.equal(payrollKey(k), false, k);
   for (const v of ['123-45-6789', '123456789', 'SSN: 123-45-6789', '123 45 6789', '１２３-４５-６７８９', 'routing 102000021, account 000123456789'])
     assert.equal(payrollValue(v), true, v);

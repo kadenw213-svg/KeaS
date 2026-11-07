@@ -1106,7 +1106,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   });
   /** The schedule builder's data: slots with need, coverage and who's available, shifts, people's hours, budgets. */
   OR('GET', '/v1/orgs/:id/schedules/:sid', ({ me, params }) => {
-    const { o, s } = asOrg(params.id, me, 'manager');
+    const { o, s, admin } = asOrg(params.id, me, 'manager');
     const sc = schedRow(o.id, params.sid);
     const slots = schedSlots(o, sc);
     const overrides = J(sc.need_overrides, {});
@@ -1135,7 +1135,8 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
         return { ...sl, need, needTotal: needTotal(need), available: avail, ifNeeded: ifn, assigned: assigned.map((x) => x.id),
           dateNotes: [...resp.values()].filter((p) => p.dateNotes[sl.date]).map((p) => ({ id: p.id, name: p.name, note: p.dateNotes[sl.date] })) };
       }),
-      shifts, people, budget: budgetRows(o, s, sc.period_start, sc.period_end),
+      // (Cost figures for admins only: see budgetForManager.)
+      shifts, people, budget: admin ? budgetRows(o, s, sc.period_start, sc.period_end) : [], ...(admin ? {} : { budgetHidden: true }),
       draftsWaiting: h.get("SELECT COUNT(*) AS n FROM org_drafts WHERE schedule_id = ? AND status = 'waiting'", sc.id).n,
       autofillDefaults: s.autofill,
     };
@@ -1264,10 +1265,11 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { removed: Number(r.changes) };
   });
   OR('POST', '/v1/orgs/:id/schedules/:sid/publish', ({ me, params, body, ip }) => {
-    const { o, s } = asOrg(params.id, me, 'manager');
+    const { o, s, admin } = asOrg(params.id, me, 'manager');
     const sc = schedRow(o.id, params.sid);
     const over = budgetRows(o, s, sc.period_start, sc.period_end).filter((b) => b.current && b.scheduled > b.amount);
-    if (over.length && body.confirmOverBudget !== true) throw new HttpError(409, 'This schedule goes over budget. Publish anyway?', { budgetWarnings: over });
+    // Only an admin is asked: the question itself would tell a manager about cost (admins see it under To do).
+    if (admin && over.length && body.confirmOverBudget !== true) throw new HttpError(409, 'This schedule goes over budget. Publish anyway?', { budgetWarnings: over });
     const r = h.run("UPDATE org_shifts SET status = 'published' WHERE schedule_id = ? AND status = 'draft' AND account_id IS NOT NULL", sc.id);
     h.run("UPDATE org_schedules SET status = 'published', published_at = ? WHERE id = ?", now(), sc.id);
     audit(me.id, 'org.schedule_publish', o.id, { schedule: sc.id, shifts: Number(r.changes), overBudget: over.length }, ip);
@@ -1454,6 +1456,13 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     }
     return out;
   }
+  // Labor cost comes from cost rates, which only admins see (a person's own rate, or their position's). Any cost figure
+  // shown to a manager could give one back: a draft shift for one person, or the dates around one shift, and the change
+  // in cost over the hours is that person's rate. So managers get the budgets and hours without any cost figures (no
+  // amounts scheduled, percentages or over-budget warnings), and admins get everything.
+  /** A budget row as a manager sees it: the budget, its dates and the hours, no cost. */
+  const budgetForManager = (b) => ({ id: b.id, departmentId: b.departmentId, departmentName: b.departmentName, periodStart: b.periodStart, periodEnd: b.periodEnd, label: b.label, note: b.note,
+    current: b.current, amount: b.amount, hours: b.hours, costHidden: true });
   function budgetRows(o, s, from, to) {
     const rows = h.all('SELECT b.*, d.name AS dept_name FROM org_budgets b JOIN org_departments d ON d.id = b.department_id WHERE b.org_id = ? AND b.period_end >= ? AND b.period_start <= ? ORDER BY d.name, b.period_start, b.created_at', o.id, from, to);
     const latest = new Map();
@@ -1471,9 +1480,16 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     });
   }
   OR('GET', '/v1/orgs/:id/budgets', ({ me, params, query }) => {
-    const { o, s, tz } = asOrg(params.id, me, 'manager');
+    const { o, s, tz, admin } = asOrg(params.id, me, 'manager');
     const t = today(tz);
     const from = date(query.from ?? addDays(t, -31), 'From'), to = date(query.to ?? addDays(t, 93), 'To');
+    // Managers: the budgets and hours only, under `plans` (budgets and unbudgeted stay empty, so an older Kea shows
+    // no cost figures rather than breaking on missing ones).
+    if (!admin) {
+      const cost = laborCost(o, zonedToUtc(from, '00:00', o.tz), zonedToUtc(addDays(to, 1), '00:00', o.tz));
+      return { budgets: [], unbudgeted: [], warnPct: s.budgetWarnPct, costHidden: true, plans: budgetRows(o, s, from, to).map(budgetForManager),
+        hoursByDepartment: [...cost.entries()].map(([d, c]) => ({ departmentId: d, hours: Math.round(c.hours * 10) / 10 })) };
+    }
     // Departments without a budget still show what they're scheduled to cost.
     const cost = laborCost(o, zonedToUtc(from, '00:00', o.tz), zonedToUtc(addDays(to, 1), '00:00', o.tz));
     return { budgets: budgetRows(o, s, from, to), unbudgeted: [...cost.entries()].map(([d, c]) => ({ departmentId: d, scheduled: c.scheduled / 100, published: c.published / 100, hours: Math.round(c.hours * 10) / 10 })), warnPct: s.budgetWarnPct };
@@ -1535,7 +1551,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
       const s = orgSettings(o);
       const td = today(o.tz);
       const push = (kind, idPart, x) => { if (s.todoKinds[kind] !== false) items.push({ key: `${o.id}:${kind}:${idPart}`, kind, orgId: o.id, orgName: o.name, ...x }); };
-      const mgr = RANK[m.role] >= RANK.manager;
+      const mgr = RANK[m.role] >= RANK.manager, admin = RANK[m.role] >= RANK.admin;
 
       // Availability forms waiting for me.
       for (const f of h.all("SELECT * FROM org_forms WHERE org_id = ? AND status = 'open' AND period_end >= ?", o.id, td)) {
@@ -1609,7 +1625,8 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
       }
       const drafts = h.all("SELECT d.id, sc.title, sc.id AS sid FROM org_drafts d JOIN org_schedules sc ON sc.id = d.schedule_id WHERE sc.org_id = ? AND d.status = 'waiting'", o.id);
       for (const d of drafts) push('drafts', d.id, { title: 'A schedule draft is waiting for review', detail: d.title, dueAt: null, overdue: false, urgency: 1, action: { type: 'schedule', scheduleId: d.sid } });
-      for (const b of budgetRows(o, s, td, addDays(td, 62)).filter((x) => x.current && x.warn))
+      // (Budget warnings are cost figures: admins only.)
+      if (admin) for (const b of budgetRows(o, s, td, addDays(td, 62)).filter((x) => x.current && x.warn))
         push('budget', b.id, { title: b.over ? `${b.departmentName} is over budget` : `${b.departmentName} is at ${b.pct}% of budget`, detail: `${b.periodStart} to ${b.periodEnd}: $${b.scheduled.toFixed(2)} of $${b.amount.toFixed(2)}`, dueAt: endOfDay(b.periodStart < td ? td : b.periodStart, o.tz), overdue: b.over, urgency: b.over ? 2 : 1, action: { type: 'budgets' } });
       const blocked = new Set();
       const tlist = [...types.values()];

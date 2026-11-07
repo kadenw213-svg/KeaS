@@ -79,3 +79,37 @@ test('the owner step: two-step on, then Back or a restart: the owner is noticed 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('the owner step ends the account’s earlier sign-ins, and KeaS ends up signed in as the owner with two-step passed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'keas-owner-'));
+  let clock = Date.UTC(2026, 10, 7, 15);
+  const hub = createHub({ dataDir: dir, now: () => clock, log: false });
+  try {
+    const { port } = await hub.listen({ port: 0, ownerPort: 0 });
+    const call = owner.localCaller(`http://127.0.0.1:${port}`);
+    const t = (await call('/v1/terms')).terms;
+    const form = { name: 'Sam Owner', email: 'sam@example.org', password: 'correct horse battery staple', termsVersion: t.version, termsSections: t.sections.map((s) => s.id) };
+    // The account already existed, signed in somewhere with the password alone.
+    await call('/v1/auth/register', { method: 'POST', body: JSON.stringify({ email: form.email, password: form.password, displayName: form.name, age13: true, termsVersion: t.version, termsSections: form.termsSections }) });
+    const earlier = (await call('/v1/auth/login', { method: 'POST', body: JSON.stringify({ email: form.email, password: form.password }) })).token;
+    // Setup as packaged KeaS runs it: owner:create, then owner:totp with the new key's code, then finish.
+    const made = await owner.createOwner({ db: hub.h, call, ...form });
+    await assert.rejects(call('/v1/me', {}, earlier), (e) => e.status === 401, 'the earlier sign-in ended');
+    const on = await call('/v1/me/totp/enable', { method: 'POST', body: JSON.stringify({ code: codeAt(made.totp.secret, stepOf(clock)) }) }, made.token);
+    assert.equal(on.ok, true);
+    // KeaS keeps that sign-in (account().adopt): it passed two-step, so owner powers work with it.
+    const me = await call('/v1/me', {}, made.token);
+    assert.equal(me.account.owner, true);
+    const cls = await call('/v1/classes', { method: 'POST', body: JSON.stringify({ title: 'Owner class' }) }, made.token);
+    assert.ok(cls.class || cls.id || cls.code, JSON.stringify(cls));
+    assert.equal(hub.h.get('SELECT COUNT(*) AS n FROM sessions WHERE account_id = ?', hub.h.get('SELECT id FROM accounts WHERE email = ?', form.email).id).n, 1);
+    // An owner who already has two-step on, setting up again with a code: the earlier sign-ins end, the new one passed.
+    clock += 30_000;
+    const again = await owner.createOwner({ db: hub.h, call, ...form, code: codeAt(made.totp.secret, stepOf(clock)) });
+    await assert.rejects(call('/v1/me', {}, made.token), (e) => e.status === 401);
+    await call('/v1/classes', { method: 'POST', body: JSON.stringify({ title: 'Owner class 2' }) }, again.token);
+  } finally {
+    await hub.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

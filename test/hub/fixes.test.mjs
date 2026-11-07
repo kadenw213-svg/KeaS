@@ -333,6 +333,7 @@ test('3 L-f: names are cleaned, and names that pass for Kea or the owner are kep
   for (const n of ['Kea Smith', 'Kea Lani', 'Team Rocket', 'Security Guard', 'Support Group', 'Keanu Reeves', 'Dr. Ana: PhD', 'Aram \u0531\u0580\u0561\u0574', 'Maria Jos\u00e9', '\u674e\u5a1c', 'Book Club: Dune']) assert.ok(!isReservedName(n), n);
   const o = await H.person('lf-owner@example.com', 'Kaden Walsh');
   H.hub.h.run("UPDATE accounts SET role = 'owner', totp_enabled = 1 WHERE id = ?", o.id);
+  H.hub.h.run('UPDATE sessions SET mfa = 1 WHERE account_id = ?', o.id); // (as if it had signed in with the code)
   const a = await H.person('lf-a@example.com', 'Plain Name');
   assert.equal((await H.call('POST', '/v1/me', a.token, { displayName: 'Kea Support' })).status, 400);
   assert.equal((await H.call('POST', '/v1/me', a.token, { displayName: 'KADEN  WALSH' })).status, 400, 'the owner’s own name');
