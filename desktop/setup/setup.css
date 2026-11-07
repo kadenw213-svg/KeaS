@@ -76,3 +76,5 @@ dialog.ask::backdrop { background: rgba(0,0,0,.35); }
 .qr { display: block; width: 200px; height: 200px; background: #fff; padding: 10px; border-radius: 10px; margin: 8px 0; image-rendering: pixelated; }
 .dot.run-static { border-color: var(--accent); }
 main select { background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font: inherit; font-size: 15px; }
+.codes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 24px; margin: 0; padding-left: 28px; user-select: all; }
+.codes code { font: 16px Consolas, monospace; letter-spacing: 1px; }

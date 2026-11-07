@@ -54,7 +54,10 @@ test('the owner step: two-step on, then Back or a restart: the owner is noticed 
     // Cut off before turning it on (Back, or KeaS closed): the same form just gives a new key.
     const again = await owner.createOwner({ db: hub.h, call, ...form });
     assert.ok(again.totp?.secret && again.totp.secret !== first.totp.secret);
-    await call('/v1/me/totp/enable', { method: 'POST', body: JSON.stringify({ code: codeAt(again.totp.secret, stepOf(clock)) }) }, again.token);
+    const on = await call('/v1/me/totp/enable', { method: 'POST', body: JSON.stringify({ code: codeAt(again.totp.secret, stepOf(clock)) }) }, again.token);
+    // (ok stays as it was; the ten backup codes come along for the setup page to show once.)
+    assert.equal(on.ok, true);
+    assert.equal(on.backupCodes.length, 10);
 
     // Now the step is done: a restart or Back shows "done" with Next instead of the form.
     const st = owner.ownerState(hub.h, 'sam@example.org');
@@ -67,6 +70,10 @@ test('the owner step: two-step on, then Back or a restart: the owner is noticed 
     const withCode = await owner.createOwner({ db: hub.h, call, ...form, code: codeAt(again.totp.secret, stepOf(clock)) });
     assert.equal(withCode.totp, null, 'two-step sign-in is already on: nothing more to set up');
     assert.ok(withCode.token);
+    // Without the phone: a backup code instead, once.
+    const withBackup = await owner.createOwner({ db: hub.h, call, ...form, code: on.backupCodes[0] });
+    assert.ok(withBackup.token);
+    await assert.rejects(owner.createOwner({ db: hub.h, call, ...form, code: on.backupCodes[0] }), (e) => e.status === 401 && e.data?.totpRequired === true);
   } finally {
     await hub.close();
     rmSync(dir, { recursive: true, force: true });

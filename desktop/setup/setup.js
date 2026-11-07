@@ -192,7 +192,49 @@ function sectionBody(body) {
   }
   return out;
 }
+/** The two-step code box, with "Use a backup code" for someone without their phone. get/set: the value. */
+function codeInput(get, set, { label = 'Code from your authenticator app', autofocus = false } = {}) {
+  const backup = !!S.useBackup;
+  return [
+    h('label', { class: 'field' }, backup ? 'Backup code' : label,
+      h('input', { type: 'text', inputmode: backup ? 'text' : 'numeric', autocomplete: backup ? 'off' : 'one-time-code', maxlength: backup ? '11' : '6', placeholder: backup ? 'XXXXX-XXXXX' : '', value: get() || '', autofocus, oninput: (e) => set(e.target.value) })),
+    h('p', { class: 'small' }, h('button', { class: 'btn', type: 'button', onclick: () => { S.useBackup = !backup; set(''); render(); } }, backup ? 'Use the code from my app' : 'Use a backup code')),
+  ];
+}
+/** New backup codes, shown once: Copy, Save as text, and "I saved these" before going on. */
+function codesScreen({ title, intro, onDone }) {
+  const codes = S.backupCodes || [];
+  return [
+    h('h1', null, title),
+    h('p', { class: 'muted' }, intro),
+    h('div', { class: 'panel' }, h('ol', { class: 'codes' }, codes.map((c) => h('li', null, h('code', null, c))))),
+    h('div', { class: 'row' },
+      h('button', { class: 'btn', type: 'button', onclick: async (e) => {
+        try { await navigator.clipboard.writeText(codes.join('\n')); e.target.textContent = 'Copied'; } catch { e.target.textContent = 'Select the codes to copy them'; }
+      } }, 'Copy'),
+      h('button', { class: 'btn', type: 'button', onclick: async (e) => {
+        try { if (await call(k.saveCodes)) e.target.textContent = 'Saved'; } catch (err) { fail(err); }
+      } }, 'Save as text…')),
+    h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !!S.codesSaved, onchange: (e) => {
+      S.codesSaved = e.target.checked;
+      const b = document.getElementById('codesNext'); if (b) b.disabled = !S.codesSaved;
+    } }), 'I saved these'),
+    S.error && h('div', { class: 'err' }, S.error),
+    h('div', { class: 'actions' }, h('button', { class: 'btn primary', id: 'codesNext', disabled: !S.codesSaved, onclick: async () => {
+      await call(k.codesDone).catch(() => {});
+      S.backupCodes = null; S.codesSaved = false; S.error = '';
+      onDone();
+    } }, 'Continue')),
+  ];
+}
+const CODES_INTRO = 'If you lose your phone, each of these signs you in once instead of the code from your authenticator app. They’re shown only now. Keep them somewhere safe, away from this PC.';
+/** New backup codes for the signed-in account, from the account panel. */
+function codesView() {
+  if (!S.backupCodes) return [h('p', { class: 'muted' }, 'No new backup codes.'), h('button', { class: 'btn', onclick: () => go(S.hub ? 'status' : 'home') }, 'Back')];
+  return codesScreen({ title: 'Your new backup codes', intro: `${CODES_INTRO} Your old ones don’t work any more.`, onDone: () => { refreshAccount(); go(S.hub ? 'status' : 'home'); } });
+}
 function owner() {
+  if (S.backupCodes) return codesScreen({ title: 'Save your backup codes', intro: CODES_INTRO, onDone: () => { S.ownerState = undefined; next(); } });
   // Where the owner step stands (an owner made before a restart, maybe with two-step sign-in already on).
   if (S.ownerState === undefined) {
     S.ownerState = null;
@@ -225,7 +267,14 @@ function owner() {
         // (Read before re-rendering: render() rebuilds the inputs.)
         const code = S.code || '';
         S.busy = true; render();
-        try { await call(k.ownerTotp, { code }); S.totpDone = true; S.busy = false; S.ownerState = undefined; next(); } catch (e) { fail(e); }
+        try {
+          await call(k.ownerTotp, { code });
+          S.totpDone = true; S.busy = false;
+          // (The Hub made backup codes: shown once before going on. A Hub without them goes straight on.)
+          const codes = await call(k.ownerBackupCodes).catch(() => []);
+          if (codes && codes.length) { S.backupCodes = codes; S.codesSaved = false; render(); }
+          else { S.ownerState = undefined; next(); }
+        } catch (e) { fail(e); }
       },
       h('label', { class: 'field' }, 'The 6-digit code it shows', h('input', { type: 'text', id: 'code', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: '6', value: S.code || '', oninput: (e) => (S.code = e.target.value) })),
       S.error && h('div', { class: 'err' }, S.error),
@@ -243,7 +292,7 @@ function owner() {
     h('label', { class: 'field' }, 'Email', h('input', { type: 'email', value: f.email, oninput: (e) => (f.email = e.target.value) })),
     h('label', { class: 'field' }, 'Password (10+ characters; a few random words works well)', h('input', { type: 'password', value: f.password, oninput: (e) => (f.password = e.target.value) })),
     // This account already has two-step sign-in on (the Hub asked for a code).
-    S.needCode && h('label', { class: 'field' }, 'Two-step code from your authenticator app', h('input', { type: 'text', inputmode: 'numeric', maxlength: '6', value: f.code, oninput: (e) => (f.code = e.target.value) })),
+    S.needCode && h('div', null, codeInput(() => f.code, (v) => (f.code = v), { label: 'Two-step code from your authenticator app' })),
     h('h2', { style: 'margin-top:18px' }, `${S.terms.title} · version ${S.terms.version}`),
     h('p', { class: 'muted small' }, 'Like every Kea account, yours agrees to each section. You can change these terms later; everyone then agrees again, seeing only what changed.'),
     // (You wrote these terms: one box agrees to all of them. Everyone else ticks each section.)
@@ -471,6 +520,8 @@ function status() {
     updatePanel(),
     h('h2', { style: 'margin-top:22px' }, 'Your Kea account'),
     accountPanel(),
+    c.role === 'hub' && ownerVerifyPanel(),
+    peoplePanel(),
     h('h2', { style: 'margin-top:22px' }, 'Payroll'),
     payrollPanel(),
     S.error && h('div', { class: 'err' }, S.error),
@@ -579,8 +630,8 @@ function payrollPanel() {
   } else if (f.need === 'code') {
     body = form(sendUnlock,
       h('h3', null, 'Two-step sign-in'),
-      h('p', { class: 'muted small' }, 'The passphrase is right. Now the 6-digit code from your authenticator app.'),
-      field('Code', 'code', 'text', { inputmode: 'numeric', maxlength: '6', autocomplete: 'one-time-code' }),
+      h('p', { class: 'muted small' }, S.useBackup ? 'The passphrase is right. Now one of your backup codes.' : 'The passphrase is right. Now the 6-digit code from your authenticator app.'),
+      codeInput(() => d.code, (v) => (d.code = v), { label: 'Code' }),
       err,
       h('div', { class: 'actions' }, cancel, h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, S.busy ? 'Opening…' : 'Open Payroll')));
   } else {
@@ -675,7 +726,7 @@ function hubAddress() {
     h('p', { class: 'muted small' }, `Empty: the standard address (${a.defaultUrl || 'http://127.0.0.1:4860'}). It must start with https://, except for a Hub on this computer.`)));
 }
 function signedInNow(st) {
-  S.acctStatus = st; S.acct = st.account; S.busy = false; S.sf = null; S.cf = null; S.signStep = null; S.error = ''; S.signupAgreed = null;
+  S.acctStatus = st; S.acct = st.account; S.busy = false; S.sf = null; S.cf = null; S.signStep = null; S.error = ''; S.signupAgreed = null; S.useBackup = false; S.op = null;
   // (load() picks the screen: home, or the Hub's status on the Hub's PC.)
   load().catch(fail);
 }
@@ -693,9 +744,9 @@ function signin() {
   if (S.signStep === 'code')
     return [
       h('h1', null, 'Two-step sign-in'),
-      h('p', { class: 'muted' }, `Enter the 6-digit code from your authenticator app for ${f.email}.`),
+      h('p', { class: 'muted' }, S.useBackup ? `Enter one of your backup codes for ${f.email}. Each one works once.` : `Enter the 6-digit code from your authenticator app for ${f.email}.`),
       form(send,
-        h('label', { class: 'field' }, 'Code', h('input', { type: 'text', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: '6', value: f.code, autofocus: true, oninput: (e) => (f.code = e.target.value) })),
+        codeInput(() => f.code, (v) => (f.code = v), { label: 'Code', autofocus: true }),
         S.error && h('div', { class: 'err' }, S.error),
         h('div', { class: 'actions' },
           h('button', { class: 'btn', type: 'button', disabled: S.busy, onclick: () => { S.signStep = null; f.code = ''; S.error = ''; render(); } }, 'Back'),
@@ -796,10 +847,86 @@ function accountPanel() {
     h('p', null, h('b', null, a.name || a.email), a.name ? h('span', { class: 'muted' }, `  ${a.email}`) : null),
     h('p', { class: 'muted small' }, `Kea Hub: ${(st && st.url) || a.hub || ''}`, st && st.reachable === false ? ' · can’t be reached right now' : '', a.totpEnabled ? ' · two-step sign-in on' : ''),
     needsTerms && h('p', { class: 'err' }, 'The Kea terms changed. ', h('button', { class: 'btn', onclick: () => { S.acctTerms = null; go('termsAccept'); } }, 'Read and agree')),
+    a.totpEnabled && backupCodesPart(a),
     h('button', { class: 'btn', disabled: S.busy, onclick: async () => {
       if (!(await askInPage('Sign out of your Kea account on this PC?', S.payrollOpen ? 'Payroll locks too.' : ''))) return;
       try { S.acctStatus = await call(k.accountLogout); S.acct = null; go(S.hub ? 'status' : 'signin'); } catch (e) { fail(e); }
     } }, 'Sign out'));
+}
+/** Two-step backup codes: how many are left, and making new ones (the password and a code from the app). */
+function backupCodesPart(a) {
+  const left = a.backupCodesLeft;
+  const f = S.bcForm;
+  if (!f)
+    return h('p', { class: 'muted small' }, left == null ? 'Backup codes: ' : `Backup codes: ${left} left. `,
+      h('button', { class: 'btn', onclick: () => { S.bcForm = { password: '', code: '' }; S.bcError = ''; render(); } }, left === 0 ? 'Make backup codes' : 'New backup codes'));
+  return form(async () => {
+    S.busy = true; S.bcError = ''; render();
+    try {
+      S.backupCodes = await call(k.accountBackupCodes, { password: f.password, code: f.code });
+      S.codesSaved = false; S.bcForm = null; S.busy = false; go('codes');
+    } catch (e) { S.busy = false; f.code = ''; S.bcError = e.message; render(); }
+  },
+  h('p', { class: 'small' }, 'New backup codes. The old ones stop working.'),
+  h('label', { class: 'field' }, 'Kea password', h('input', { type: 'password', autocomplete: 'current-password', value: f.password, oninput: (e) => (f.password = e.target.value) })),
+  h('label', { class: 'field' }, 'Code from your authenticator app', h('input', { type: 'text', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: '6', value: f.code, oninput: (e) => (f.code = e.target.value) })),
+  S.bcError && h('div', { class: 'err' }, S.bcError),
+  h('div', { class: 'actions' },
+    h('button', { class: 'btn', type: 'button', disabled: S.busy, onclick: () => { S.bcForm = null; S.bcError = ''; render(); } }, 'Cancel'),
+    h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, 'Make new codes')));
+}
+// ---------- People asking to join (an unverified email always asks), and verifying emails ----------
+function loadPeople() {
+  if (S.opLoading) return;
+  S.opLoading = true;
+  call(k.orgPeople).then((v) => { S.op = v; S.opLoading = false; if (['home', 'status'].includes(S.step) && !S.busy && !typingNow()) render(); })
+    .catch((e) => { S.opLoading = false; S.op = { error: e.message }; });
+}
+async function personAction(fn, arg, done) {
+  S.busy = true; S.opError = ''; S.opOk = ''; render();
+  try { await call(fn, arg); S.opOk = done; } catch (e) { S.opError = e.message; }
+  S.busy = false; S.op = null; loadPeople(); render();
+}
+function peoplePanel() {
+  const st = S.acctStatus;
+  if (!st || !st.signedIn) return null;
+  if (!S.op) { loadPeople(); return null; }
+  if (S.op.error || !S.op.some((g) => g.pending.length || g.unverified.length)) return S.opOk ? h('p', { class: 'ok small' }, S.opOk) : null;
+  const who = (m) => h('div', { style: 'flex:1' }, h('b', null, m.name), !m.emailVerified && h('span', { class: 'tag' }, 'Email not verified'), h('div', { class: 'muted small' }, m.email || ''));
+  const verifyBtn = (g, m) => !m.emailVerified && h('button', { class: 'btn', disabled: S.busy, onclick: async () => {
+    if (!(await askInPage(`Verify ${m.email || m.name}?`, 'Only if you know this email address really is theirs. It counts everywhere on the Kea Hub, payroll too.', 'Verify'))) return;
+    personAction(k.orgVerifyEmail, { id: g.org.id, accountId: m.id }, `${m.name}’s email is verified.`);
+  } }, 'Verify email');
+  return h('div', null,
+    h('h2', { style: 'margin-top:22px' }, 'People'),
+    S.op.map((g) => (g.pending.length || g.unverified.length) && h('div', { class: 'panel' },
+      h('p', null, h('b', null, g.org.name)),
+      g.pending.length > 0 && h('p', { class: 'small' }, h('b', null, 'Asking to join. '), h('span', { class: 'muted' }, 'Someone whose email isn’t verified can still join once you approve it.')),
+      h('ul', { class: 'steps' }, g.pending.map((m) => h('li', null, who(m),
+        verifyBtn(g, m),
+        h('button', { class: 'btn', disabled: S.busy, onclick: () => personAction(k.orgApprove, { id: g.org.id, accountId: m.id, approve: false }, `Declined ${m.name}.`) }, 'Decline'),
+        h('button', { class: 'btn primary', disabled: S.busy, onclick: () => personAction(k.orgApprove, { id: g.org.id, accountId: m.id, approve: true }, `${m.name} is in.`) }, 'Approve')))),
+      g.unverified.length > 0 && h('p', { class: 'small', style: g.pending.length ? 'margin-top:18px' : '' }, h('b', null, 'Email not verified. '), h('span', { class: 'muted' }, 'Payroll needs a verified email.')),
+      h('ul', { class: 'steps' }, g.unverified.map((m) => h('li', null, who(m), verifyBtn(g, m)))))),
+    S.opOk && h('p', { class: 'ok small' }, S.opOk),
+    S.opError && h('div', { class: 'err' }, S.opError));
+}
+/** The Hub's owner, on the Hub's PC: verify any account's email by hand. */
+function ownerVerifyPanel() {
+  const f = S.vf || (S.vf = { email: '' });
+  return h('div', { class: 'panel' },
+    h('p', null, h('b', null, 'Verify someone’s email')),
+    h('p', { class: 'muted small' }, 'For someone who can’t use Verify with Google (an Outlook or school email). Only when you know the address is theirs.'),
+    form(async () => {
+      S.busy = true; S.vfMsg = ''; S.vfErr = ''; render();
+      try { const r = await call(k.ownerVerifyEmail, { email: f.email }); S.vfMsg = `${r.email} is verified.`; f.email = ''; } catch (e) { S.vfErr = e.message; }
+      S.busy = false; render();
+    },
+    h('div', { class: 'row' },
+      h('input', { type: 'email', placeholder: 'Their email', value: f.email, oninput: (e) => (f.email = e.target.value), style: 'max-width:300px' }),
+      h('button', { class: 'btn', type: 'submit', disabled: S.busy }, 'Verify'))),
+    S.vfMsg && h('p', { class: 'ok small' }, S.vfMsg),
+    S.vfErr && h('div', { class: 'err' }, S.vfErr));
 }
 // ---------- Get set up: every step until this person is good to go (desktop/checklist.cjs decides the steps) ----------
 function loadChecklist() {
@@ -809,7 +936,7 @@ function loadChecklist() {
 }
 const typingNow = () => !!document.activeElement && ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName);
 // (Each step checks itself again when KeaS comes back to the front, and every half minute while the list is open.)
-window.addEventListener('focus', () => { if (['home', 'status'].includes(S.step)) loadChecklist(); });
+window.addEventListener('focus', () => { if (['home', 'status'].includes(S.step)) { loadChecklist(); S.op = null; loadPeople(); } });
 setInterval(() => { if (['home', 'status'].includes(S.step) && !document.hidden && S.cl && !S.cl.allSet) loadChecklist(); }, 30_000);
 const STATES = ['AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'DC', 'FL', 'GA', 'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD', 'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ', 'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC', 'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY'];
 /** Where each step's button takes the person. */
@@ -877,6 +1004,7 @@ function home() {
     h('h1', null, 'KeaS'),
     checklistPanel(),
     accountPanel(),
+    peoplePanel(),
     h('h2', { style: 'margin-top:22px' }, 'Payroll'),
     payrollPanel(),
     h('h2', { style: 'margin-top:22px' }, 'Settings'),
@@ -901,8 +1029,8 @@ function askInPage(title, text, yes = 'OK') {
   });
 }
 
-const VIEWS = { welcome, storage, reach, reachSettings: reach, owner, boot, done, status, settings, signin, signup, termsAccept, home };
-const TITLES = { reachSettings: 'KeaS ? Reachable from anywhere', status: 'KeaS · Kea Hub', settings: 'KeaS · Startup and power', signin: 'KeaS · Sign in', signup: 'KeaS · Create an account', termsAccept: 'KeaS · Kea terms', home: 'KeaS' };
+const VIEWS = { codes: codesView, welcome, storage, reach, reachSettings: reach, owner, boot, done, status, settings, signin, signup, termsAccept, home };
+const TITLES = { reachSettings: 'KeaS ? Reachable from anywhere', status: 'KeaS · Kea Hub', settings: 'KeaS · Startup and power', signin: 'KeaS · Sign in', signup: 'KeaS · Create an account', termsAccept: 'KeaS · Kea terms', home: 'KeaS', codes: 'KeaS · Backup codes' };
 function render() {
   renderProgress();
   document.title = TITLES[S.step] || 'KeaS · Set up the Kea Hub';

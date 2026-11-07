@@ -381,6 +381,18 @@ const hubHandle = (name, fn) => handle(name, (arg) => {
 });
 
 let ownerToken = null;
+// Two-step backup codes just made, until the page has shown them and the person saved them ({ email, codes }).
+let shownCodes = null;
+/** Save the backup codes just shown as a text file wherever the person picks. */
+async function saveCodesFile() {
+  if (!shownCodes?.codes?.length) throw new Error('There are no new backup codes to save.');
+  const r = await dialog.showSaveDialog(win, { title: 'Save your backup codes', defaultPath: 'Kea backup codes.txt', filters: [{ name: 'Text', extensions: ['txt'] }] });
+  if (r.canceled || !r.filePath) return null;
+  const text = [`Kea two-step sign-in backup codes${shownCodes.email ? ` for ${shownCodes.email}` : ''}`, `Made ${new Date().toLocaleString()}`, '',
+    'Each code works once, in place of the code from your authenticator app. Keep them somewhere safe.', '', ...shownCodes.codes, ''].join('\r\n');
+  fs.writeFileSync(r.filePath, text);
+  return r.filePath;
+}
 // ---------- updates (updates.cjs) ----------
 let updates = null;
 function startUpdates() {
@@ -443,6 +455,18 @@ function registerIpc() {
   handle('org:create', (a) => account().createOrg(a));
   handle('org:join', (a) => account().joinOrg(a));
   handle('org:update', (a) => account().updateOrg(a));
+  // Approving people who asked to join (an unverified email always asks), and verifying their email.
+  handle('org:people', () => account().orgPeople());
+  handle('org:approve', (a) => account().orgApprove(a));
+  handle('org:verifyEmail', (a) => account().orgVerifyEmail(a));
+  // Two-step backup codes: new ones for this account (shown once, then forgotten here), and saving them as text.
+  handle('account:backupCodes', async (a) => {
+    const r = await account().backupCodes(a);
+    shownCodes = { email: account().cached()?.email || '', codes: r.backupCodes };
+    return r.backupCodes;
+  });
+  handle('codes:save', () => saveCodesFile());
+  handle('codes:done', () => { shownCodes = null; return true; });
   handle('settings:startWithWindows', ({ on }) => {
     config = writeConfig({ ...config, startWithWindows: !!on });
     if (!DEV) app.setLoginItemSettings({ openAtLogin: !!on, args: ['--hidden'] });
@@ -546,8 +570,24 @@ function registerIpc() {
   });
   hubHandle('owner:totp', async ({ code }) => {
     if (!ownerToken) throw new Error('Go back one step and sign in to the owner account again.');
-    await local('/v1/me/totp/enable', { method: 'POST', body: JSON.stringify({ code }) }, ownerToken);
+    const r = await local('/v1/me/totp/enable', { method: 'POST', body: JSON.stringify({ code }) }, ownerToken);
+    // (Still answers true, as before. The backup codes wait here for the page to show once: owner:backupCodes.)
+    shownCodes = Array.isArray(r.backupCodes) && r.backupCodes.length ? { email: config.ownerEmail || '', codes: r.backupCodes } : null;
     return true;
+  });
+  // The owner's new backup codes, for the setup page to show this once ([] when the Hub made none).
+  hubHandle('owner:backupCodes', () => (shownCodes ? shownCodes.codes : []));
+  // The Hub's owner marks someone's email verified (through the owner console on this PC only; audited there).
+  hubHandle('owner:verifyEmail', async ({ email }) => {
+    const mail = String(email || '').trim().toLowerCase();
+    if (!/^[^\s@/]+@[^\s@/]+\.[^\s@/]+$/.test(mail)) throw new Error('Enter the email address of the account.');
+    if (!hubRunning()) throw new Error('Start the Hub first.');
+    const key = hub ? hub.ownerKey : fs.readFileSync(path.join(config.dataDir, 'owner.key'), 'utf8').trim();
+    const { ownerFetch } = await import(pathToFileURL(path.join(ROOT, 'hub', 'lib', 'ownerauth.mjs')).href);
+    const r = await ownerFetch(`http://127.0.0.1:${HUB_PORT + 1}`, key, 'POST', `/owner/accounts/${encodeURIComponent(mail)}`, { emailVerified: true });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(r.status === 404 ? `There’s no Kea account for ${mail} on this Hub.` : j.error || `The Kea Hub said ${r.status}.`);
+    return { email: j.account?.email || mail, emailVerified: !!j.account?.emailVerified, verifiedBy: j.account?.verifiedBy || null };
   });
   hubHandle('finish', ({ startWithWindows = true, theme }) => {
     config = writeConfig({ ...config, setupDone: true, startWithWindows, theme: theme || config.theme || 'system' });

@@ -68,6 +68,46 @@ export function sealSecret(key, secret, accountId) {
   const ct = Buffer.concat([c.update(String(secret), 'utf8'), c.final()]);
   return SEALED + Buffer.concat([iv, c.getAuthTag(), ct]).toString('base64url');
 }
+// ---------- backup codes ----------
+// Ten one-time codes for when the phone with the authenticator app is gone. Each is 10 characters from an alphabet
+// without look-alikes (about 49 bits), shown once as XXXXX-XXXXX. Only an HMAC-SHA256 of each is stored, keyed with a
+// key derived from the Hub's signing key and bound to the account id, so a copy of hub.db alone can't be used to test
+// guesses offline.
+const BACKUP_ALPHA = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+export const BACKUP_COUNT = 10;
+const BACKUP_LEN = 10;
+export const backupKeyFrom = (privateKey) => Buffer.from(hkdfSync('sha256', privateKey.export({ type: 'pkcs8', format: 'der' }), 'kea-hub', 'totp-backup-codes v1', 32));
+/** n new codes, formatted for people: "ABCDE-FGH23". */
+export function newBackupCodes(n = BACKUP_COUNT) {
+  const out = new Set();
+  while (out.size < n) {
+    // (Rejection sampling: no character is more likely than another.)
+    let s = '';
+    while (s.length < BACKUP_LEN) for (const b of randomBytes(16)) if (b < 248 && s.length < BACKUP_LEN) s += BACKUP_ALPHA[b % BACKUP_ALPHA.length];
+    out.add(`${s.slice(0, 5)}-${s.slice(5)}`);
+  }
+  return [...out];
+}
+/** What someone typed, as stored: upper case, no spaces or dashes; null when it can't be a backup code. */
+export function normBackupCode(code) {
+  const c = String(code ?? '').toUpperCase().replace(/[\s-]+/g, '');
+  if (c.length !== BACKUP_LEN) return null;
+  for (const ch of c) if (!BACKUP_ALPHA.includes(ch)) return null;
+  return c;
+}
+export const hashBackupCode = (key, accountId, normalized) => createHmac('sha256', key).update(`kea-backup:${accountId}:${normalized}`).digest('hex');
+/** Constant-time: the one of `hashes` equal to `hash`, or null. Every one is compared, so the time says nothing. */
+export function backupMatch(hash, hashes) {
+  const want = Buffer.from(hash, 'hex');
+  let found = null;
+  for (const h of hashes) {
+    const b = Buffer.from(h, 'hex');
+    const same = b.length === want.length && timingSafeEqual(b, want);
+    if (same) found = h;
+  }
+  return found;
+}
+
 /** The base32 secret (a plain one from before sealing comes back as is), or null for none. Throws if tampered with. */
 export function openSecret(key, stored, accountId) {
   if (stored == null) return null;
