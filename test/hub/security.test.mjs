@@ -241,3 +241,21 @@ test('payroll guard: disguised keys, SSN- and bank-shaped values, no depth limit
   assert.throws(() => checkNoPayroll({ list: Array.from({ length: MAX_NODES + 1 }, () => 1) }, refuse, tooBig), /too big/);
   checkNoPayroll({ a: [{ b: 'fine' }] }, refuse, tooBig);
 });
+
+// 2026-11-07 review: a two-step code is used once even when two sign-ins race, and turning two-step on ends the
+// account's other sign-ins (one made with the password alone must not keep working, or become an owner's).
+import { codeAt, stepOf } from '../../hub/lib/totp.mjs';
+test('two-step: one code, one sign-in, even sent twice at once; turning it on ends the other sign-ins', async () => {
+  const email = 'race-totp@example.com';
+  const t1 = await person(email);
+  const t2 = (await call('POST', '/v1/auth/login', null, { email, password: 'lantern velvet orbit' }, freshIp())).body.token;
+  const s = await call('POST', '/v1/me/totp/setup', t1, { password: 'lantern velvet orbit' });
+  assert.equal(s.status, 200);
+  assert.equal((await call('POST', '/v1/me/totp/enable', t1, { code: codeAt(s.body.secret, stepOf(clock)), password: 'lantern velvet orbit' })).status, 200);
+  assert.equal((await call('GET', '/v1/me', t1)).status, 200, 'the sign-in that turned it on stays');
+  assert.equal((await call('GET', '/v1/me', t2)).status, 401, 'the other sign-in ended');
+  clock += 60_000;
+  const code = codeAt(s.body.secret, stepOf(clock));
+  const both = await Promise.all([0, 1].map(() => call('POST', '/v1/auth/login', null, { email, password: 'lantern velvet orbit', code }, freshIp())));
+  assert.deepEqual(both.map((r) => r.status).sort(), [200, 401]);
+});
