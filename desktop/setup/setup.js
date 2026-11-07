@@ -105,7 +105,9 @@ function tsDone(id) {
 async function setUpTailscale() {
   S.busy = true; S.error = ''; S.log = []; render();
   try {
-    await call(k.saveSetup, { role: S.role, dataDir: S.dataDir, storageDir: S.storageDir, quotaGb: S.quotaGb, reach: 'tailscale' });
+    // (From the Hub's status page later: only the reachability changes; the Hub restarts to match.)
+    if (S.step === 'reachSettings') await call(k.reachSet, { reach: 'tailscale' });
+    else await call(k.saveSetup, { role: S.role, dataDir: S.dataDir, storageDir: S.storageDir, quotaGb: S.quotaGb, reach: 'tailscale' });
     await call(k.start);
     S.running = 'install'; render();
     if (!(await call(k.tsStatus)).installed) await call(k.tsInstall);
@@ -119,15 +121,35 @@ async function setUpTailscale() {
   } catch (e) { S.running = null; fail(e); }
 }
 function reach() {
+  const later = S.step === 'reachSettings';
+  // What's already done in Tailscale (installed, signed in, Funnel on), so the dots start out right.
+  if (S.reach === 'tailscale' && !S.tsChecked && !S.busy) {
+    S.tsChecked = true;
+    call(k.tsStatus).then((t) => { S.ts = t; if (t.url && t.funnel) S.publicUrl = t.url; render(); }).catch(() => {});
+  }
   const opt = (v, title, text, tag) => h('button', { class: `choice ${S.reach === v ? 'on' : ''}`, disabled: S.busy, onclick: () => { S.reach = v; render(); } }, h('b', null, title, tag && h('span', { class: 'tag' }, tag)), h('span', { class: 'muted' }, text));
   const allDone = S.reach === 'local' || TS_STEPS.every(([id]) => tsDone(id));
+  if (later)
+    return [
+      h('h1', null, 'Make the Hub reachable from anywhere'),
+      h('p', { class: 'muted' }, 'So people can sign in to Kea from their own homes and phones. KeaS installs and sets up Tailscale Funnel: your home address stays hidden and no router settings change. The Hub restarts for a moment.'),
+      h('div', { class: 'panel' },
+        h('ul', { class: 'steps' }, TS_STEPS.map(([id, title, text]) =>
+          h('li', null, h('span', { class: `dot ${tsDone(id) ? 'ok' : S.running === id ? 'run' : ''}` }), h('div', null, h('b', null, title), h('div', { class: 'muted small' }, text))))),
+        S.publicUrl && h('p', { class: 'ok', style: 'margin-top:12px' }, 'Your public address: ', h('span', { class: 'url' }, S.publicUrl)),
+        S.log.length > 0 && h('div', { class: 'log' }, S.log.slice(-40).join('\n'))),
+      S.error && h('div', { class: 'err' }, S.error),
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn', disabled: S.busy, onclick: () => load().catch(fail) }, allDone ? 'Done' : 'Back'),
+        !allDone && h('button', { class: 'btn primary', disabled: S.busy, onclick: setUpTailscale }, S.busy ? 'Setting up…' : 'Set it up')),
+    ];
   return [
     h('h1', null, 'Make it reachable from anywhere'),
     S.folderWarning && h('div', { class: 'err' }, S.folderWarning),
     h('p', { class: 'muted' }, S.role === 'hub' ? 'So people can sign in to Kea from their own homes and phones.' : 'So your staff can clock in and see schedules from their phones.'),
     h('div', { class: 'cards' },
       opt('tailscale', 'Anywhere, free (Tailscale Funnel)', 'KeaS installs and sets it up. Your home address stays hidden and no router settings change.', 'Recommended'),
-      opt('local', 'Only this computer', 'For trying KeaS out. Nobody else can reach it.')),
+      opt('local', 'Only this computer for now', 'Nobody else can reach it. You can make it reachable later from the Hub’s status page.')),
     S.reach === 'tailscale' && h('div', { class: 'panel' },
       h('ul', { class: 'steps' }, TS_STEPS.map(([id, title, text]) =>
         h('li', null, h('span', { class: `dot ${tsDone(id) ? 'ok' : S.running === id ? 'run' : ''}` }), h('div', null, h('b', null, title), h('div', { class: 'muted small' }, text))))),
@@ -385,11 +407,23 @@ function status() {
     h('h1', null, c.role === 'hub' ? 'Kea Hub' : 'KeaS server'),
     h('div', { class: 'panel' },
       h('p', null, h('span', { class: `dot ${S.running ? 'ok' : 'bad'}`, style: 'display:inline-block;vertical-align:-4px;margin-right:8px' }), S.running ? 'Running' : 'Not running'),
+      // Why it didn't start, and what to do about it.
+      !S.running && h('div', null,
+        S.lastStartError ? h('p', { class: 'err' }, `It didn’t start: ${S.lastStartError}`) : h('p', { class: 'muted small' }, 'Start it here. If it doesn’t start, the log says why.'),
+        h('div', { class: 'row' },
+          h('button', { class: 'btn primary', disabled: S.busy, onclick: async () => {
+            S.busy = true; S.error = ''; render();
+            try { await call(k.start); } catch {}
+            S.busy = false; await load().catch(fail);
+          } }, S.busy ? 'Starting…' : S.lastStartError ? 'Try again' : 'Start the Hub'),
+          h('button', { class: 'btn', onclick: () => call(k.openLog).catch(fail) }, 'Open log'))),
       c.publicUrl ? h('p', null, 'Public address: ', h('span', { class: 'url' }, c.publicUrl), ' ',
         h('button', { class: 'btn', disabled: S.busy, onclick: async () => {
-          if (!confirm('Turn off public access? Nobody outside this computer can reach the server until you turn Funnel on again in setup.')) return;
+          if (!(await askInPage('Turn off public access?', 'Nobody outside this computer can reach the Hub until you make it reachable again here.', 'Turn it off'))) return;
           try { S.busy = true; render(); await call(k.tsFunnelOff); await load(); } catch (e) { fail(e); } finally { S.busy = false; render(); }
-        } }, 'Turn off public access')) : h('p', { class: 'muted' }, 'Only reachable on this computer.'),
+        } }, 'Turn off public access'))
+        : h('p', null, h('span', { class: 'muted' }, 'Only reachable on this computer. '),
+          c.role === 'hub' && h('button', { class: 'btn', disabled: S.busy, onclick: () => { S.reach = 'tailscale'; S.tsChecked = false; S.ts = {}; S.log = []; S.publicUrl = null; go('reachSettings'); } }, 'Make it reachable from anywhere…')),
       h('p', null, 'Data: ', h('span', { class: 'url' }, c.dataDir), ' ', h('button', { class: 'btn', onclick: () => k.openFolder({ dir: c.dataDir }) }, 'Open folder')),
       c.role === 'hub' && h('p', { class: 'muted small' }, `Each account gets ${c.quotaGb || 5} GB of Kea storage. Owner: ${c.ownerEmail || 'not set'}.`)),
     c.role === 'hub' && h('div', { class: 'panel' },
@@ -751,8 +785,8 @@ function askInPage(title, text, yes = 'OK') {
   });
 }
 
-const VIEWS = { welcome, storage, reach, owner, boot, done, status, settings, signin, signup, termsAccept, home };
-const TITLES = { status: 'KeaS · Kea Hub', settings: 'KeaS · Startup and power', signin: 'KeaS · Sign in', signup: 'KeaS · Create an account', termsAccept: 'KeaS · Kea terms', home: 'KeaS' };
+const VIEWS = { welcome, storage, reach, reachSettings: reach, owner, boot, done, status, settings, signin, signup, termsAccept, home };
+const TITLES = { reachSettings: 'KeaS ? Reachable from anywhere', status: 'KeaS · Kea Hub', settings: 'KeaS · Startup and power', signin: 'KeaS · Sign in', signup: 'KeaS · Create an account', termsAccept: 'KeaS · Kea terms', home: 'KeaS' };
 function render() {
   renderProgress();
   document.title = TITLES[S.step] || 'KeaS · Set up the Kea Hub';
@@ -763,6 +797,7 @@ async function load() {
   const st = await call(k.state);
   S.config = st.config; S.defaults = st.defaults; S.folderProblem = st.folderProblem || null; S.folderWarning = st.folderWarning || S.folderWarning || null;
   S.running = st.running.hub || st.running.org;
+  S.lastStartError = st.lastStartError || null;
   S.hubExternal = !!st.running.hubExternal;
   S.version = st.version;
   S.update = await call(k.updateState).catch(() => null);
@@ -807,7 +842,7 @@ function applyTheme(t) {
 }
 document.getElementById('theme').addEventListener('change', (e) => { applyTheme(e.target.value); k.setTheme({ theme: e.target.value }); });
 k.onUpdate((u) => { S.update = u; if (S.step === 'status') render(); });
-k.onProgress((line) => { S.log.push(line); if (S.step === 'reach') render(); });
+k.onProgress((line) => { S.log.push(line); if (S.step === 'reach' || S.step === 'reachSettings') render(); });
 // The tray (and Payroll) can send the window to a screen: Startup and power, the Payroll panel, or sign-in.
 k.onNavigate((nav) => {
   const view = typeof nav === 'string' ? nav : nav && nav.view;
@@ -824,3 +859,15 @@ k.onNavigate((nav) => {
   } else if (view === 'signin' && !S.busy) { S.error = ''; go('signin'); }
 });
 load().catch(fail);
+// The Hub's status page stays current by itself (while the window is shown and nothing is being typed or run).
+setInterval(async () => {
+  if (S.step !== 'status' || document.hidden || S.busy) return;
+  try {
+    const st = await call(k.state);
+    const running = st.running.hub || st.running.org;
+    if (running !== S.running || (st.lastStartError || null) !== S.lastStartError || st.config.publicUrl !== S.config.publicUrl) {
+      S.running = running; S.lastStartError = st.lastStartError || null; S.config = st.config; S.hubExternal = !!st.running.hubExternal;
+      if (!document.activeElement || !['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName)) render();
+    }
+  } catch {}
+}, 15_000);

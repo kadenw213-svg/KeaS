@@ -142,7 +142,7 @@ function watchExternalHub() {
     if (!hubExternal || await bootstart.hubAnswering(HUB_PORT, { dataDir: config.dataDir })) return;
     log('the Hub started before sign-in stopped answering; starting it here');
     hubExternal = false;
-    try { await startServices(); } catch (e) { log('start failed', e.message); }
+    try { await startServices(); lastStartError = null; } catch (e) { lastStartError = e.message; log('start failed', e.message); }
     refreshTray();
   }, 60_000);
 }
@@ -390,7 +390,7 @@ function registerIpc() {
     const defaults = { hubData: defaultFolder('Kea Hub'), orgData: defaultFolder('KeaS Server') };
     const hub = hubMode();
     return {
-      config: publicConfig(), folderProblem, folderWarning, running: { hub: hubRunning(), org: !!org, hubExternal }, port: servicePort(),
+      config: publicConfig(), folderProblem, folderWarning, lastStartError, running: { hub: hubRunning(), org: !!org, hubExternal }, port: servicePort(),
       defaults, resume: hub ? flow.resumeChoices(config, defaults) : null, version: app.getVersion(),
       hub, view: flow.firstView({ hub, config, signedIn: account().signedIn() }), account: account().cached(), startWithWindows: flow.startWithWindows(config),
     };
@@ -442,7 +442,29 @@ function registerIpc() {
     if (config.boot?.installed && config.boot.layout === bootstart.LAYOUT && !DEV) await refreshBoot(true);
     return publicConfig();
   });
-  hubHandle('start', async () => { await startServices(); return { hub: hubRunning(), org: !!org, port: servicePort() }; });
+  hubHandle('start', async () => {
+    try { await startServices(); lastStartError = null; } catch (e) { lastStartError = e.message; throw e; }
+    return { hub: hubRunning(), org: !!org, port: servicePort() };
+  });
+  // Reachability changed after setup (Hub settings): the Hub restarts so it reads addresses the right way.
+  hubHandle('reach:set', async ({ reach }) => {
+    const on = reach === 'tailscale';
+    if (!!config.tailscale !== on) {
+      config = writeConfig({ ...config, tailscale: on });
+      if (config.boot?.installed && config.boot.layout === bootstart.LAYOUT && !DEV) await refreshBoot(true);
+      if (hub) { await hub.close().catch(() => {}); hub = null; }
+      try { await startServices(); lastStartError = null; } catch (e) { lastStartError = e.message; throw e; }
+    }
+    return publicConfig();
+  });
+  // The log (keas.log), for when the Hub didn't start.
+  hubHandle('openLog', async () => {
+    const f = path.join(app.getPath('userData'), 'keas.log');
+    if (!fs.existsSync(f)) fs.writeFileSync(f, '');
+    const err = await shell.openPath(f);
+    if (err) throw new Error(err);
+    return true;
+  });
   hubHandle('boot:status', () => bootStatus());
   hubHandle('boot:apply', ({ options, dryRun }) => bootApply(options, !!dryRun));
   hubHandle('boot:remove', ({ dryRun }) => bootRemove(!!dryRun));
