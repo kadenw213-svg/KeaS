@@ -23,14 +23,18 @@ const gb = (b) => `${(b / 1024 ** 3).toFixed(b > 1024 ** 4 ? 0 : 1)} GB`;
 const size = (b) => (b >= 1024 ** 4 ? `${(b / 1024 ** 4).toFixed(1)} TB` : gb(b));
 async function call(fn, arg) {
   const r = await fn(arg);
-  if (!r.ok) throw new Error(r.error);
+  if (!r.ok) { const e = new Error(r.error); e.status = r.status; e.data = r.data || {}; throw e; }
   return r.value;
 }
 function fail(e) { S.error = String(e.message || e); S.busy = false; render(); }
 
 const STEPS = { hub: ['welcome', 'storage', 'reach', 'owner', 'boot', 'done'], org: ['welcome', 'storage', 'reach', 'done'], join: ['welcome'] };
 const LABELS = { welcome: 'Start', storage: 'Where data goes', reach: 'Reachable from anywhere', owner: 'Your owner account', boot: 'Start before sign-in', done: 'Done' };
-function go(step) { S.step = step; S.error = ''; render(); window.scrollTo(0, 0); }
+function go(step) {
+  S.step = step; S.error = ''; render(); window.scrollTo(0, 0);
+  // Setup remembers where it got to, so a restart picks up here.
+  if (!S.config.setupDone && STEPS.hub.includes(step)) k.setupStep({ step }).catch(() => {});
+}
 function next() { const list = STEPS[S.role || 'hub']; go(list[list.indexOf(S.step) + 1]); }
 function back() { const list = STEPS[S.role || 'hub']; go(list[Math.max(0, list.indexOf(S.step) - 1)]); }
 
@@ -152,6 +156,22 @@ function sectionBody(body) {
   return out;
 }
 function owner() {
+  // Where the owner step stands (an owner made before a restart, maybe with two-step sign-in already on).
+  if (S.ownerState === undefined) {
+    S.ownerState = null;
+    call(k.ownerState).then((o) => { S.ownerState = o; render(); }).catch(() => {});
+  }
+  const o = S.ownerState;
+  if (o && o.exists && o.owner && o.totp)
+    return [
+      h('h1', null, 'Your owner account'),
+      h('div', { class: 'panel' },
+        h('p', null, h('span', { class: 'dot ok', style: 'display:inline-block;vertical-align:-4px;margin-right:8px' }), h('b', null, o.email), ' is the owner of this Hub.'),
+        h('p', { class: 'muted small' }, 'Two-step sign-in is on. Nothing more to do here.')),
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn', onclick: back }, 'Back'),
+        h('button', { class: 'btn primary', onclick: next }, 'Next')),
+    ];
   if (!S.terms) { call(k.terms).then((t) => { S.terms = t.terms; render(); }).catch(fail); return [h('p', { class: 'muted' }, 'Getting the terms…')]; }
   if (S.totp && !S.totpDone)
     return [
@@ -161,21 +181,26 @@ function owner() {
       h('p', { class: 'muted small', style: 'margin-top:8px' }, `Account: ${S.owner.email} · Issuer: Kea · Time-based`),
       h('label', { class: 'field' }, 'The 6-digit code it shows', h('input', { type: 'text', id: 'code', inputmode: 'numeric', maxlength: '6', value: S.code || '', oninput: (e) => (S.code = e.target.value) })),
       S.error && h('div', { class: 'err' }, S.error),
-      h('div', { class: 'actions' }, h('button', { class: 'btn primary', disabled: S.busy, onclick: async () => {
-        // (Read before re-rendering: render() rebuilds the inputs.)
-        const code = S.code || '';
-        S.busy = true; render();
-        try { await call(k.ownerTotp, { code }); S.totpDone = true; S.busy = false; next(); } catch (e) { fail(e); }
-      } }, 'Turn it on')),
+      h('div', { class: 'actions' },
+        // (Back to the account form: signing in again there gives a new key, so nothing is ever stuck.)
+        h('button', { class: 'btn', disabled: S.busy, onclick: () => { S.totp = null; S.code = ''; S.error = ''; render(); } }, 'Back'),
+        h('button', { class: 'btn primary', disabled: S.busy, onclick: async () => {
+          // (Read before re-rendering: render() rebuilds the inputs.)
+          const code = S.code || '';
+          S.busy = true; render();
+          try { await call(k.ownerTotp, { code }); S.totpDone = true; S.busy = false; S.ownerState = undefined; next(); } catch (e) { fail(e); }
+        } }, 'Turn it on')),
     ];
   const all = S.terms.sections.every((s) => S.agreed.has(s.id));
-  const f = S.form || (S.form = { name: '', email: '', password: '' });
+  const f = S.form || (S.form = { name: '', email: (o && o.email) || '', password: '', code: '' });
   return [
     h('h1', null, 'Your owner account'),
     h('p', { class: 'muted' }, 'This is your own Kea account, the same one you sign in to Kea with, made the owner of this Hub. If you already have one on this Hub, use the same email and password.'),
     h('label', { class: 'field' }, 'Name', h('input', { type: 'text', value: f.name, oninput: (e) => (f.name = e.target.value) })),
     h('label', { class: 'field' }, 'Email', h('input', { type: 'email', value: f.email, oninput: (e) => (f.email = e.target.value) })),
     h('label', { class: 'field' }, 'Password (10+ characters; a few random words works well)', h('input', { type: 'password', value: f.password, oninput: (e) => (f.password = e.target.value) })),
+    // This account already has two-step sign-in on (the Hub asked for a code).
+    S.needCode && h('label', { class: 'field' }, 'Two-step code from your authenticator app', h('input', { type: 'text', inputmode: 'numeric', maxlength: '6', value: f.code, oninput: (e) => (f.code = e.target.value) })),
     h('h2', { style: 'margin-top:18px' }, `${S.terms.title} · version ${S.terms.version}`),
     h('p', { class: 'muted small' }, 'Like every Kea account, yours agrees to each section. You can change these terms later; everyone then agrees again, seeing only what changed.'),
     h('div', { class: 'terms' }, S.terms.sections.map((s) =>
@@ -187,10 +212,13 @@ function owner() {
       h('button', { class: 'btn primary', disabled: S.busy || !all || !f.name.trim() || !f.email.trim() || f.password.length < 10, onclick: async () => {
         S.busy = true; render();
         try {
-          const r = await call(k.ownerCreate, { name: f.name, email: f.email, password: f.password, termsVersion: S.terms.version, termsSections: S.terms.sections.map((s) => s.id) });
-          S.owner = r; S.totp = r.totp; S.busy = false;
-          if (!r.totp) { S.totpDone = true; next(); } else render();
-        } catch (e) { fail(e); }
+          const r = await call(k.ownerCreate, { name: f.name, email: f.email, password: f.password, code: S.needCode ? f.code : undefined, termsVersion: S.terms.version, termsSections: S.terms.sections.map((s) => s.id) });
+          S.owner = r; S.totp = r.totp; S.busy = false; S.needCode = false; f.code = '';
+          if (!r.totp) { S.totpDone = true; S.ownerState = undefined; next(); } else render();
+        } catch (e) {
+          if (e.data && e.data.totpRequired) { S.needCode = true; f.code = ''; }
+          fail(e);
+        }
       } }, 'Agree and create')),
   ];
 }
@@ -437,6 +465,15 @@ async function load() {
   document.getElementById('theme').value = st.config.theme || 'system';
   applyTheme(st.config.theme || 'system');
   if (st.config.setupDone) { S.role = st.config.role; S.step = 'status'; }
+  else if (!S.resumed && st.resume) {
+    // An unfinished setup: back where it stopped, with what was already chosen.
+    S.resumed = true;
+    const r = st.resume;
+    Object.assign(S, { step: r.step, dataDir: r.dataDir, storageDir: r.storageDir, quotaGb: r.quotaGb, reach: r.reach });
+    if (r.needsHub && !S.running) {
+      try { await call(k.start); S.running = true; } catch (e) { S.step = 'storage'; S.error = `The Hub didn’t start: ${e.message}`; }
+    }
+  }
   S.drives = await call(k.drives).catch(() => []);
   render();
 }

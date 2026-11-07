@@ -21,6 +21,8 @@ contextBridge.exposeInMainWorld('keas', {
   tsFunnelOff: call('ts:funnelOff'),
   terms: call('terms'),
   ownerCreate: call('owner:create'),
+  ownerState: call('owner:state'),
+  setupStep: call('setupStep'),
   ownerTotp: call('owner:totp'),
   finish: call('finish'),
   updateState: call('update:state'),

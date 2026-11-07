@@ -13,6 +13,8 @@ const tailscale = require('./tailscale.cjs');
 const { verifyHubIdentity } = require('./hubid.cjs');
 const bootstart = require('./bootstart.cjs');
 const { createUpdates } = require('./updates.cjs');
+const ownerLib = require('./owner.cjs');
+const flow = require('./flow.cjs');
 
 const ROOT = path.join(__dirname, '..');
 const HUB_PORT = 4860;
@@ -292,7 +294,8 @@ async function checkFolder(dir, label) {
 // ---------- IPC for the setup screens ----------
 const send = (ch, v) => win?.webContents.send(ch, v);
 const handle = (name, fn) => ipcMain.handle(name, async (_e, arg) => {
-  try { return { ok: true, value: await fn(arg || {}) }; } catch (e) { log('error', name, e.message); return { ok: false, error: String(e.message || e) }; }
+  // (What the Hub said besides the message, like totpRequired, goes along so the page can show the right step.)
+  try { return { ok: true, value: await fn(arg || {}) }; } catch (e) { log('error', name, e.message); return { ok: false, error: String(e.message || e), status: e.status ?? null, data: e.data ?? null }; }
 });
 
 let ownerToken = null;
@@ -321,7 +324,10 @@ function registerIpc() {
   handle('update:state', () => updates.state());
   handle('update:check', () => updates.check());
   handle('update:install', () => updates.install());
-  handle('state', async () => ({ config: publicConfig(), folderProblem, folderWarning, running: { hub: hubRunning(), org: !!org, hubExternal }, port: servicePort(), defaults: { hubData: defaultFolder('Kea Hub'), orgData: defaultFolder('KeaS Server') }, version: app.getVersion() }));
+  handle('state', async () => {
+    const defaults = { hubData: defaultFolder('Kea Hub'), orgData: defaultFolder('KeaS Server') };
+    return { config: publicConfig(), folderProblem, folderWarning, running: { hub: hubRunning(), org: !!org, hubExternal }, port: servicePort(), defaults, resume: flow.resumeChoices(config, defaults), version: app.getVersion() };
+  });
   handle('drives', () => drives());
   handle('pickFolder', async ({ start }) => {
     const r = await dialog.showOpenDialog(win, { title: 'Where should KeaS keep its data?', defaultPath: start, properties: ['openDirectory', 'createDirectory'] });
@@ -368,32 +374,31 @@ function registerIpc() {
     return s;
   });
 
-  // The Hub owner: the account is made through the Hub like anyone's (with the terms), then made owner right here,
-  // on this PC, which is the only place that can happen.
-  const local = (p, init = {}, token) => fetch(`http://127.0.0.1:${HUB_PORT}${p}`, { ...init, headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) } }).then(async (r) => { const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || `Hub said ${r.status}`); return j; });
+  // The Hub owner (owner.cjs): the account is made through the Hub like anyone's (with the terms), then made owner
+  // right here, on this PC, which is the only place that can happen.
+  const local = ownerLib.localCaller(`http://127.0.0.1:${HUB_PORT}`);
   handle('terms', () => local('/v1/terms'));
-  handle('owner:create', async ({ name, email, password, termsVersion, termsSections }) => {
+  // Setup remembers where it got to, so closing KeaS (or a crash or restart) never sends it back to the start.
+  handle('setupStep', ({ step }) => {
+    if (config.setupDone || !flow.WIZARD.includes(step)) return false;
+    if (config.setupStep !== step) config = writeConfig({ ...config, setupStep: step });
+    return true;
+  });
+  handle('owner:state', async () => {
+    if (!config.ownerEmail || !hubRunning()) return null;
+    return ownerLib.ownerState(await hubDb(), config.ownerEmail);
+  });
+  handle('owner:create', async ({ name, email, password, code, termsVersion, termsSections }) => {
     const db = await hubDb();
     // The password goes only to OUR Hub: whatever answers on the port must prove it holds this Hub's signing key.
     if (!(await verifyHubIdentity(HUB_PORT, config.dataDir))) throw new Error('The Kea Hub on this PC didn’t prove it’s the one in your data folder, so the password wasn’t sent. Restart KeaS; if this keeps happening, another program may be using port 4860.');
-    let token;
-    const existing = db.get('SELECT id FROM accounts WHERE email = ?', String(email).trim().toLowerCase());
-    // Registering never returns a session (the Hub answers the same for new and existing emails), so a new account
-    // is made first and then signed in like an existing one. A brand-new account has no two-step sign-in yet.
-    if (!existing) await local('/v1/auth/register', { method: 'POST', body: JSON.stringify({ email, password, displayName: name, age13: true, termsVersion, termsSections }) });
-    token = (await local('/v1/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) })).token;
-    if (!token) throw new Error('The Hub didn’t sign the owner account in. Check the password and try again.');
-    const a = db.get('SELECT * FROM accounts WHERE email = ?', String(email).trim().toLowerCase());
-    db.run("UPDATE accounts SET role = 'owner', can_host = 1, email_verified = 1, verified_by = 'owner', identity_verified = 1, updated_at = ? WHERE id = ?", Date.now(), a.id);
-    db.run('INSERT INTO audit (at,actor,action,target,ip) VALUES (?,?,?,?,?)', Date.now(), 'keas-setup', 'owner.make_owner', a.id, 'local');
-    config = writeConfig({ ...config, ownerEmail: a.email });
-    ownerToken = token;
-    // The owner must use two-step sign-in. (Already on: nothing to set up.)
-    // (Setting it up needs the password again: a session alone can't change how an account signs in.)
-    const totp = a.totp_enabled ? null : await local('/v1/me/totp/setup', { method: 'POST', body: JSON.stringify({ password }) }, token);
-    return { email: a.email, totp };
+    const r = await ownerLib.createOwner({ db, call: local, name, email, password, code, termsVersion, termsSections });
+    config = writeConfig({ ...config, ownerEmail: r.email });
+    ownerToken = r.token;
+    return { email: r.email, totp: r.totp };
   });
   handle('owner:totp', async ({ code }) => {
+    if (!ownerToken) throw new Error('Go back one step and sign in to the owner account again.');
     await local('/v1/me/totp/enable', { method: 'POST', body: JSON.stringify({ code }) }, ownerToken);
     return true;
   });
