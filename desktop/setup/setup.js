@@ -321,6 +321,36 @@ function done() {
   ];
 }
 
+/** The Updates panel: the version, what the updater is doing, and the buttons. */
+function updatePanel() {
+  const u = S.update || { status: 'idle' };
+  const busy = u.status === 'checking' || u.status === 'downloading';
+  const line = {
+    idle: '',
+    dev: 'Updates work in the installed KeaS.',
+    checking: 'Checking for updates…',
+    latest: 'KeaS is up to date.',
+    downloading: `Downloading KeaS ${u.version || ''}… ${u.percent || 0}%`,
+    ready: `KeaS ${u.version} is downloaded and ready to install.`,
+    error: u.message || 'The update check didn’t work.',
+  }[u.status] || '';
+  return h('div', { class: 'panel' },
+    h('p', null, h('b', null, 'Updates'), h('span', { class: 'muted small' }, `  KeaS ${S.version || ''}`)),
+    line && h('p', { class: u.status === 'error' ? 'err' : 'muted small' }, line),
+    u.status === 'ready' && h('p', { class: 'muted small' }, S.hubExternal
+      ? 'KeaS restarts to install it. The Hub started before sign-in keeps running and moves to the new version the next time Windows starts.'
+      : 'KeaS restarts to install it, and the Hub is offline for about a minute.'),
+    h('div', { class: 'row' },
+      u.status === 'ready'
+        ? h('button', { class: 'btn primary', onclick: async () => {
+          if (!confirm(`Restart KeaS now to install ${u.version}?`)) return;
+          try { await call(k.installUpdate); } catch (e) { fail(e); }
+        } }, 'Restart and update')
+        : h('button', { class: 'btn', disabled: busy || u.status === 'dev', onclick: async () => {
+          try { S.update = { status: 'checking' }; render(); S.update = await call(k.checkUpdates); render(); } catch (e) { fail(e); }
+        } }, 'Check for updates')));
+}
+
 function status() {
   const c = S.config;
   return [
@@ -343,6 +373,7 @@ function status() {
     c.role === 'hub' && c.boot?.installed && (c.boot.layout !== 2 || c.boot.repair) && h('div', { class: 'err' }, 'Starting the Hub before sign-in needs to be set up again, so what it runs is kept in a protected folder. ', h('button', { class: 'btn', onclick: () => { S.bs = null; S.bo = null; S.bootScript = null; S.bootResult = null; go('settings'); } }, 'Set it up again')),
     S.folderProblem && h('div', { class: 'err' }, S.folderProblem),
     S.folderWarning && h('div', { class: 'err' }, S.folderWarning),
+    updatePanel(),
     h('h2', { style: 'margin-top:22px' }, 'Payroll'),
     h('div', { class: 'panel' },
       h('p', null, 'Pay runs, tax forms and HR records for your organization. Payroll runs only on this computer: SSNs and bank details are encrypted with a passphrase you choose and never go to the Hub.'),
@@ -401,6 +432,8 @@ async function load() {
   S.config = st.config; S.defaults = st.defaults; S.folderProblem = st.folderProblem || null; S.folderWarning = st.folderWarning || S.folderWarning || null;
   S.running = st.running.hub || st.running.org;
   S.hubExternal = !!st.running.hubExternal;
+  S.version = st.version;
+  S.update = await call(k.updateState).catch(() => null);
   document.getElementById('theme').value = st.config.theme || 'system';
   applyTheme(st.config.theme || 'system');
   if (st.config.setupDone) { S.role = st.config.role; S.step = 'status'; }
@@ -412,6 +445,7 @@ function applyTheme(t) {
   else delete document.documentElement.dataset.theme;
 }
 document.getElementById('theme').addEventListener('change', (e) => { applyTheme(e.target.value); k.setTheme({ theme: e.target.value }); });
+k.onUpdate((u) => { S.update = u; if (S.step === 'status') render(); });
 k.onProgress((line) => { S.log.push(line); if (S.step === 'reach') render(); });
 // The tray's "Power settings…" opens the settings page (once setup is done).
 k.onNavigate((view) => {

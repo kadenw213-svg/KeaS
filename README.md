@@ -73,7 +73,7 @@ yet, so Windows may show a warning; choose **More info → Run anyway**.
 
 ## Built with
 
-Electron and Node.js, with SQLite (`node:sqlite`) for the Hub's data and no other runtime dependencies. Accounts use
+Electron and Node.js, with SQLite (`node:sqlite`) for the Hub's data, and electron-updater for KeaS's own updates. Accounts use
 Argon2id or scrypt password hashing, Ed25519-signed tokens and TOTP two-step sign-in, and public access goes through
 Tailscale Funnel. To build KeaS from source, see [docs/DEVELOPING.md](docs/DEVELOPING.md).
 

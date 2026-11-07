@@ -12,6 +12,7 @@ const { pathToFileURL } = require('url');
 const tailscale = require('./tailscale.cjs');
 const { verifyHubIdentity } = require('./hubid.cjs');
 const bootstart = require('./bootstart.cjs');
+const { createUpdates } = require('./updates.cjs');
 
 const ROOT = path.join(__dirname, '..');
 const HUB_PORT = 4860;
@@ -251,6 +252,7 @@ function refreshTray() {
       { label: 'Start the Hub before sign-in', type: 'checkbox', checked: installed, click: toggle },
       { label: 'Power settings…', click: () => { showWindow(); setTimeout(() => send('navigate', 'settings'), win?.webContents.isLoading() ? 800 : 0); } },
     ] : []),
+    ...(updates?.state().status === 'ready' ? [{ type: 'separator' }, { label: `Restart to update KeaS to ${updates.state().version}`, click: () => { try { updates.install(); } catch (e) { log('update', e.message); } } }] : []),
     { type: 'separator' },
     { label: hubExternal ? 'Quit KeaS (the Hub keeps running)' : 'Quit KeaS (stops the server)', click: () => { app.isQuitting = true; app.quit(); } },
   ]));
@@ -294,7 +296,31 @@ const handle = (name, fn) => ipcMain.handle(name, async (_e, arg) => {
 });
 
 let ownerToken = null;
+// ---------- updates (updates.cjs) ----------
+let updates = null;
+function startUpdates() {
+  let told = null;
+  updates = createUpdates({
+    enabled: app.isPackaged,
+    log,
+    send: (s) => {
+      send('update', s);
+      refreshTray();
+      // Once per version: the tray says it's ready.
+      if (s.status === 'ready' && told !== s.version && tray) {
+        told = s.version;
+        try { tray.displayBalloon({ iconType: 'info', title: 'KeaS update ready', content: `KeaS ${s.version} is downloaded. Choose "Restart to update" when it suits you; the Hub is offline for a moment while KeaS restarts.` }); } catch {}
+      }
+    },
+    beforeInstall: () => { app.isQuitting = true; },
+  });
+  updates.start();
+}
+
 function registerIpc() {
+  handle('update:state', () => updates.state());
+  handle('update:check', () => updates.check());
+  handle('update:install', () => updates.install());
   handle('state', async () => ({ config: publicConfig(), folderProblem, folderWarning, running: { hub: hubRunning(), org: !!org, hubExternal }, port: servicePort(), defaults: { hubData: defaultFolder('Kea Hub'), orgData: defaultFolder('KeaS Server') }, version: app.getVersion() }));
   handle('drives', () => drives());
   handle('pickFolder', async ({ start }) => {
@@ -430,6 +456,7 @@ app.whenReady().then(async () => {
   // standard moves to the new one once; any other size chosen at setup stays. The Hub tells each person it changes for.
   if (config.role === 'hub' && config.quotaGb === 25 && !config.quotaStandard5) config = writeConfig({ ...config, quotaGb: 5, quotaStandard5: true });
   nativeTheme.themeSource = config.theme === 'light' || config.theme === 'dark' ? config.theme : 'system';
+  startUpdates();
   registerIpc();
   if (config.setupDone) {
     try { await startServices(); } catch (e) { log('start failed', e.message); }
@@ -440,4 +467,4 @@ app.whenReady().then(async () => {
   if (!process.argv.includes('--hidden') || !config.setupDone) showWindow();
 });
 app.on('window-all-closed', () => { if (!config.setupDone) app.quit(); });
-app.on('before-quit', async () => { app.isQuitting = true; clearInterval(hubWatch); try { await hub?.close(); await org?.close(); extDb?.close(); } catch {} });
+app.on('before-quit', async () => { app.isQuitting = true; clearInterval(hubWatch); updates?.stop(); try { await hub?.close(); await org?.close(); extDb?.close(); } catch {} });

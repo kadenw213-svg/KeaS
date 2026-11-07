@@ -1,6 +1,6 @@
 {
   "name": "keas",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "description": "KeaS: the Kea Hub (accounts, classes, study, storage and sync for Kea) and a free workforce suite for organizations.",
   "type": "module",
@@ -17,7 +17,8 @@
     "test:desktop": "node --test \"test/desktop/*.test.mjs\"",
     "test": "node --test \"test/server/*.test.mjs\" \"test/hub/*.test.mjs\"",
     "desktop": "electron .",
-    "desktop:build": "npm run web:build && electron-builder --win nsis"
+    "desktop:build": "npm run web:build && electron-builder --win nsis",
+    "release": "npm run web:build && electron-builder --win nsis --publish always"
   },
   "engines": {
     "node": ">=22.5"
@@ -62,7 +63,19 @@
       "oneClick": false,
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,
-      "shortcutName": "KeaS"
-    }
+      "shortcutName": "KeaS",
+      "artifactName": "KeaS-Setup-${version}.${ext}"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "kadenw213-svg",
+        "repo": "KeaS",
+        "releaseType": "release"
+      }
+    ]
+  },
+  "dependencies": {
+    "electron-updater": "6.8.11"
   }
 }

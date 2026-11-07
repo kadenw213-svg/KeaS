@@ -23,6 +23,14 @@ contextBridge.exposeInMainWorld('keas', {
   ownerCreate: call('owner:create'),
   ownerTotp: call('owner:totp'),
   finish: call('finish'),
+  updateState: call('update:state'),
+  checkUpdates: call('update:check'),
+  installUpdate: call('update:install'),
+  onUpdate: (cb) => {
+    const fn = (_e, s) => cb(s);
+    ipcRenderer.on('update', fn);
+    return () => ipcRenderer.removeListener('update', fn);
+  },
   setTheme: call('setTheme'),
   openExternal: call('openExternal'),
   openFolder: call('openFolder'),
