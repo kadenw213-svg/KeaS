@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react';
 import { Plus } from 'lucide-react';
-import { useWork, can, money, fmtDay, loadWork } from '../store';
+import { useWork, can, money, fmtDay, loadWork, takeFocus } from '../store';
 import { api } from '../api';
 import { act, useLoad, Loading, Page, Table, Tag, FormDialog, statusTone, human, type Field } from '../kit';
 import { toast } from '../ui';
@@ -8,11 +8,13 @@ import { toast } from '../ui';
 /** Employees: the payroll profile (job, pay rates, raises, tax setup, SSN, address, direct deposit). */
 export function Employees() {
   const { people, positions, me } = useWork();
-  const [sel, setSel] = useState<string | null>(null);
+  // A link from elsewhere (a pay-run warning) opens one person's card ready to fix.
+  const [focus] = useState(takeFocus);
+  const [sel, setSel] = useState<string | null>(focus?.personId || null);
   const [adding, setAdding] = useState(false);
   const [filter, setFilter] = useState('');
   const shown = people.filter((p) => !filter || p.name.toLowerCase().includes(filter.toLowerCase()));
-  if (sel) return <Profile id={sel} back={() => setSel(null)} />;
+  if (sel) return <Profile id={sel} back={() => setSel(null)} initialEdit={sel === focus?.personId ? focus?.edit : undefined} />;
   return (
     <Page
       title="Employees"
@@ -69,13 +71,13 @@ export function Employees() {
   );
 }
 
-function Profile({ id, back }: { id: string; back: () => void }) {
+function Profile({ id, back, initialEdit }: { id: string; back: () => void; initialEdit?: 'tax' | 'deposit' | 'rate' | 'basic' }) {
   const { positions, people, me } = useWork();
   const { data, error, reload } = useLoad<any>(`/v1/people/${id}/profile`);
   const { data: org } = useLoad<any>('/v1/org-structure');
   const { data: grades } = useLoad<any>('/v1/pay-grades');
   const { data: hol } = useLoad<any>('/v1/holidays');
-  const [edit, setEdit] = useState<null | 'basic' | 'job' | 'tax' | 'contact' | 'deposit' | 'rate' | 'raise'>(null);
+  const [edit, setEdit] = useState<null | 'basic' | 'job' | 'tax' | 'contact' | 'deposit' | 'rate' | 'raise'>(initialEdit || null);
   const [ssn, setSsn] = useState<string | null>(null);
   if (!data) return <Page title="Employee"><Loading error={error} /></Page>;
   const p = data.profile;

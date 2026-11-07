@@ -62,6 +62,7 @@ interface WorkState {
   vault: { initialized: boolean; locked: boolean; hubUrl: string | null; org: string | null; localAccounts: boolean; localSignIn?: boolean } | null;
   error: string | null;
   tick: number;
+  focus: Focus | null;
   set(p: Partial<WorkState>): void;
 }
 
@@ -83,6 +84,7 @@ export const useWork = create<WorkState>((set) => ({
   vault: null,
   error: null,
   tick: 0,
+  focus: null,
   set: (p) => set(p)
 }));
 
@@ -92,9 +94,21 @@ onSessionEvents({
 });
 
 /** Switch view and keep the address bar in step, so reload and back work. */
-export function go(view: WorkView) {
+export function go(view: WorkView, focus: Focus | null = null) {
   if (location.pathname !== '/' + view) history.pushState(null, '', '/' + view);
-  useWork.getState().set({ view });
+  useWork.getState().set({ view, focus });
+}
+/** Where a link points inside a screen: a person's profile card, or a pay period. The screen takes it once. */
+export interface Focus {
+  personId?: string;
+  edit?: 'tax' | 'deposit' | 'rate' | 'basic';
+  periodStart?: string;
+  team?: boolean;
+}
+export function takeFocus(): Focus | null {
+  const f = useWork.getState().focus;
+  if (f) useWork.getState().set({ focus: null });
+  return f;
 }
 window.addEventListener('popstate', () => useWork.getState().set({ view: viewFromPath() }));
 

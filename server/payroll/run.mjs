@@ -286,6 +286,8 @@ export function registerRun(c) {
       deposits.set(p.id, depositSplit(line.net, accts));
       if (!accts.length) warnings.push({ code: 'no_deposit', personId: p.id, message: `${p.name}: no direct deposit account (pay by check)` });
       if (!vault.openJson(p.piiRaw)?.ssn) warnings.push({ code: 'no_ssn', personId: p.id, message: `${p.name}: no SSN on file` });
+      // No W-4: federal tax is still withheld, as for Single with no adjustments (what the IRS says to do without one).
+      if (line.gross > 0 && !p.w4?.filing && !p.w4?.exempt) warnings.push({ code: 'no_w4', personId: p.id, message: `${p.name}: no W-4 on file, so federal tax is withheld as Single with no adjustments` });
       if (mw?.standard != null && !line.salaried) {
         const age = p.birthdate ? ageOn(p.birthdate, period.end) : 99;
         const floor = Math.round(mw.standard * 100 * (age < 18 && mw.youthDiscountPct ? 1 - mw.youthDiscountPct / 100 : 1));
@@ -390,7 +392,7 @@ export function registerRun(c) {
     const ent = entityId ? h.get('SELECT * FROM legal_entities WHERE id = ? AND org_id = ?', entityId, org.id) : h.get('SELECT * FROM legal_entities WHERE org_id = ? AND bank_enc IS NOT NULL ORDER BY is_default DESC LIMIT 1', org.id);
     if (entityId && !ent) throw new HttpError(404, 'entity not found');
     const bank = (ent?.bank_enc && vault.openJson(ent.bank_enc)) || vault.openJson(org.bankRaw) || {};
-    if (!bank.originRouting) throw new HttpError(409, 'Add the company bank details (Org structure → legal entity) first.');
+    if (!bank.originRouting) throw new HttpError(409, 'Add the company bank details first: Org and pay setup → Structure → Legal entities (Advanced, in the entity’s details).', { fix: 'org' });
     const entries = [], skipped = [];
     for (const l of lines) {
       if (ent && entityId && l.entityId !== ent.id) continue;
