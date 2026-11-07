@@ -71,3 +71,6 @@ input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accen
 details summary { cursor: pointer; color: var(--accent); font-size: 14px; margin: 8px 0; }
 .secret { font: 16px Consolas, monospace; letter-spacing: 1px; background: var(--surface-2); padding: 8px 12px; border-radius: 8px; user-select: all; word-break: break-all; }
 @media (max-width: 560px) { .progress { display: none; } h1 { font-size: 22px; } }
+dialog.ask { border: 1px solid var(--border); border-radius: 14px; background: var(--surface); color: var(--text); padding: 18px 20px; max-width: 420px; }
+dialog.ask::backdrop { background: rgba(0,0,0,.35); }
+.qr { display: block; width: 200px; height: 200px; background: #fff; padding: 10px; border-radius: 10px; margin: 8px 0; image-rendering: pixelated; }

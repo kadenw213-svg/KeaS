@@ -15,6 +15,10 @@ const bootstart = require('./bootstart.cjs');
 const { createUpdates } = require('./updates.cjs');
 const ownerLib = require('./owner.cjs');
 const flow = require('./flow.cjs');
+const { createAccount } = require('./account.cjs');
+
+// Only the Hub's owner runs the Hub: its setup is there only with this switch, or on a PC that already runs a Hub.
+const HOST_HUB = process.argv.includes(flow.HOST_HUB);
 
 const ROOT = path.join(__dirname, '..');
 const HUB_PORT = 4860;
@@ -26,6 +30,16 @@ const publicConfig = () => ({ ...config, googleClientSecret: undefined, orgVault
 const writeConfig = (c) => { fs.mkdirSync(path.dirname(configFile()), { recursive: true }); fs.writeFileSync(configFile(), JSON.stringify(c, null, 1)); return c; };
 let config = {};
 let win = null, tray = null;
+const hubMode = () => flow.hubMode({ argv: process.argv, config });
+// The Kea account this KeaS is signed in to (account.cjs): the session is kept encrypted by Windows.
+let accountApi = null;
+const account = () => (accountApi ||= createAccount({
+  dir: app.getPath('userData'),
+  protect: { available: () => safeStorage.isEncryptionAvailable(), encrypt: (s) => safeStorage.encryptString(s), decrypt: (b) => safeStorage.decryptString(b) },
+  getUrl: () => config.accountHubUrl || null,
+  setUrl: (u) => { config = writeConfig({ ...config, accountHubUrl: u || null }); },
+  client: `KeaS/${app.getVersion()}`,
+}));
 let hub = null, org = null;
 // The Hub started before sign-in by the Scheduled Task (bootstart.cjs) is a separate process: KeaS then uses it instead
 // of starting its own, and starts its own only if that one stops answering.
@@ -46,6 +60,8 @@ app.on('second-instance', () => showWindow());
 // that can't hold permissions is still used, with a warning.
 let folderProblem = null;
 let folderWarning = null;
+// Why the Hub didn't start the last time KeaS tried (shown on the status screen, with Retry and Open log).
+let lastStartError = null;
 const FOLDER_WARNING = 'KeaS can’t limit who opens this folder, because of how the drive is formatted or who owns the folder. Anyone with another Windows account on this PC, or a program running under one, may be able to read or change the Hub’s keys and everyone’s files.';
 async function secureFolders() {
   folderProblem = null;
@@ -206,8 +222,8 @@ function showWindow() {
   win.webContents.setWindowOpenHandler(({ url }) => { if (/^https?:/.test(url)) shell.openExternal(url); return { action: 'deny' }; });
   win.webContents.on('will-navigate', (e) => e.preventDefault());
   win.on('close', (e) => {
-    // Closing the window keeps the server running in the tray once it's set up.
-    if (config.setupDone && !app.isQuitting) { e.preventDefault(); win.hide(); }
+    // Closing the window keeps KeaS (and the Hub) running in the tray, when it has one.
+    if (tray && !app.isQuitting) { e.preventDefault(); win.hide(); }
   });
   win.on('closed', () => (win = null));
   if (process.env.KEAS_CAPTURE && !app.isPackaged) {
@@ -235,7 +251,19 @@ function makeTray() {
 }
 function refreshTray() {
   if (!tray) return;
-  const isHub = config.role === 'hub';
+  const isHub = config.role === 'hub' && hubMode();
+  if (!isHub && config.role !== 'org') {
+    // Not a Hub PC: KeaS only waits in the tray (it started with Windows). Nothing in it runs a server.
+    tray.setToolTip('KeaS');
+    tray.setContextMenu(Menu.buildFromTemplate([
+      { label: 'Open KeaS', click: showWindow },
+      { label: 'Payroll', click: () => trayPayroll() },
+      ...(updates?.state().status === 'ready' ? [{ type: 'separator' }, { label: `Restart to update KeaS to ${updates.state().version}`, click: () => installUpdate() }] : []),
+      { type: 'separator' },
+      { label: 'Quit KeaS', click: () => { app.isQuitting = true; app.quit(); } },
+    ]));
+    return;
+  }
   const installed = !!config.boot?.installed;
   tray.setToolTip(isHub ? (hubExternal ? 'KeaS · Kea Hub running (started before sign-in)' : 'KeaS · Kea Hub running') : 'KeaS · server running');
   const toggle = async () => {
@@ -248,13 +276,13 @@ function refreshTray() {
   };
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: 'Open KeaS', click: showWindow },
-    { label: 'Payroll', click: () => openPayroll().catch(() => {}) },
+    { label: 'Payroll', click: () => trayPayroll() },
     ...(isHub ? [
       { type: 'separator' },
       { label: 'Start the Hub before sign-in', type: 'checkbox', checked: installed, click: toggle },
       { label: 'Power settings…', click: () => { showWindow(); setTimeout(() => send('navigate', 'settings'), win?.webContents.isLoading() ? 800 : 0); } },
     ] : []),
-    ...(updates?.state().status === 'ready' ? [{ type: 'separator' }, { label: `Restart to update KeaS to ${updates.state().version}`, click: () => { try { updates.install(); } catch (e) { log('update', e.message); } } }] : []),
+    ...(updates?.state().status === 'ready' ? [{ type: 'separator' }, { label: `Restart to update KeaS to ${updates.state().version}`, click: () => installUpdate() }] : []),
     { type: 'separator' },
     { label: hubExternal ? 'Quit KeaS (the Hub keeps running)' : 'Quit KeaS (stops the server)', click: () => { app.isQuitting = true; app.quit(); } },
   ]));
@@ -265,6 +293,18 @@ let payrollApi = null;
 const payroll = () => (payrollApi ||= require('./payroll.cjs').createPayroll({ getConfig: () => config, setConfig: (patch) => { config = writeConfig({ ...config, ...patch }); }, userData: app.getPath('userData'), root: ROOT, hubPort: HUB_PORT, log }));
 const openPayroll = () => payroll().open().catch((e) => { log('payroll', e.message); throw e; });
 app.on('before-quit', () => { payrollApi?.stop(); });
+/** The tray's Payroll: opens it, or says why it can't (with a way into KeaS). */
+async function trayPayroll() {
+  try { await openPayroll(); }
+  catch (e) {
+    const r = await dialog.showMessageBox({ type: 'warning', title: 'KeaS', message: 'Payroll didn’t open.', detail: e.message, buttons: ['Open KeaS', 'Close'], defaultId: 0, cancelId: 1 });
+    if (r.response === 0) showWindow();
+  }
+}
+/** Restart and update (the tray's item; the page asks first itself). */
+async function installUpdate() {
+  try { updates.install(); } catch (e) { log('update', e.message); }
+}
 
 // ---------- drives ----------
 function drives() {
@@ -297,6 +337,11 @@ const handle = (name, fn) => ipcMain.handle(name, async (_e, arg) => {
   // (What the Hub said besides the message, like totpRequired, goes along so the page can show the right step.)
   try { return { ok: true, value: await fn(arg || {}) }; } catch (e) { log('error', name, e.message); return { ok: false, error: String(e.message || e), status: e.status ?? null, data: e.data ?? null }; }
 });
+// Running and setting up the Kea Hub: only in hub mode (--host-hub, or a PC that already runs a Hub).
+const hubHandle = (name, fn) => handle(name, (arg) => {
+  if (!hubMode()) throw new Error('Setting up a Kea Hub isn’t part of KeaS here.');
+  return fn(arg);
+});
 
 let ownerToken = null;
 // ---------- updates (updates.cjs) ----------
@@ -326,10 +371,37 @@ function registerIpc() {
   handle('update:install', () => updates.install());
   handle('state', async () => {
     const defaults = { hubData: defaultFolder('Kea Hub'), orgData: defaultFolder('KeaS Server') };
-    return { config: publicConfig(), folderProblem, folderWarning, running: { hub: hubRunning(), org: !!org, hubExternal }, port: servicePort(), defaults, resume: flow.resumeChoices(config, defaults), version: app.getVersion() };
+    const hub = hubMode();
+    return {
+      config: publicConfig(), folderProblem, folderWarning, running: { hub: hubRunning(), org: !!org, hubExternal }, port: servicePort(),
+      defaults, resume: hub ? flow.resumeChoices(config, defaults) : null, version: app.getVersion(),
+      hub, view: flow.firstView({ hub, config, signedIn: account().signedIn() }), account: account().cached(), startWithWindows: flow.startWithWindows(config),
+    };
   });
-  handle('drives', () => drives());
-  handle('pickFolder', async ({ start }) => {
+
+  // ---------- the Kea account (account.cjs) ----------
+  // Signing in also points payroll at the same Hub (on a PC that isn't the Hub; there it's this PC's own Hub).
+  const signedIn = (st) => {
+    if (st.signedIn && config.role !== 'hub' && config.hubUrl !== account().url()) config = writeConfig({ ...config, hubUrl: account().url() });
+    return st;
+  };
+  handle('account:status', () => account().status());
+  handle('account:login', async (a) => signedIn(await account().login(a)));
+  handle('account:register', async (a) => signedIn(await account().register(a)));
+  handle('account:terms', () => account().terms());
+  handle('account:acceptTerms', (a) => account().acceptTerms(a));
+  handle('account:logout', async () => { payrollApi?.forget?.(); return account().logout(); });
+  handle('account:setUrl', async ({ url }) => { payrollApi?.forget?.(); return account().changeUrl(url); });
+  handle('settings:startWithWindows', ({ on }) => {
+    config = writeConfig({ ...config, startWithWindows: !!on });
+    if (!DEV) app.setLoginItemSettings({ openAtLogin: !!on, args: ['--hidden'] });
+    // Not a Hub PC: KeaS only sits in the tray when it starts with Windows.
+    if (!hubMode()) { if (on) makeTray(); else if (tray) { tray.destroy(); tray = null; } }
+    else refreshTray();
+    return flow.startWithWindows(config);
+  });
+  hubHandle('drives', () => drives());
+  hubHandle('pickFolder', async ({ start }) => {
     const r = await dialog.showOpenDialog(win, { title: 'Where should KeaS keep its data?', defaultPath: start, properties: ['openDirectory', 'createDirectory'] });
     if (r.canceled) return null;
     const p = r.filePaths[0];
@@ -337,8 +409,8 @@ function registerIpc() {
     if (path.parse(p).root.toLowerCase() === path.join(p, path.sep).toLowerCase()) throw new Error(`Pick or make a folder on that drive (for example ${path.join(p, 'Kea Hub')}), not the drive itself.`);
     return p;
   });
-  handle('checkFolder', ({ dir }) => checkFolder(dir));
-  handle('saveSetup', async ({ role, dataDir, storageDir, quotaGb, reach }) => {
+  hubHandle('checkFolder', ({ dir }) => checkFolder(dir));
+  hubHandle('saveSetup', async ({ role, dataDir, storageDir, quotaGb, reach }) => {
     if (!['hub', 'org'].includes(role)) throw new Error('Pick what this PC is for.');
     // A different role serves a different port: the old one's Funnel goes, so nothing stays public by accident.
     if (config.role && config.role !== role && config.tailscale) {
@@ -353,21 +425,21 @@ function registerIpc() {
     if (config.boot?.installed && config.boot.layout === bootstart.LAYOUT && !DEV) await refreshBoot(true);
     return publicConfig();
   });
-  handle('start', async () => { await startServices(); return { hub: hubRunning(), org: !!org, port: servicePort() }; });
-  handle('boot:status', () => bootStatus());
-  handle('boot:apply', ({ options, dryRun }) => bootApply(options, !!dryRun));
-  handle('boot:remove', ({ dryRun }) => bootRemove(!!dryRun));
+  hubHandle('start', async () => { await startServices(); return { hub: hubRunning(), org: !!org, port: servicePort() }; });
+  hubHandle('boot:status', () => bootStatus());
+  hubHandle('boot:apply', ({ options, dryRun }) => bootApply(options, !!dryRun));
+  hubHandle('boot:remove', ({ dryRun }) => bootRemove(!!dryRun));
 
-  handle('ts:status', () => tailscale.status(servicePort()));
-  handle('ts:install', () => tailscale.install((l) => send('progress', l)));
-  handle('ts:login', () => tailscale.login((u) => shell.openExternal(u), (l) => send('progress', l)));
+  hubHandle('ts:status', () => tailscale.status(servicePort()));
+  hubHandle('ts:install', () => tailscale.install((l) => send('progress', l)));
+  hubHandle('ts:login', () => tailscale.login((u) => shell.openExternal(u), (l) => send('progress', l)));
   // Public access off: removes only KeaS's Funnel (https:443 to this server's port), nothing else in Tailscale.
-  handle('ts:funnelOff', async () => {
+  hubHandle('ts:funnelOff', async () => {
     const s = await tailscale.funnelOff(servicePort());
     config = writeConfig({ ...config, publicUrl: null });
     return s;
   });
-  handle('ts:funnel', async () => {
+  hubHandle('ts:funnel', async () => {
     const s = await tailscale.funnel(servicePort(), (u) => shell.openExternal(u), (l) => send('progress', l));
     config = writeConfig({ ...config, publicUrl: s.url });
     pointKeaHere();
@@ -377,32 +449,34 @@ function registerIpc() {
   // The Hub owner (owner.cjs): the account is made through the Hub like anyone's (with the terms), then made owner
   // right here, on this PC, which is the only place that can happen.
   const local = ownerLib.localCaller(`http://127.0.0.1:${HUB_PORT}`);
-  handle('terms', () => local('/v1/terms'));
+  hubHandle('terms', () => local('/v1/terms'));
   // Setup remembers where it got to, so closing KeaS (or a crash or restart) never sends it back to the start.
-  handle('setupStep', ({ step }) => {
+  hubHandle('setupStep', ({ step }) => {
     if (config.setupDone || !flow.WIZARD.includes(step)) return false;
     if (config.setupStep !== step) config = writeConfig({ ...config, setupStep: step });
     return true;
   });
-  handle('owner:state', async () => {
+  hubHandle('owner:state', async () => {
     if (!config.ownerEmail || !hubRunning()) return null;
     return ownerLib.ownerState(await hubDb(), config.ownerEmail);
   });
-  handle('owner:create', async ({ name, email, password, code, termsVersion, termsSections }) => {
+  hubHandle('owner:create', async ({ name, email, password, code, termsVersion, termsSections }) => {
     const db = await hubDb();
     // The password goes only to OUR Hub: whatever answers on the port must prove it holds this Hub's signing key.
     if (!(await verifyHubIdentity(HUB_PORT, config.dataDir))) throw new Error('The Kea Hub on this PC didn’t prove it’s the one in your data folder, so the password wasn’t sent. Restart KeaS; if this keeps happening, another program may be using port 4860.');
     const r = await ownerLib.createOwner({ db, call: local, name, email, password, code, termsVersion, termsSections });
     config = writeConfig({ ...config, ownerEmail: r.email });
     ownerToken = r.token;
+    // KeaS is now signed in to the owner's own Kea account (payroll uses it too).
+    account().adopt(r.token, `http://127.0.0.1:${HUB_PORT}`);
     return { email: r.email, totp: r.totp };
   });
-  handle('owner:totp', async ({ code }) => {
+  hubHandle('owner:totp', async ({ code }) => {
     if (!ownerToken) throw new Error('Go back one step and sign in to the owner account again.');
     await local('/v1/me/totp/enable', { method: 'POST', body: JSON.stringify({ code }) }, ownerToken);
     return true;
   });
-  handle('finish', ({ startWithWindows = true, theme }) => {
+  hubHandle('finish', ({ startWithWindows = true, theme }) => {
     config = writeConfig({ ...config, setupDone: true, startWithWindows, theme: theme || config.theme || 'system' });
     if (!DEV) app.setLoginItemSettings({ openAtLogin: !!startWithWindows, args: ['--hidden'] });
     makeTray();
@@ -463,13 +537,14 @@ app.whenReady().then(async () => {
   nativeTheme.themeSource = config.theme === 'light' || config.theme === 'dark' ? config.theme : 'system';
   startUpdates();
   registerIpc();
-  if (config.setupDone) {
-    try { await startServices(); } catch (e) { log('start failed', e.message); }
+  if (config.setupDone && hubMode()) {
+    try { await startServices(); } catch (e) { lastStartError = e.message; log('start failed', e.message); }
     // KeaS was updated: the before-sign-in Hub uses the new Hub files from its next start.
     if (config.role === 'hub' && config.boot?.installed && config.boot.layout === bootstart.LAYOUT && !DEV) await refreshBoot(false);
     makeTray();
-  }
-  if (!process.argv.includes('--hidden') || !config.setupDone) showWindow();
+  } else if (!hubMode() && flow.startWithWindows(config)) makeTray();
+  if (!process.argv.includes('--hidden') || !tray) showWindow();
 });
-app.on('window-all-closed', () => { if (!config.setupDone) app.quit(); });
+// (With a tray, closing the window keeps KeaS running; without one, it quits.)
+app.on('window-all-closed', () => { if (!tray) app.quit(); });
 app.on('before-quit', async () => { app.isQuitting = true; clearInterval(hubWatch); updates?.stop(); try { await hub?.close(); await org?.close(); extDb?.close(); } catch {} });

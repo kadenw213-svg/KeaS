@@ -40,4 +40,22 @@ function stepNext(step) {
   return i < 0 ? 'welcome' : WIZARD[Math.min(WIZARD.length - 1, i + 1)];
 }
 
-module.exports = { WIZARD, resumeStep, resumeChoices, stepBack, stepNext };
+// Only the Hub's owner runs a Hub. Its setup is reachable only when KeaS is started with this switch, or on a PC that
+// already runs a Hub (set up before). Everyone else signs in to their Kea account and never sees Hub setup.
+const HOST_HUB = '--host-hub';
+function hubMode({ argv = [], config = {} } = {}) {
+  // (An organization server set up by an earlier KeaS keeps running and keeps its status screen too.)
+  return argv.includes(HOST_HUB) || ((config.role === 'hub' || config.role === 'org') && !!config.setupDone);
+}
+/** The first screen: the Hub's status or setup (hub mode), else the account home or sign-in. */
+function firstView({ hub, config = {}, signedIn }) {
+  if (hub) return config.setupDone ? 'status' : resumeStep(config);
+  return signedIn ? 'home' : 'signin';
+}
+/** Starting with Windows: off unless chosen; a Hub set up before keeps what it had (on unless turned off). */
+function startWithWindows(config = {}) {
+  if (typeof config.startWithWindows === 'boolean') return config.startWithWindows;
+  return config.role === 'hub' && !!config.setupDone;
+}
+
+module.exports = { WIZARD, HOST_HUB, resumeStep, resumeChoices, stepBack, stepNext, hubMode, firstView, startWithWindows };
