@@ -1,8 +1,9 @@
-// KeaS first-run setup (and the status screen afterwards). Plain DOM, no innerHTML: every bit of text is set as text.
+// The KeaS window: first-run setup, then the home screen (the server, Get set up, the organization's pay codes and
+// roles, the Kea account, Payroll), or a Kea Hub's status while its accounts haven't moved. Plain DOM, no innerHTML: every bit of text is set as text.
 'use strict';
 const k = window.keas;
 const app = document.getElementById('app');
-const S = { step: 'welcome', role: 'hub', dataDir: '', storageDir: '', quotaGb: 5, reach: 'tailscale', drives: [], defaults: {}, config: {}, ts: {}, log: [], busy: false, error: '', owner: null, totp: null, terms: null, agreed: new Set(), totpDone: false };
+const S = { step: 'welcome', dataDir: '', reach: 'tailscale', drives: [], defaults: {}, config: {}, ts: {}, log: [], busy: false, error: '' };
 
 function h(tag, props, ...kids) {
   const el = document.createElement(tag);
@@ -28,49 +29,41 @@ async function call(fn, arg) {
 }
 function fail(e) { S.error = String(e.message || e); S.busy = false; render(); }
 
-const STEPS = { hub: ['welcome', 'storage', 'reach', 'owner', 'boot', 'done'], org: ['welcome', 'storage', 'reach', 'done'], join: ['welcome'] };
-const LABELS = { welcome: 'Start', storage: 'Where data goes', reach: 'Reachable from anywhere', owner: 'Your owner account', boot: 'Start before sign-in', done: 'Done' };
+/** A two-step code box (or a backup code instead), for Payroll's "ask every time". */
+function codeInput(get, set, { label = 'Code from your authenticator app', autofocus = false } = {}) {
+  const backup = !!S.useBackup;
+  return [
+    h('label', { class: 'field' }, backup ? 'Backup code' : label,
+      h('input', { type: 'text', inputmode: backup ? 'text' : 'numeric', autocomplete: backup ? 'off' : 'one-time-code', maxlength: backup ? '11' : '6', placeholder: backup ? 'XXXXX-XXXXX' : '', value: get() || '', autofocus, oninput: (e) => set(e.target.value) })),
+    h('p', { class: 'small' }, h('button', { class: 'btn', type: 'button', onclick: () => { S.useBackup = !backup; set(''); render(); } }, backup ? 'Use the code from my app' : 'Use a backup code')),
+  ];
+}
+// ---------- setup: the data folder ----------
+const STEPS = ['welcome', 'keac', 'account', 'claim', 'org', 'place', 'reach', 'done'];
+const LABELS = { welcome: 'Data folder', keac: 'Kea account server', account: 'Your Kea account', claim: 'This server', org: 'Organization', place: 'Where people work', reach: 'Reachable from anywhere', done: 'Done' };
 function go(step) {
   S.step = step; S.error = ''; render(); window.scrollTo(0, 0);
-  // Setup remembers where it got to, so a restart picks up here.
-  if (S.hub && !S.config.setupDone && STEPS.hub.includes(step)) k.setupStep({ step }).catch(() => {});
+  if (!S.config.setupDone && STEPS.includes(step)) k.setupStep({ step }).catch(() => {});
 }
-function next() { const list = STEPS[S.role || 'hub']; go(list[list.indexOf(S.step) + 1]); }
-function back() { const list = STEPS[S.role || 'hub']; go(list[Math.max(0, list.indexOf(S.step) - 1)]); }
-
+function next() { go(STEPS[Math.min(STEPS.length - 1, STEPS.indexOf(S.step) + 1)]); }
+function back() { go(STEPS[Math.max(0, STEPS.indexOf(S.step) - 1)]); }
 function renderProgress() {
   const el = document.getElementById('progress');
   el.replaceChildren();
-  if (!S.hub || !STEPS.hub.includes(S.step)) return;
-  const list = STEPS[S.role || 'hub'];
-  const at = list.indexOf(S.step);
-  list.forEach((s, i) => el.append(h('li', { class: i === at ? 'on' : i < at ? 'done' : '' }, LABELS[s])));
+  if (S.config.setupDone || !STEPS.includes(S.step)) return;
+  const at = STEPS.indexOf(S.step);
+  STEPS.forEach((s, i) => el.append(h('li', { class: i === at ? 'on' : i < at ? 'done' : '' }, LABELS[s])));
 }
+const tzHere = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { return 'America/Denver'; } };
 
-// ---------- steps ----------
 function welcome() {
-  const choice = (role, title, text, tag) =>
-    h('button', { class: `choice ${S.role === role ? 'on' : ''}`, onclick: () => { S.role = role; render(); } }, h('b', null, title, tag && h('span', { class: 'tag' }, tag)), h('span', { class: 'muted' }, text));
-  return [
-    h('h1', null, 'Set up a Kea Hub on this computer'),
-    h('p', { class: 'muted' }, 'A Kea Hub is the server Kea accounts, classes, study groups and Kea storage live on. This makes a new Hub of your own on this computer.'),
-    h('div', { class: 'cards' },
-      choice('hub', 'Run a Kea Hub', 'Accounts with two-step sign-in, classes and invite codes, study leaderboards, Kea storage and sync, and Kea’s shared Claude.'),
-    ),
-    h('div', { class: 'actions' }, h('button', { class: 'btn primary', disabled: S.role !== 'hub', onclick: () => { S.dataDir = S.dataDir || S.defaults.hubData; go('storage'); } }, 'Next')),
-  ];
-}
-
-function storage() {
-  const name = S.role === 'hub' ? 'Kea Hub' : 'KeaS Server';
-  // (Another drive keeps the folder name typed so far; only the drive letter changes.)
-  const pick = (d) => { const rest = /^[a-z]:\\(.+)$/i.exec(S.dataDir.trim())?.[1]; S.dataDir = `${d.root}${rest || name}`; S.storageDir = ''; render(); };
+  const pick = (d) => { const rest = /^[a-z]:\\(.+)$/i.exec(S.dataDir.trim())?.[1]; S.dataDir = `${d.root}${rest || 'KeaS'}`; render(); };
   const onDrive = (d) => S.dataDir.toUpperCase().startsWith(d.root.toUpperCase());
+  if (!S.dataDir) S.dataDir = S.defaults.serverData || '';
   return [
-    h('h1', null, 'Where should the data go?'),
-    h('p', { class: 'muted' }, S.role === 'hub'
-      ? 'Accounts, classes, study progress and everyone’s Kea storage are kept here. Pick a big drive: Kea data is mostly text, so even a few TB holds a lot of people.'
-      : 'Your organization’s schedules, punches and records are kept here.'),
+    h('h1', null, 'Set up KeaS for your organization'),
+    h('p', { class: 'muted' }, 'KeaS runs your organization’s server on this computer: schedules, the time clock, pay codes and Payroll. Your people sign in with their Kea accounts, from Kea on their computers and phones.'),
+    h('h2', null, 'Where should the data go?'),
     h('div', { class: 'drives' }, S.drives.map((d) =>
       h('button', { class: `choice drive ${onDrive(d) ? 'on' : ''}`, onclick: () => pick(d) },
         h('b', null, `${d.letter}: ${d.label || 'drive'}`), h('span', { class: 'muted small' }, `${size(d.free)} free of ${size(d.total)}`),
@@ -78,26 +71,456 @@ function storage() {
     h('label', { class: 'field' }, 'Folder', h('div', { class: 'row' },
       h('input', { type: 'text', value: S.dataDir, oninput: (e) => (S.dataDir = e.target.value) }),
       h('button', { class: 'btn', onclick: async () => { const p = await call(k.pickFolder, { start: S.dataDir }).catch(fail); if (p) { S.dataDir = p; render(); } } }, 'Choose…'))),
-    S.role === 'hub' && h('details', null, h('summary', null, 'Advanced'),
-      h('label', { class: 'field' }, 'Standard Kea storage for each account (GB)', h('input', { type: 'number', min: '1', max: '100000', value: String(S.quotaGb), oninput: (e) => (S.quotaGb = Number(e.target.value) || 5) })),
-      h('p', { class: 'muted small' }, 'Supporters get 25 GB, and you can give any account more later from the owner console. A limit keeps one person from filling the whole drive.'),
-      h('label', { class: 'field' }, 'Keep account files in a different folder (optional)', h('div', { class: 'row' },
-        h('input', { type: 'text', value: S.storageDir, placeholder: `${S.dataDir}\\storage`, oninput: (e) => (S.storageDir = e.target.value) }),
-        h('button', { class: 'btn', onclick: async () => { const p = await call(k.pickFolder, { start: S.storageDir || S.dataDir }).catch(fail); if (p) { S.storageDir = p; render(); } } }, 'Choose…')))),
     S.error && h('div', { class: 'err' }, S.error),
     h('div', { class: 'actions' },
-      h('button', { class: 'btn', onclick: back }, 'Back'),
       h('button', { class: 'btn primary', disabled: S.busy || !S.dataDir.trim(), onclick: async () => {
         S.busy = true; S.error = ''; render();
-        try { const r = await call(k.checkFolder, { dir: S.dataDir }); S.folderWarning = r.warning || null; S.busy = false; go('reach'); } catch (e) { fail(new Error(`Can’t use that folder: ${e.message}`)); }
-      } }, S.busy ? 'Checking…' : 'Next')),
-    h('p', { class: 'muted small' }, 'Only drives inside this PC are shown: cloud drives (Google Drive, OneDrive…), network and removable drives can’t hold the Hub’s data.'),
+        try {
+          const r = await call(k.checkFolder, { dir: S.dataDir });
+          S.folderWarning = r.warning || null;
+          await call(k.saveSetup, { dataDir: S.dataDir });
+          await call(k.start);
+          S.busy = false;
+          await load();
+          if (S.legacy) return;
+          go('keac');
+        } catch (e) { fail(new Error(`Can’t use that folder: ${e.message}`)); }
+      } }, S.busy ? 'Starting…' : 'Next')),
+    h('p', { class: 'muted small' }, 'Only drives inside this PC are shown: cloud drives (Google Drive, OneDrive…), network and removable drives can’t hold the server’s data.'),
   ];
 }
 
+// ---------- setup: the Kea account server (KeaC), its key checked ----------
+function keac() {
+  const sv = S.server || {};
+  const trusted = sv.keac && sv.keac.trusted > 0;
+  const o = S.keacOffer;
+  const url = S.keacUrl ?? (sv.keac && sv.keac.url) ?? S.config.keacUrl ?? '';
+  return [
+    h('h1', null, 'Your Kea account server'),
+    h('p', { class: 'muted' }, 'People sign in to this server with their Kea accounts. KeaS checks every sign-in with the Kea account server’s key, so it needs to know which key is the real one: compare its fingerprint with the one in the Kea account server’s Keys screen.'),
+    trusted && !o && h('p', { class: 'ok' }, `Trusted: ${sv.keac.url}. `, h('span', { class: 'muted small' }, (sv.keac.keys || []).map((x) => `${x.kid} (${x.status})`).join(', '))),
+    form(async () => {
+      S.busy = true; S.error = ''; render();
+      try { S.keacOffer = await call(k.keacOffer, { url: S.keacUrl ?? url }); S.keacPick = S.keacOffer.suggested; S.busy = false; render(); } catch (e) { fail(e); }
+    },
+    h('label', { class: 'field' }, 'Address', h('div', { class: 'row' },
+      h('input', { type: 'text', value: url, placeholder: 'https://name.tailnet.ts.net', oninput: (e) => (S.keacUrl = e.target.value) }),
+      h('button', { class: 'btn', type: 'submit', disabled: S.busy }, S.busy ? 'Checking…' : 'Check its key')))),
+    o && h('div', { class: 'panel' },
+      h('p', null, h('b', null, 'Its keys now')),
+      h('ul', { class: 'steps' }, o.keys.map((x) => h('li', null,
+        h('input', { type: 'radio', name: 'kid', checked: S.keacPick === x.kid, onchange: () => { S.keacPick = x.kid; render(); } }),
+        h('div', null, h('b', null, `${x.kid} (${x.status})`), x.oldHubKey && h('span', { class: 'tag' }, 'This PC’s own Kea Hub key'),
+          h('div', null, h('code', { style: 'font-size:12px;word-break:break-all' }, x.fingerprint)))))),
+      h('p', { class: 'muted small' }, 'Trust it only if this fingerprint is the one the Kea account server shows for its current key.'),
+      h('div', { class: 'actions' }, h('button', { class: 'btn primary', disabled: S.busy || !S.keacPick, onclick: async () => {
+        const x = o.keys.find((y) => y.kid === S.keacPick);
+        if (!(await askInPage('Trust this key?', x.fingerprint, 'Trust it'))) return;
+        S.busy = true; render();
+        try { await call(k.keacPin, { url: o.url, kid: x.kid, fingerprint: x.fingerprint }); S.keacOffer = null; S.busy = false; await load(); go('account'); } catch (e) { fail(e); }
+      } }, 'Trust this key'))),
+    S.error && h('div', { class: 'err' }, S.error),
+    h('div', { class: 'actions' },
+      h('button', { class: 'btn', onclick: back }, 'Back'),
+      h('button', { class: 'btn primary', disabled: !trusted, onclick: next }, 'Next')),
+  ];
+}
+
+// ---------- setup: signing in with the Kea account (at KeaC) ----------
+function accountForm(after) {
+  const f = S.sf || (S.sf = { email: (S.acct && S.acct.email) || '', password: '', code: '' });
+  const done = async (p) => { S.busy = true; S.error = ''; render(); try { S.acctStatus = await p; S.acct = S.acctStatus.account; S.sf = null; S.needCode = false; S.busy = false; await after(); } catch (e) { S.busy = false; if (e.data && e.data.totpRequired) { S.needCode = true; S.error = f.code ? e.message : ''; } else S.error = e.message; render(); } };
+  return h('div', null,
+    form(() => done(call(k.accountLogin, { email: f.email, password: f.password, code: S.needCode ? f.code : undefined })),
+      h('label', { class: 'field' }, 'Email', h('input', { type: 'email', value: f.email, autocomplete: 'username', oninput: (e) => (f.email = e.target.value) })),
+      h('label', { class: 'field' }, 'Password', h('input', { type: 'password', value: f.password, autocomplete: 'current-password', oninput: (e) => (f.password = e.target.value) })),
+      S.needCode && h('label', { class: 'field' }, 'Code from your authenticator app, or a backup code', h('input', { type: 'text', inputmode: 'numeric', autocomplete: 'one-time-code', value: f.code, oninput: (e) => (f.code = e.target.value) })),
+      h('div', { class: 'actions' }, h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, S.busy ? 'Signing in…' : 'Sign in'))),
+    S.google && h('p', null, h('button', { class: 'btn', disabled: S.busy, onclick: () => done(call(k.accountGoogle)) }, 'Sign in with Google in the browser')),
+    h('p', { class: 'muted small' }, 'Your password and code go to your Kea account server only, never to this KeaS server. No Kea account yet? Make one in the Kea app.'));
+}
+function account() {
+  const a = S.acctStatus || {};
+  return [
+    h('h1', null, 'Sign in with your Kea account'),
+    a.signedIn && S.acct ? h('p', { class: 'ok' }, `Signed in as ${S.acct.email}.`) : accountForm(async () => { await load(); go('claim'); }),
+    S.error && h('div', { class: 'err' }, S.error),
+    h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: back }, 'Back'), h('button', { class: 'btn primary', disabled: !(a.signedIn && S.acct), onclick: next }, 'Next')),
+  ];
+}
+
+// ---------- setup: this server, claimed with its setup code ----------
+function claim() {
+  const sv = S.server || {};
+  const signedIn = sv.signedIn;
+  return [
+    h('h1', null, 'Set up this server'),
+    !sv.claimed ? [
+      h('p', { class: 'muted' }, 'The first Kea account to set this server up runs it. That can only happen here, on this computer, with its one-time setup code:'),
+      h('div', { class: 'panel' }, h('p', { style: 'font:600 24px/1.2 ui-monospace,Consolas,monospace;letter-spacing:3px' }, S.setupCode || '—')),
+      h('div', { class: 'actions' }, h('button', { class: 'btn primary', disabled: S.busy || !S.setupCode, onclick: async () => {
+        S.busy = true; S.error = ''; render();
+        try { await call(k.serverClaim, { secret: S.setupCode }); S.busy = false; await load(); go('org'); } catch (e) { fail(e); }
+      } }, S.busy ? 'Setting it up…' : `Set it up as ${(S.acct && S.acct.email) || 'me'}`)),
+    ] : signedIn ? h('p', { class: 'ok' }, sv.me && sv.me.operator ? 'You run this server.' : `Signed in as ${(sv.me && sv.me.email) || ''}.`) : [
+      h('p', { class: 'muted' }, 'This server is set up already. Sign in to it with your Kea account.'),
+      h('div', { class: 'actions' }, h('button', { class: 'btn primary', disabled: S.busy, onclick: async () => {
+        S.busy = true; S.error = ''; render();
+        try { await call(k.serverSignIn); S.busy = false; await load(); go('org'); } catch (e) { fail(e); }
+      } }, 'Sign in to this server')),
+    ],
+    S.error && h('div', { class: 'err' }, S.error),
+    h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: back }, 'Back'), h('button', { class: 'btn primary', disabled: !signedIn, onclick: next }, 'Next')),
+  ];
+}
+
+// ---------- setup: the organization, and where people work ----------
+function org() {
+  if (!S.orgList) { call(k.checklist).then((cl) => { S.cl = cl; S.orgList = true; render(); }).catch(fail); return [h('p', { class: 'muted' }, 'Checking…')]; }
+  const have = S.cl && S.cl.org;
+  const f = S.orgForm || (S.orgForm = { name: '', state: '', code: '' });
+  return [
+    h('h1', null, 'Your organization'),
+    have ? h('p', { class: 'ok' }, `${have.name}.`) : form(async () => {
+      S.busy = true; S.error = ''; render();
+      try { await call(k.orgCreate, { name: f.name, state: f.state || null, tz: tzHere() }); S.busy = false; S.orgList = false; S.cl = null; go('place'); } catch (e) { fail(e); }
+    },
+    h('label', { class: 'field' }, 'Name', h('input', { type: 'text', value: f.name, oninput: (e) => (f.name = e.target.value) })),
+    h('div', { class: 'actions' }, h('button', { class: 'btn primary', type: 'submit', disabled: S.busy || !f.name.trim() }, 'Create it'))),
+    S.error && h('div', { class: 'err' }, S.error),
+    h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: back }, 'Back'), h('button', { class: 'btn primary', disabled: !have, onclick: next }, 'Next')),
+  ];
+}
+function place() {
+  if (!S.cl || !S.cl.org) { call(k.checklist).then((cl) => { S.cl = cl; render(); }).catch(fail); return [h('p', { class: 'muted' }, 'Checking…')]; }
+  const o = S.cl.org;
+  const f = S.placeForm || (S.placeForm = { state: o.state || '', tz: o.tz || tzHere(), periodDays: 14, periodAnchor: '' });
+  const zones = TIME_ZONES.includes(f.tz) ? TIME_ZONES : [f.tz, ...TIME_ZONES];
+  return [
+    h('h1', null, 'Where people work'),
+    h('p', { class: 'muted' }, 'The state decides which labor rules (overtime, breaks, paid sick leave) and tax tables apply. KeaS shows a state’s rules as suggestions until they’re checked against the official sources.'),
+    form(async () => {
+      S.busy = true; S.error = ''; render();
+      try {
+        const clock = { periodDays: Number(f.periodDays) === 7 ? 7 : 14, ...(f.periodAnchor ? { periodAnchor: f.periodAnchor } : {}) };
+        await call(k.orgUpdate, { id: o.id, state: f.state || null, tz: f.tz, settings: { clock } });
+        S.busy = false; S.cl = null; go('reach');
+      } catch (e) { fail(e); }
+    },
+    h('div', { class: 'row' },
+      h('label', { class: 'field' }, 'State', h('select', { onchange: (e) => (f.state = e.target.value) }, h('option', { value: '' }, 'Pick one'), US_STATES.map((x) => h('option', { value: x, selected: f.state === x }, x)))),
+      h('label', { class: 'field' }, 'Time zone', h('select', { onchange: (e) => (f.tz = e.target.value) }, zones.map((z) => h('option', { value: z, selected: f.tz === z }, z))))),
+    h('details', null, h('summary', null, 'Advanced'),
+      h('div', { class: 'row' },
+        h('label', { class: 'field' }, 'Pay period', h('select', { onchange: (e) => (f.periodDays = Number(e.target.value)) }, h('option', { value: '14', selected: f.periodDays === 14 }, 'Every two weeks'), h('option', { value: '7', selected: f.periodDays === 7 }, 'Every week'))),
+        h('label', { class: 'field' }, 'First day of a pay period', h('input', { type: 'date', value: f.periodAnchor, oninput: (e) => (f.periodAnchor = e.target.value) })))),
+    h('div', { class: 'actions' }, h('button', { class: 'btn', type: 'button', onclick: back }, 'Back'), h('button', { class: 'btn primary', type: 'submit', disabled: S.busy || !f.state }, 'Save and go on'))),
+    S.error && h('div', { class: 'err' }, S.error),
+  ];
+}
+
+function done() {
+  const url = S.publicUrl || S.config.publicUrl || null;
+  return [
+    h('h1', null, 'All set'),
+    h('div', { class: 'panel' },
+      h('p', null, h('b', null, 'Your organization’s server is running.')),
+      url ? h('p', null, 'Public address: ', h('span', { class: 'url' }, url)) : h('p', { class: 'muted' }, 'Only reachable on this computer.'),
+      h('p', null, 'Data: ', h('span', { class: 'url' }, S.config.dataDir), ' ', h('button', { class: 'btn', onclick: () => k.openFolder({ dir: S.config.dataDir }) }, 'Open folder')),
+      h('p', { class: 'muted small' }, 'Your people join with a code you make under People, in Kea (Work) or here.')),
+    h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: S.boot !== false, onchange: (e) => (S.boot = e.target.checked) }), 'Start KeaS when Windows starts (it waits in the tray and keeps the server running)'),
+    S.error && h('div', { class: 'err' }, S.error),
+    h('div', { class: 'actions' }, h('button', { class: 'btn primary', onclick: async () => {
+      try { await call(k.finish, { startWithWindows: S.boot !== false, theme: document.getElementById('theme').value }); await load(); } catch (e) { fail(e); }
+    } }, 'Finish')),
+  ];
+}
+
+// ---------- a PC that is still the Kea Hub ----------
+function legacy() {
+  const la = S.legacyAcct;
+  if (!la) call(k.legacyStatus).then((v) => { S.legacyAcct = v; render(); }).catch(() => {});
+  return [
+    h('h1', null, 'Kea Hub'),
+    h('div', { class: 'panel' },
+      h('p', null, h('b', null, S.legacyMessage)),
+      h('p', { class: 'muted small' }, 'Until then this PC keeps running the Kea Hub as before, so Kea keeps working. When KeaC’s move has run (it copies the accounts from this folder), say so here: KeaS then makes this organization’s server from a copy of the Hub’s data, and leaves the Hub’s own files as they were.'),
+      form(async () => {
+        if (!(await askInPage('Have the Kea accounts moved to your Kea account server?', 'Only once KeaC’s move has run. After this, Kea apps that still use this address are sent to the Kea account server.', 'They have moved'))) return;
+        S.busy = true; S.error = ''; render();
+        try { const r = await call(k.legacyMoved, { keacUrl: S.moveUrl || '' }); S.moved = r.upgraded; S.busy = false; await load(); go('keac'); } catch (e) { fail(e); }
+      },
+      h('label', { class: 'field' }, 'Your Kea account server’s address', h('div', { class: 'row' },
+        h('input', { type: 'text', value: S.moveUrl || '', placeholder: 'https://name.tailnet.ts.net', oninput: (e) => (S.moveUrl = e.target.value) }),
+        h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, 'My Kea accounts have moved'))))),
+    h('div', { class: 'panel' },
+      h('p', null, h('span', { class: `dot ${S.running ? 'ok' : 'bad'}`, style: 'display:inline-block;vertical-align:-4px;margin-right:8px' }), S.running ? 'The Kea Hub is running' : 'Not running'),
+      !S.running && h('button', { class: 'btn primary', onclick: async () => { try { await call(k.start); } catch {} await load(); } }, 'Start it'),
+      h('p', null, 'Data: ', h('span', { class: 'url' }, S.config.dataDir))),
+    h('h2', null, 'Payroll'),
+    la && !la.signedIn ? h('div', { class: 'panel' }, h('p', { class: 'muted small' }, 'Payroll signs in with your Kea Hub account here until the accounts move.'), legacySignIn()) : payrollPanel(),
+    updatePanel(),
+    S.error && h('div', { class: 'err' }, S.error),
+  ];
+}
+function legacySignIn() {
+  const f = S.lf || (S.lf = { email: '', password: '', code: '' });
+  return form(async () => {
+    S.busy = true; S.error = ''; render();
+    try { S.legacyAcct = await call(k.legacyLogin, { email: f.email, password: f.password, code: S.lneedCode ? f.code : undefined }); S.lf = null; S.busy = false; render(); }
+    catch (e) { S.busy = false; if (e.data && e.data.totpRequired) S.lneedCode = true; else S.error = e.message; render(); }
+  },
+  h('label', { class: 'field' }, 'Email', h('input', { type: 'email', value: f.email, oninput: (e) => (f.email = e.target.value) })),
+  h('label', { class: 'field' }, 'Password', h('input', { type: 'password', value: f.password, oninput: (e) => (f.password = e.target.value) })),
+  S.lneedCode && h('label', { class: 'field' }, 'Two-step code', h('input', { type: 'text', value: f.code, oninput: (e) => (f.code = e.target.value) })),
+  h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, 'Sign in'));
+}
+
+// ---------- the organization from this PC: pay codes, roles, people waiting ----------
+const orgPath = (p = '') => `/v1/orgs/${encodeURIComponent(S.cl.org.id)}${p}`;
+const money = (c) => (c == null ? '—' : `$${(c / 100).toFixed(2)}`);
+function loadOrgAdmin() {
+  if (S.oaLoading || !S.cl || !S.cl.org) return;
+  S.oaLoading = true;
+  Promise.all([call(k.orgApi, { path: orgPath('/pay-codes') }), call(k.orgApi, { path: orgPath('/roles') }), call(k.orgApi, { path: orgPath('/members') })])
+    .then(([pc, roles, members]) => { S.oa = { pc, roles, members }; S.oaLoading = false; render(); })
+    .catch((e) => { S.oaLoading = false; S.oa = { error: e.message }; render(); });
+}
+async function orgDo(method, p, body) {
+  S.busy = true; S.oaError = ''; render();
+  try { await call(k.orgApi, { method, path: orgPath(p), body }); S.busy = false; S.oa = null; S.cl = null; loadChecklist(); render(); } catch (e) { S.busy = false; S.oaError = e.message; render(); }
+}
+function payCodesPanel() {
+  const pc = S.oa.pc;
+  const f = S.pcForm || (S.pcForm = { name: '', rate: '' });
+  const members = (S.oa.members.members || []).filter((m) => m.status !== 'pending');
+  return h('div', { class: 'panel', id: 'paycodes' },
+    h('h2', { style: 'margin-top:0' }, 'Pay codes'),
+    h('p', { class: 'muted small' }, 'A pay code is a job and its rate. Each hour is paid at the code it was worked at, at the rate in effect that day. People see only their own codes.'),
+    h('table', { class: 'grid' }, h('tr', null, h('th', null, 'Code'), h('th', null, 'Rate'), h('th', null, 'Coming'), h('th', null, 'People'), h('th', null, '')),
+      (pc.codes || []).map((c) => h('tr', null,
+        h('td', null, c.name, !c.active && h('span', { class: 'tag' }, 'Off')),
+        h('td', null, money(c.rateCents)),
+        h('td', { class: 'small' }, (c.upcoming || []).map((u) => `${money(u.rateCents)} from ${u.from}`).join(', ') || '—'),
+        h('td', null, String(c.holders || 0)),
+        h('td', null, pc.canManage && h('div', { class: 'row' },
+          h('button', { class: 'btn', disabled: S.busy, onclick: async () => {
+            const v = window.prompt(`New rate for ${c.name} (dollars an hour)`, (c.rateCents / 100).toFixed(2)); if (!v) return;
+            const from = window.prompt('From which date? (YYYY-MM-DD; empty: today)', '') || undefined;
+            orgDo('POST', `/pay-codes/${c.id}`, { rate: v, ...(from ? { effectiveFrom: from } : {}) });
+          } }, 'Change rate'),
+          h('button', { class: 'btn', disabled: S.busy, onclick: () => orgDo('POST', `/pay-codes/${c.id}`, { active: !c.active }) }, c.active ? 'Turn off' : 'Turn on')))))),
+    pc.canManage && form(() => orgDo('POST', '/pay-codes', { name: f.name, rate: f.rate }).then(() => { S.pcForm = null; }),
+      h('div', { class: 'row' },
+        h('input', { type: 'text', placeholder: 'Name (Lifeguard)', value: f.name, oninput: (e) => (f.name = e.target.value) }),
+        h('input', { type: 'text', placeholder: 'Rate an hour (15.00)', value: f.rate, oninput: (e) => (f.rate = e.target.value), style: 'max-width:180px' }),
+        h('button', { class: 'btn primary', type: 'submit', disabled: S.busy || !f.name.trim() || !f.rate }, 'Add code'))),
+    pc.canAssign && (pc.codes || []).some((c) => c.active) && h('div', null,
+      h('p', { class: 'small', style: 'margin-top:12px' }, h('b', null, 'Give a code to someone'), ' (their first is their default)'),
+      form(() => orgDo('POST', `/members/${encodeURIComponent(S.grant?.aid || '')}/pay-codes`, { codeId: S.grant?.cid, default: !!S.grant?.def }),
+        h('div', { class: 'row' },
+          h('select', { onchange: (e) => (S.grant = { ...(S.grant || {}), aid: e.target.value }) }, h('option', { value: '' }, 'Person'), members.map((m) => h('option', { value: m.id, selected: S.grant?.aid === m.id }, m.name || m.email || m.id))),
+          h('select', { onchange: (e) => (S.grant = { ...(S.grant || {}), cid: e.target.value }) }, h('option', { value: '' }, 'Code'), pc.codes.filter((c) => c.active).map((c) => h('option', { value: c.id, selected: S.grant?.cid === c.id }, c.name))),
+          h('label', { class: 'check', style: 'margin:0' }, h('input', { type: 'checkbox', checked: !!S.grant?.def, onchange: (e) => (S.grant = { ...(S.grant || {}), def: e.target.checked }) }), 'Default'),
+          h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, 'Give it')))),
+    !pc.hasKey && h('p', { class: 'err' }, 'This server has no org data key, so it can’t keep pay rates.'));
+}
+function rolesPanel() {
+  const r = S.oa.roles;
+  const f = S.roleForm || (S.roleForm = { name: '', abilities: new Set() });
+  const members = (S.oa.members.members || []).filter((m) => m.status !== 'pending');
+  const catalog = r.abilities || [];
+  return h('div', { class: 'panel' },
+    h('h2', { style: 'margin-top:0' }, 'Roles'),
+    h('p', { class: 'muted small' }, 'A role is a list of what someone may do, for the whole organization or chosen departments. Owner, Admin, Manager and Member are there from the start.'),
+    h('ul', { class: 'steps' }, (r.roles || []).map((x) => h('li', null, h('div', { style: 'flex:1' }, h('b', null, x.name), x.template && h('span', { class: 'tag' }, 'Template'),
+      h('div', { class: 'muted small' }, `${x.abilities.length} abilities${x.holders != null ? ` · ${x.holders} people` : ''}`)),
+      !x.template && h('button', { class: 'btn', disabled: S.busy, onclick: async () => { if (await askInPage(`Delete the role ${x.name}?`, 'People who had it keep their other roles.', 'Delete')) orgDo('POST', `/roles/${x.id}/delete`, {}); } }, 'Delete')))),
+    catalog.length > 0 && h('details', null, h('summary', null, 'Make a role'),
+      form(() => orgDo('POST', '/roles', { name: f.name, abilities: [...f.abilities] }).then(() => { S.roleForm = null; }),
+        h('label', { class: 'field' }, 'Name', h('input', { type: 'text', value: f.name, oninput: (e) => (f.name = e.target.value) })),
+        h('div', { class: 'cards' }, catalog.map((a) => h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: f.abilities.has(a.id), onchange: (e) => { if (e.target.checked) f.abilities.add(a.id); else f.abilities.delete(a.id); } }), a.label || a.id))),
+        h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, 'Make it'))),
+    h('details', null, h('summary', null, 'Give a role'),
+      form(() => orgDo('POST', `/members/${encodeURIComponent(S.ra?.aid || '')}/roles`, { roleId: S.ra?.rid, scope: 'org' }),
+        h('div', { class: 'row' },
+          h('select', { onchange: (e) => (S.ra = { ...(S.ra || {}), aid: e.target.value }) }, h('option', { value: '' }, 'Person'), members.map((m) => h('option', { value: m.id }, m.name || m.email || m.id))),
+          h('select', { onchange: (e) => (S.ra = { ...(S.ra || {}), rid: e.target.value }) }, h('option', { value: '' }, 'Role'), (r.roles || []).map((x) => h('option', { value: x.id }, x.name))),
+          h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, 'Give it')))));
+}
+function orgAdmin() {
+  if (!S.cl || !S.cl.org || !['owner', 'admin'].includes(S.cl.org.role)) return null;
+  if (!S.oa) { loadOrgAdmin(); return h('div', { class: 'panel' }, h('p', { class: 'muted small' }, 'Loading the organization…')); }
+  if (S.oa.error) return h('div', { class: 'err' }, S.oa.error);
+  return [h('h2', { style: 'margin-top:22px' }, S.cl.org.name), S.oaError && h('div', { class: 'err' }, S.oaError), payCodesPanel(), rolesPanel(), peoplePanel()];
+}
+function loadPeople() {
+  if (S.peopleLoading) return;
+  S.peopleLoading = true;
+  call(k.orgPeople).then((v) => { S.people = v; S.peopleLoading = false; render(); }).catch(() => { S.peopleLoading = false; });
+}
+function peoplePanel() {
+  if (!S.people) { loadPeople(); return null; }
+  const waiting = S.people.flatMap((o) => o.pending.map((m) => ({ org: o.org, m })));
+  if (!waiting.length) return null;
+  return h('div', { class: 'panel' }, h('p', null, h('b', null, 'Asking to join')),
+    h('ul', { class: 'steps' }, waiting.map(({ org: o, m }) => h('li', null, h('div', { style: 'flex:1' }, h('b', null, m.name || m.email), h('div', { class: 'muted small' }, `${m.email || ''} · ${o.name}`)),
+      h('button', { class: 'btn primary', disabled: S.busy, onclick: async () => { try { await call(k.orgApprove, { id: o.id, accountId: m.id, approve: true }); S.people = null; render(); } catch (e) { fail(e); } } }, 'Let in'),
+      h('button', { class: 'btn', disabled: S.busy, onclick: async () => { try { await call(k.orgApprove, { id: o.id, accountId: m.id, approve: false }); S.people = null; render(); } catch (e) { fail(e); } } }, 'Decline')))));
+}
+
+// ---------- the home screen, after setup ----------
+function accountPanel() {
+  const a = S.acctStatus || {};
+  if (!a.signedIn) return h('div', { class: 'panel' }, h('p', null, h('b', null, 'Sign in with your Kea account')), accountForm(async () => { await load(); }));
+  return h('div', { class: 'panel' },
+    h('p', null, h('b', null, (S.acct && S.acct.email) || ''), a.reachable === false ? h('span', { class: 'muted small' }, '  (the Kea account server can’t be reached right now; KeaS keeps working)') : null),
+    h('button', { class: 'btn', onclick: async () => { try { S.acctStatus = await call(k.accountLogout); S.acct = null; await load(); } catch (e) { fail(e); } } }, 'Sign out'));
+}
+function home() {
+  const c = S.config;
+  return [
+    h('h1', null, (S.cl && S.cl.org && S.cl.org.name) || 'KeaS'),
+    checklistPanel(),
+    h('div', { class: 'panel' },
+      h('p', null, h('span', { class: `dot ${S.running ? 'ok' : 'bad'}`, style: 'display:inline-block;vertical-align:-4px;margin-right:8px' }), S.running ? 'The server is running' : 'Not running'),
+      !S.running && h('div', null,
+        S.lastStartError ? h('p', { class: 'err' }, `It didn’t start: ${S.lastStartError}`) : null,
+        h('div', { class: 'row' }, h('button', { class: 'btn primary', disabled: S.busy, onclick: async () => { S.busy = true; render(); try { await call(k.start); } catch {} S.busy = false; await load().catch(fail); } }, 'Start it'),
+          h('button', { class: 'btn', onclick: () => call(k.openLog).catch(fail) }, 'Open log'))),
+      c.publicUrl ? h('p', null, 'Public address: ', h('span', { class: 'url' }, c.publicUrl), ' ',
+        h('button', { class: 'btn', disabled: S.busy, onclick: async () => {
+          if (!(await askInPage('Turn off public access?', 'Nobody outside this computer can reach the server until you make it reachable again here.', 'Turn it off'))) return;
+          try { S.busy = true; render(); await call(k.tsFunnelOff); await load(); } catch (e) { fail(e); } finally { S.busy = false; render(); }
+        } }, 'Turn off public access'))
+        : h('p', null, h('span', { class: 'muted' }, 'Only reachable on this computer. '), h('button', { class: 'btn', onclick: () => { S.reach = 'tailscale'; S.tsChecked = false; S.ts = {}; S.log = []; S.publicUrl = null; go('reachSettings'); } }, 'Make it reachable from anywhere…')),
+      h('p', null, 'Data: ', h('span', { class: 'url' }, c.dataDir), ' ', h('button', { class: 'btn', onclick: () => k.openFolder({ dir: c.dataDir }) }, 'Open folder')),
+      S.server && S.server.keac && h('p', { class: 'muted small' }, `Kea account server: ${S.server.keac.url || 'not set'}${S.server.keac.keysError ? ` (last check: ${S.server.keac.keysError})` : ''}. Server id ${S.server.serverId}.`),
+      h('button', { class: 'btn', onclick: () => { S.bs = null; S.bo = null; S.bootScript = null; S.bootResult = null; go('settings'); } }, 'Startup and power…')),
+    S.folderProblem && h('div', { class: 'err' }, S.folderProblem),
+    S.folderWarning && h('div', { class: 'err' }, S.folderWarning),
+    orgAdmin(),
+    h('h2', { style: 'margin-top:22px' }, 'Your Kea account'),
+    accountPanel(),
+    h('h2', { id: 'payroll', style: 'margin-top:22px' }, 'Payroll'),
+    payrollPanel(),
+    updatePanel(),
+    S.error && h('div', { class: 'err' }, S.error),
+    h('p', { class: 'muted small' }, 'Closing this window keeps the server running in the tray. Quit from the tray icon to stop it.'),
+  ];
+}
+
+function loadChecklist() {
+  if (S.clLoading) return;
+  S.clLoading = true;
+  call(k.checklist).then((v) => { S.cl = v; S.clLoading = false; if (['home', 'legacy'].includes(S.step) && !S.busy && !typingNow()) render(); }).catch(() => { S.clLoading = false; });
+}
+const typingNow = () => !!document.activeElement && ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName);
+window.addEventListener('focus', () => { if (S.step === 'home') { loadChecklist(); S.people = null; } });
+setInterval(() => { if (S.step === 'home' && !document.hidden && S.cl && !S.cl.allSet) loadChecklist(); }, 30_000);
+async function stepAction(s) {
+  switch (s.action) {
+    case 'status': case 'welcome': return go(s.action === 'welcome' ? 'welcome' : 'home');
+    case 'startServer': S.busy = true; render(); try { await call(k.start); } catch {} S.busy = false; await load(); return loadChecklist();
+    case 'reach': S.reach = 'tailscale'; S.tsChecked = false; S.ts = {}; S.log = []; S.publicUrl = null; return go('reachSettings');
+    case 'settings': S.bs = null; S.bo = null; S.bootScript = null; S.bootResult = null; return go('settings');
+    case 'update': { const u = S.update || {}; if (await askInPage(`Restart KeaS now to install ${u.version || 'the update'}?`, '', 'Restart and update')) call(k.installUpdate).catch(fail); return; }
+    case 'keac': return go('keac');
+    case 'signin': return go('account');
+    case 'claim': case 'serverSignIn': return go('claim');
+    case 'org': S.orgList = false; return go('org');
+    case 'orgEdit': S.placeForm = null; return go('place');
+    case 'payCodes': return document.getElementById('paycodes')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    case 'move': return go('legacy');
+    case 'payroll': return openPay();
+    default: return loadChecklist();
+  }
+}
+const ACTION_WORDS = { status: 'Open', welcome: 'Pick it', startServer: 'Start it', reach: 'Set it up', settings: 'Set it up', update: 'Restart and update', keac: 'Check its key', signin: 'Sign in', claim: 'Set it up', serverSignIn: 'Sign in', payroll: 'Open Payroll', org: 'Create it', orgEdit: 'Add it', payCodes: 'Show pay codes', move: 'Open' };
+function checklistPanel() {
+  const cl = S.cl;
+  if (!cl) { loadChecklist(); return h('div', { class: 'panel' }, h('p', { class: 'muted small' }, 'Checking what’s left to set up…')); }
+  if (cl.allSet && !S.clShow)
+    return h('p', { class: 'ok small' }, h('span', { class: 'dot ok', style: 'display:inline-block;vertical-align:-5px;margin-right:8px' }),
+      cl.waiting ? 'All set. Tax tables are waiting for a KeaS update. ' : 'All set. ',
+      h('button', { class: 'btn', onclick: () => { S.clShow = true; render(); } }, 'Show setup steps'));
+  return h('div', { class: 'panel' },
+    h('div', { class: 'row', style: 'justify-content:space-between' },
+      h('h2', { style: 'margin:0' }, cl.allSet ? 'Setup steps' : `Get set up: ${cl.left} step${cl.left === 1 ? '' : 's'} left`),
+      h('div', { class: 'row' },
+        h('button', { class: 'btn', disabled: S.clLoading, onclick: () => loadChecklist() }, S.clLoading ? 'Checking…' : 'Check again'),
+        cl.allSet && h('button', { class: 'btn', onclick: () => { S.clShow = false; render(); } }, 'Hide'))),
+    h('ul', { class: 'steps', style: 'margin-top:12px' }, cl.steps.map((s) => h('li', null,
+      h('span', { class: `dot ${s.done ? 'ok' : s.waiting ? 'run-static' : ''}` }),
+      h('div', { style: 'flex:1' }, h('b', null, s.title), s.optional && h('span', { class: 'tag' }, 'Optional'), s.waiting && h('span', { class: 'tag' }, 'Waiting for an update'), h('div', { class: 'muted small' }, s.text)),
+      !s.done && s.action && s.action !== 'recheck' && h('button', { class: 'btn primary', disabled: S.busy, onclick: () => stepAction(s) }, ACTION_WORDS[s.action] || 'Do this'),
+      !s.done && s.action === 'recheck' && h('button', { class: 'btn', disabled: S.clLoading, onclick: () => loadChecklist() }, 'Check again')))));
+}
+
+const VIEWS = { welcome, keac, account, claim, org, place, reach, reachSettings: reach, done, home, settings, legacy };
+const TITLES = { home: 'KeaS', legacy: 'KeaS · Kea Hub', settings: 'KeaS · Startup and power', reachSettings: 'KeaS · Reachable from anywhere' };
+function render() {
+  renderProgress();
+  document.title = TITLES[S.step] || 'KeaS · Set up';
+  app.replaceChildren(...[VIEWS[S.step] ? VIEWS[S.step]() : home()].flat(2).filter((x) => x != null && x !== false && x !== ''));
+}
+async function load() {
+  const st = await call(k.state);
+  S.config = st.config; S.defaults = st.defaults || {}; S.folderProblem = st.folderProblem || null; S.folderWarning = st.folderWarning || S.folderWarning || null;
+  S.running = !!st.running; S.lastStartError = st.lastStartError || null; S.hubExternal = !!st.external;
+  S.version = st.version; S.legacy = !!st.legacy; S.legacyMessage = st.legacyMessage; S.server = st.server; S.setupCode = st.setupCode; S.google = !!st.google;
+  S.startWithWindows = !!st.startWithWindows;
+  if (st.account) S.acct = st.account;
+  S.update = await call(k.updateState).catch(() => null);
+  document.getElementById('theme').value = st.config.theme || 'system';
+  applyTheme(st.config.theme || 'system');
+  S.acctStatus = S.legacy ? null : await call(k.accountStatus).catch(() => S.acctStatus || null);
+  if (S.acctStatus && S.acctStatus.account) S.acct = S.acctStatus.account;
+  if (!S.resumed || ['home', 'legacy'].includes(st.view) || S.legacy) {
+    S.resumed = true;
+    if (!STEPS.includes(S.step) || S.legacy || st.view === 'home' || st.view === 'legacy') S.step = st.view;
+    if (st.resume && !st.config.setupDone && !S.legacy && !S.dataDirSet) { S.dataDir = st.resume.dataDir; S.reach = st.resume.reach; S.dataDirSet = true; }
+    if (st.resume && st.resume.needsServer && !S.running && !S.legacy) { try { await call(k.start); S.running = true; } catch (e) { S.step = 'welcome'; S.error = `The server didn’t start: ${e.message}`; } }
+  }
+  if (S.step === 'welcome') S.drives = await call(k.drives).catch(() => []);
+  render();
+  if (S.step === 'home') loadChecklist();
+}
+function applyTheme(t) {
+  if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+  else delete document.documentElement.dataset.theme;
+}
+document.getElementById('theme').addEventListener('change', (e) => { applyTheme(e.target.value); k.setTheme({ theme: e.target.value }); });
+k.onUpdate((u) => { S.update = u; if (S.step === 'home' || S.step === 'legacy') render(); });
+k.onProgress((line) => { S.log.push(line); if (S.step === 'reach' || S.step === 'reachSettings') render(); });
+k.onNavigate((nav) => {
+  const view = typeof nav === 'string' ? nav : nav && nav.view;
+  if (view === 'settings') { if (!S.config.setupDone || S.busy) return; S.bs = null; S.bo = null; S.bootScript = null; S.bootResult = null; go('settings'); }
+  else if (view === 'payroll') {
+    S.pay = null; S.payError = ''; S.busy = false;
+    if (nav.locked) { S.payLocked = nav.locked; S.payForm = null; S.payData = null; }
+    if (nav.open && nav.open.need) { S.payForm = nav.open; S.payData = {}; }
+    S.step = S.legacy ? 'legacy' : 'home';
+    render();
+  } else if (view === 'payrollClosed') { S.pay = null; if (S.step === 'home' && !S.busy && !typingNow()) render(); loadChecklist(); }
+  else if (view === 'account' && !S.busy) go('account');
+});
+load().catch(fail);
+setInterval(async () => {
+  if (S.step !== 'home' || document.hidden || S.busy) return;
+  try {
+    const st = await call(k.state);
+    if (!!st.running !== S.running || (st.lastStartError || null) !== S.lastStartError || st.config.publicUrl !== S.config.publicUrl) {
+      S.running = !!st.running; S.lastStartError = st.lastStartError || null; S.config = st.config;
+      if (!typingNow()) render();
+    }
+  } catch {}
+}, 15_000);
+
 const TS_STEPS = [
   ['install', 'Install Tailscale', 'Free. Windows asks once for permission.'],
-  ['login', 'Sign in to Tailscale', 'Your browser opens. Any Google, Microsoft or GitHub account works.'],
+  ['login', 'Sign in to Tailscale', 'Your browser opens. Any Google, Microsoft or Gitserver account works.'],
   ['funnel', 'Turn on Funnel', 'Gives this computer a public https address. The first time, Tailscale asks you to allow it in the browser.'],
 ];
 function tsDone(id) {
@@ -107,9 +530,9 @@ function tsDone(id) {
 async function setUpTailscale() {
   S.busy = true; S.error = ''; S.log = []; render();
   try {
-    // (From the Hub's status page later: only the reachability changes; the Hub restarts to match.)
+    // (From the server's status page later: only the reachability changes; the server restarts to match.)
     if (S.step === 'reachSettings') await call(k.reachSet, { reach: 'tailscale' });
-    else await call(k.saveSetup, { role: S.role, dataDir: S.dataDir, storageDir: S.storageDir, quotaGb: S.quotaGb, reach: 'tailscale' });
+    else await call(k.saveSetup, { reach: 'tailscale' });
     await call(k.start);
     S.running = 'install'; render();
     if (!(await call(k.tsStatus)).installed) await call(k.tsInstall);
@@ -133,8 +556,8 @@ function reach() {
   const allDone = S.reach === 'local' || TS_STEPS.every(([id]) => tsDone(id));
   if (later)
     return [
-      h('h1', null, 'Make the Hub reachable from anywhere'),
-      h('p', { class: 'muted' }, 'So people can sign in to Kea from their own homes and phones. KeaS installs and sets up Tailscale Funnel: your home address stays hidden and no router settings change. The Hub restarts for a moment.'),
+      h('h1', null, 'Make the server reachable from anywhere'),
+      h('p', { class: 'muted' }, 'So your people can clock in and see their schedules from their phones, anywhere. KeaS installs and sets up Tailscale Funnel: your address stays hidden and no router settings change. The server restarts for a moment.'),
       h('div', { class: 'panel' },
         h('ul', { class: 'steps' }, TS_STEPS.map(([id, title, text]) =>
           h('li', null, h('span', { class: `dot ${tsDone(id) ? 'ok' : S.running === id ? 'run' : ''}` }), h('div', null, h('b', null, title), h('div', { class: 'muted small' }, text))))),
@@ -148,10 +571,10 @@ function reach() {
   return [
     h('h1', null, 'Make it reachable from anywhere'),
     S.folderWarning && h('div', { class: 'err' }, S.folderWarning),
-    h('p', { class: 'muted' }, S.role === 'hub' ? 'So people can sign in to Kea from their own homes and phones.' : 'So your staff can clock in and see schedules from their phones.'),
+    h('p', { class: 'muted' }, 'So your people can clock in and see their schedules from their phones.'),
     h('div', { class: 'cards' },
       opt('tailscale', 'Anywhere, free (Tailscale Funnel)', 'KeaS installs and sets it up. Your home address stays hidden and no router settings change.', 'Recommended'),
-      opt('local', 'Only this computer for now', 'Nobody else can reach it. You can make it reachable later from the Hub’s status page.')),
+      opt('local', 'Only this computer for now', 'Nobody else can reach it. You can make it reachable later from the home screen.')),
     S.reach === 'tailscale' && h('div', { class: 'panel' },
       h('ul', { class: 'steps' }, TS_STEPS.map(([id, title, text]) =>
         h('li', null, h('span', { class: `dot ${tsDone(id) ? 'ok' : S.running === id ? 'run' : ''}` }), h('div', null, h('b', null, title), h('div', { class: 'muted small' }, text))))),
@@ -164,177 +587,13 @@ function reach() {
       h('button', { class: 'btn primary', disabled: S.busy || !allDone, onclick: async () => {
         S.busy = true; render();
         try {
-          if (S.reach === 'local') { await call(k.saveSetup, { role: S.role, dataDir: S.dataDir, storageDir: S.storageDir, quotaGb: S.quotaGb, reach: 'local' }); await call(k.start); }
+          if (S.reach === 'local') { await call(k.saveSetup, { reach: 'local' }); await call(k.start); }
           S.busy = false; next();
         } catch (e) { fail(e); }
       } }, 'Next')),
   ];
 }
 
-/**
- * A QR code of the two-step key (the otpauth:// address the Hub gave), drawn right here: nothing is sent anywhere.
- * (vendor/qrcode-generator-1.4.4.js, MIT, by Kazuhiko Arase.)
- */
-function qrImage(uri) {
-  if (!uri || typeof window.qrcode !== 'function') return null;
-  try {
-    const q = window.qrcode(0, 'M');
-    q.addData(uri);
-    q.make();
-    return h('img', { class: 'qr', alt: 'QR code for your authenticator app', src: q.createDataURL(6, 2) });
-  } catch { return null; }
-}
-function sectionBody(body) {
-  const out = []; let list = null;
-  for (const line of body.split('\n')) {
-    if (line.startsWith('- ')) { if (!list) { list = h('ul'); out.push(list); } list.append(h('li', null, line.slice(2))); }
-    else { list = null; if (line.trim()) out.push(h('p', null, line)); }
-  }
-  return out;
-}
-/** The two-step code box, with "Use a backup code" for someone without their phone. get/set: the value. */
-function codeInput(get, set, { label = 'Code from your authenticator app', autofocus = false } = {}) {
-  const backup = !!S.useBackup;
-  return [
-    h('label', { class: 'field' }, backup ? 'Backup code' : label,
-      h('input', { type: 'text', inputmode: backup ? 'text' : 'numeric', autocomplete: backup ? 'off' : 'one-time-code', maxlength: backup ? '11' : '6', placeholder: backup ? 'XXXXX-XXXXX' : '', value: get() || '', autofocus, oninput: (e) => set(e.target.value) })),
-    h('p', { class: 'small' }, h('button', { class: 'btn', type: 'button', onclick: () => { S.useBackup = !backup; set(''); render(); } }, backup ? 'Use the code from my app' : 'Use a backup code')),
-  ];
-}
-/** New backup codes, shown once: Copy, Save as text, and "I saved these" before going on. */
-function codesScreen({ title, intro, onDone }) {
-  const codes = S.backupCodes || [];
-  return [
-    h('h1', null, title),
-    h('p', { class: 'muted' }, intro),
-    h('div', { class: 'panel' }, h('ol', { class: 'codes' }, codes.map((c) => h('li', null, h('code', null, c))))),
-    h('div', { class: 'row' },
-      h('button', { class: 'btn', type: 'button', onclick: async (e) => {
-        try { await navigator.clipboard.writeText(codes.join('\n')); e.target.textContent = 'Copied'; } catch { e.target.textContent = 'Select the codes to copy them'; }
-      } }, 'Copy'),
-      h('button', { class: 'btn', type: 'button', onclick: async (e) => {
-        try { if (await call(k.saveCodes)) e.target.textContent = 'Saved'; } catch (err) { fail(err); }
-      } }, 'Save as text…')),
-    h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !!S.codesSaved, onchange: (e) => {
-      S.codesSaved = e.target.checked;
-      const b = document.getElementById('codesNext'); if (b) b.disabled = !S.codesSaved;
-    } }), 'I saved these'),
-    S.error && h('div', { class: 'err' }, S.error),
-    h('div', { class: 'actions' }, h('button', { class: 'btn primary', id: 'codesNext', disabled: !S.codesSaved, onclick: async () => {
-      await call(k.codesDone).catch(() => {});
-      S.backupCodes = null; S.codesSaved = false; S.error = '';
-      onDone();
-    } }, 'Continue')),
-  ];
-}
-const CODES_INTRO = 'If you lose your phone, each of these signs you in once instead of the code from your authenticator app. They’re shown only now. Keep them somewhere safe, away from this PC.';
-/** New backup codes for the signed-in account, from the account panel. */
-function codesView() {
-  if (!S.backupCodes) return [h('p', { class: 'muted' }, 'No new backup codes.'), h('button', { class: 'btn', onclick: () => go(S.hub ? 'status' : 'home') }, 'Back')];
-  return codesScreen({ title: 'Your new backup codes', intro: `${CODES_INTRO} Your old ones don’t work any more.`, onDone: () => { refreshAccount(); go(S.hub ? 'status' : 'home'); } });
-}
-function owner() {
-  if (S.backupCodes) return codesScreen({ title: 'Save your backup codes', intro: CODES_INTRO, onDone: () => { S.ownerState = undefined; next(); } });
-  // Where the owner step stands (an owner made before a restart, maybe with two-step sign-in already on).
-  if (S.ownerState === undefined) {
-    S.ownerState = null;
-    call(k.ownerState).then((o) => { S.ownerState = o; render(); }).catch(() => {});
-  }
-  const o = S.ownerState;
-  if (o && o.exists && o.owner && o.totp)
-    return [
-      h('h1', null, 'Your owner account'),
-      h('div', { class: 'panel' },
-        h('p', null, h('span', { class: 'dot ok', style: 'display:inline-block;vertical-align:-4px;margin-right:8px' }), h('b', null, o.email), ' is the owner of this Hub.'),
-        h('p', { class: 'muted small' }, 'Two-step sign-in is on. Nothing more to do here.')),
-      h('div', { class: 'actions' },
-        h('button', { class: 'btn', onclick: back }, 'Back'),
-        h('button', { class: 'btn primary', onclick: next }, 'Next')),
-    ];
-  if (!S.terms) { call(k.terms).then((t) => { S.terms = t.terms; render(); }).catch(fail); return [h('p', { class: 'muted' }, 'Getting the terms…')]; }
-  if (S.totp && !S.totpDone)
-    return [
-      h('h1', null, 'Turn on two-step sign-in'),
-      h('p', { class: 'muted' }, 'The owner account controls the whole Hub, so it always needs a code from an authenticator app (Google Authenticator, Microsoft Authenticator, 1Password…). In the app, scan this code, or add an account by entering the key:'),
-      qrImage(S.totp.uri),
-      h('div', { class: 'row' },
-        h('div', { class: 'secret' }, S.totp.secret.replace(/(.{4})/g, '$1 ').trim()),
-        h('button', { class: 'btn', type: 'button', onclick: async (e) => {
-          try { await navigator.clipboard.writeText(S.totp.secret); e.target.textContent = 'Copied'; } catch { e.target.textContent = 'Select the key to copy it'; }
-        } }, 'Copy key')),
-      h('p', { class: 'muted small', style: 'margin-top:8px' }, `Account: ${S.owner.email} · Issuer: Kea · Time-based`),
-      form(async () => {
-        // (Read before re-rendering: render() rebuilds the inputs.)
-        const code = S.code || '';
-        S.busy = true; render();
-        try {
-          await call(k.ownerTotp, { code });
-          S.totpDone = true; S.busy = false;
-          // (The Hub made backup codes: shown once before going on. A Hub without them goes straight on.)
-          const codes = await call(k.ownerBackupCodes).catch(() => []);
-          if (codes && codes.length) { S.backupCodes = codes; S.codesSaved = false; render(); }
-          else { S.ownerState = undefined; next(); }
-        } catch (e) { fail(e); }
-      },
-      h('label', { class: 'field' }, 'The 6-digit code it shows', h('input', { type: 'text', id: 'code', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: '6', value: S.code || '', oninput: (e) => (S.code = e.target.value) })),
-      S.error && h('div', { class: 'err' }, S.error),
-      h('div', { class: 'actions' },
-        // (Back to the account form: signing in again there gives a new key, so nothing is ever stuck.)
-        h('button', { class: 'btn', type: 'button', disabled: S.busy, onclick: () => { S.totp = null; S.code = ''; S.error = ''; render(); } }, 'Back'),
-        h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, 'Turn it on'))),
-    ];
-  const all = S.terms.sections.every((s) => S.agreed.has(s.id));
-  const f = S.form || (S.form = { name: '', email: (o && o.email) || '', password: '', code: '' });
-  return [
-    h('h1', null, 'Your owner account'),
-    h('p', { class: 'muted' }, 'This is your own Kea account, the same one you sign in to Kea with, made the owner of this Hub. If you already have one on this Hub, use the same email and password.'),
-    h('label', { class: 'field' }, 'Name', h('input', { type: 'text', value: f.name, oninput: (e) => (f.name = e.target.value) })),
-    h('label', { class: 'field' }, 'Email', h('input', { type: 'email', value: f.email, oninput: (e) => (f.email = e.target.value) })),
-    h('label', { class: 'field' }, 'Password (10+ characters; a few random words works well)', h('input', { type: 'password', value: f.password, oninput: (e) => (f.password = e.target.value) })),
-    // This account already has two-step sign-in on (the Hub asked for a code).
-    S.needCode && h('div', null, codeInput(() => f.code, (v) => (f.code = v), { label: 'Two-step code from your authenticator app' })),
-    h('h2', { style: 'margin-top:18px' }, `${S.terms.title} · version ${S.terms.version}`),
-    h('p', { class: 'muted small' }, 'Like every Kea account, yours agrees to each section. You can change these terms later; everyone then agrees again, seeing only what changed.'),
-    // (You wrote these terms: one box agrees to all of them. Everyone else ticks each section.)
-    h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: all, onchange: (e) => {
-      for (const s of S.terms.sections) { if (e.target.checked) S.agreed.add(s.id); else S.agreed.delete(s.id); }
-      render();
-    } }), h('b', null, 'I agree to all sections')),
-    termsBox(S.terms.sections, S.agreed, 'agreeCreate'),
-    S.error && h('div', { class: 'err' }, S.error),
-    h('div', { class: 'actions' },
-      h('button', { class: 'btn', disabled: S.busy, onclick: back }, 'Back'),
-      h('button', { class: 'btn primary', id: 'agreeCreate', disabled: S.busy || !all, onclick: async () => {
-        const why = !f.name.trim() ? 'Enter your name.' : !f.email.trim() ? 'Enter your email.' : f.password.length < 10 ? 'The password needs 10 or more characters.' : '';
-        if (why) { S.error = why; render(); return; }
-        S.busy = true; render();
-        try {
-          const r = await call(k.ownerCreate, { name: f.name, email: f.email, password: f.password, code: S.needCode ? f.code : undefined, termsVersion: S.terms.version, termsSections: S.terms.sections.map((s) => s.id) });
-          S.owner = r; S.totp = r.totp; S.busy = false; S.needCode = false; f.code = '';
-          if (!r.totp) { S.totpDone = true; S.ownerState = undefined; next(); } else render();
-        } catch (e) {
-          if (e.data && e.data.totpRequired) { S.needCode = true; f.code = ''; }
-          fail(e);
-        }
-      } }, 'Agree and create')),
-  ];
-}
-
-// ---------- start before sign-in, and power (a setup step, and the settings page later) ----------
-const BOOT_ADV = [
-  ['neverSleepAC', 'Never sleep on AC power', 'Sleep stops the Hub. On battery, Windows still sleeps as usual.'],
-  ['neverHibernateAC', 'Never hibernate on AC power', ''],
-  ['wakeTimersAC', 'Allow wake timers on AC power', 'Lets Windows wake the PC for scheduled tasks and updates.'],
-  ['disksNeverOffAC', 'Keep drives from turning off on AC power', 'A drive that has spun down makes the first request after a quiet spell slow.'],
-  ['runOnBattery', 'Keep the Hub running on battery', 'For a laptop or a PC on a battery backup (UPS).'],
-  ['restartOnFailure', 'Restart the Hub if it stops with an error', ''],
-];
-const BOOT_NUM = [
-  ['delaySeconds', 'Wait after Windows starts (seconds)', 0, 3600, 'So the network and Tailscale are up first.'],
-  ['restartCount', 'Restart tries', 1, 999, ''],
-  ['restartMinutes', 'Minutes between restart tries', 1, 1440, ''],
-];
-const POWER_NAMES = { standby: 'Sleep after', hibernate: 'Hibernate after', wake: 'Wake timers', disk: 'Turn off drives after' };
 function powerValue(key, v) {
   if (v == null) return 'unknown';
   if (key === 'wake') return ['Off', 'On', 'Important ones only'][v] ?? String(v);
@@ -374,11 +633,11 @@ function bootForm() {
   const p = S.bs.power?.values || {};
   const prev = S.bs.saved?.powerApplied ? S.bs.saved.previous?.values : null;
   return [
-    box('bootStart', 'Start the Kea Hub when Windows starts, before anyone signs in', 'Recommended for the PC the Hub lives on.'),
-    box('power', 'Keep this PC awake on AC power', 'So the Hub doesn’t go to sleep at night.'),
+    box('bootStart', 'Start the KeaS server when Windows starts, before anyone signs in', 'Recommended: people clock in through it.'),
+    box('power', 'Keep this PC awake on AC power', 'So the server doesn’t go to sleep at night.'),
     h('details', { open: !!S.bootAdv, ontoggle: (e) => (S.bootAdv = e.target.open) }, h('summary', null, 'Advanced'),
-      h('p', { class: 'muted small' }, `The Hub runs as a Scheduled Task (${S.bs.taskName}) under your Windows account, with normal rights, whether or not you’re signed in. It doesn’t store your Windows password, so it can’t reach network drives: keep the Hub’s data on a drive inside this PC.`),
-      h('p', { class: 'muted small' }, `What the task runs is kept in ${S.bs.serviceDir}, which only Administrators and you can change. The Hub’s data folder can only be opened by you, Administrators and Windows itself.`),
+      h('p', { class: 'muted small' }, `The server runs as a Scheduled Task (${S.bs.taskName}) under your Windows account, with normal rights, whether or not you’re signed in. It doesn’t store your Windows password, so it can’t reach network drives: keep the server’s data on a drive inside this PC.`),
+      h('p', { class: 'muted small' }, `What the task runs is kept in ${S.bs.serviceDir}, which only Administrators and you can change. The server’s data folder can only be opened by you, Administrators and Windows itself.`),
       BOOT_ADV.map(([key, label, hint]) => box(key, label, hint, (key === 'runOnBattery' || key === 'restartOnFailure' ? !o.bootStart : !o.power))),
       BOOT_NUM.map(([key, label, min, max, hint]) => h('label', { class: 'field' }, label,
         h('input', { type: 'number', min: String(min), max: String(max), value: String(o[key]), disabled: !o.bootStart || S.busy, oninput: (e) => (o[key] = Number(e.target.value)) }),
@@ -394,58 +653,27 @@ function bootForm() {
       h('p', { class: 'muted small' }, S.bs.note)),
     h('p', { class: 'small' }, h('span', { class: `dot ${t.installed ? 'ok' : ''}`, style: 'display:inline-block;vertical-align:-4px;margin-right:8px' }),
       t.installed ? `Starts before sign-in: on${t.state ? ` (task ${t.state.toLowerCase()}${t.lastResult ? `, last result ${t.lastResult}` : ''})` : ''}.` : 'Starts before sign-in: off.',
-      S.bs.external ? ' The Hub running now was started before sign-in.' : ''),
+      S.bs.external ? ' The server running now was started before sign-in.' : ''),
     S.bootResult && h('ul', { class: 'small' }, S.bootResult.steps.map((s) => h('li', { class: s.ok ? 'ok' : 'err' }, `${s.step}: ${s.ok ? 'done' : s.error}`))),
   ].filter(Boolean);
-}
-function boot() {
-  if (!S.bs) { loadBoot().catch(fail); return [h('p', { class: 'muted' }, 'Checking this PC’s settings…')]; }
-  const nothing = !S.bo.bootStart && !S.bo.power;
-  return [
-    h('h1', null, 'Start before sign-in'),
-    h('p', { class: 'muted' }, 'So the Hub is there for everyone even after Windows restarts for an update, without you signing in, and so the PC doesn’t fall asleep. Windows asks once for permission. You can turn this off any time from the tray icon or the settings page, and the power settings go back to how they were.'),
-    ...bootForm(),
-    S.error && h('div', { class: 'err' }, S.error),
-    h('div', { class: 'actions' },
-      h('button', { class: 'btn', disabled: S.busy, onclick: back }, 'Back'),
-      h('button', { class: 'btn', disabled: S.busy, onclick: next }, 'Skip'),
-      h('button', { class: 'btn primary', disabled: S.busy || nothing, onclick: () => applyBoot({ after: next }) }, S.busy ? 'Setting up…' : 'Set it up')),
-  ];
 }
 function settings() {
   if (!S.bs) { loadBoot().catch(fail); return [h('p', { class: 'muted' }, 'Checking this PC’s settings…')]; }
   const on = S.bs.saved?.installed || S.bs.saved?.powerApplied || S.bs.task?.installed;
   return [
     h('h1', null, 'Startup and power'),
-    h('p', { class: 'muted' }, 'Start the Kea Hub before anyone signs in, and keep this PC awake for it. Saving asks Windows for permission once.'),
+    h('p', { class: 'muted' }, 'Start the KeaS server before anyone signs in, and keep this PC awake for it. Saving asks Windows for permission once.'),
     S.bs.needsUpdate && h('div', { class: 'err' }, 'Starting before sign-in needs to be set up again: it was set up by an earlier version of KeaS, or the permissions on its folder changed. Click Save to move it to a protected folder.'),
     S.bs.folderProblem && h('div', { class: 'err' }, S.bs.folderProblem),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !!S.startWithWindows, disabled: S.busy, onchange: async (e) => {
       try { S.startWithWindows = await call(k.setStartWithWindows, { on: e.target.checked }); render(); } catch (err) { fail(err); }
-    } }), h('span', null, 'Start KeaS when I sign in to Windows', h('span', { class: 'muted small' }, ' It waits in the tray and runs the Hub. Changes right away; no permission needed.'))),
+    } }), h('span', null, 'Start KeaS when I sign in to Windows', h('span', { class: 'muted small' }, ' It waits in the tray and runs the server. Changes right away; no permission needed.'))),
     ...bootForm(),
     S.error && h('div', { class: 'err' }, S.error),
     h('div', { class: 'actions' },
-      h('button', { class: 'btn', disabled: S.busy, onclick: () => load().catch(fail) }, 'Back'),
+      h('button', { class: 'btn', disabled: S.busy, onclick: () => { S.step = 'home'; load().catch(fail); } }, 'Back'),
       on && h('button', { class: 'btn', disabled: S.busy, onclick: () => removeBoot() }, 'Turn it all off'),
       h('button', { class: 'btn primary', disabled: S.busy || (!S.bo.bootStart && !S.bo.power), onclick: () => applyBoot() }, S.busy ? 'Saving…' : 'Save')),
-  ];
-}
-
-function done() {
-  const url = S.publicUrl || S.config.publicUrl || null;
-  return [
-    h('h1', null, 'All set'),
-    h('div', { class: 'panel' },
-      h('p', null, h('b', null, S.role === 'hub' ? 'The Kea Hub is running.' : 'Your organization’s server is running.')),
-      url ? h('p', null, 'Public address: ', h('span', { class: 'url' }, url)) : h('p', { class: 'muted' }, 'Only reachable on this computer.'),
-      h('p', null, 'Data: ', h('span', { class: 'url' }, S.dataDir), ' ', h('button', { class: 'btn', onclick: () => k.openFolder({ dir: S.dataDir }) }, 'Open folder')),
-      S.role === 'hub' && h('p', { class: 'muted small' }, 'Kea on this computer now signs in to this Hub.')),
-    h('label', { class: 'check' }, h('input', { type: 'checkbox', id: 'boot', checked: S.boot !== false, onchange: (e) => (S.boot = e.target.checked) }), 'Start KeaS when Windows starts (it waits in the tray and keeps the server running)'),
-    S.error && h('div', { class: 'err' }, S.error),
-    h('div', { class: 'actions' }, h('button', { class: 'btn primary', onclick: async () => {
-      try { await call(k.finish, { startWithWindows: S.boot !== false, theme: document.getElementById('theme').value }); await load(); } catch (e) { fail(e); }
-    } }, 'Finish')),
   ];
 }
 
@@ -492,8 +720,8 @@ function updatePanel() {
     h('p', null, h('b', null, 'Updates'), h('span', { class: 'muted small' }, `  KeaS ${S.version || ''}`)),
     line && h('p', { class: u.status === 'error' ? 'err' : 'muted small' }, line),
     u.status === 'ready' && h('p', { class: 'muted small' }, S.hubExternal
-      ? 'KeaS restarts to install it, and starts the Hub again by itself. The installer stops the Hub that started before sign-in too, so KeaS runs the Hub itself until Windows next starts, when the start-up task runs the new version. The Hub is offline for about a minute.'
-      : 'KeaS restarts to install it and starts the Hub again by itself; the Hub is offline for about a minute.'),
+      ? 'KeaS restarts to install it, and starts the server again by itself. The installer stops the server that started before sign-in too, so KeaS runs the server itself until Windows next starts, when the start-up task runs the new version. The server is offline for about a minute.'
+      : 'KeaS restarts to install it and starts the server again by itself; the server is offline for about a minute.'),
     u.status === 'ready' && n.on && h('p', { class: 'muted small' }, 'Not while Payroll is open or in use: then it waits for the next night.'),
     h('div', { class: 'row' },
       u.status === 'ready'
@@ -515,53 +743,6 @@ function updatePanel() {
         h('label', null, ' to ', h('select', { onchange: (e) => setNightly({ to: Number(e.target.value) }) }, ...hourOptions(n.to))))));
 }
 
-function status() {
-  const c = S.config;
-  return [
-    h('h1', null, c.role === 'hub' ? 'Kea Hub' : 'KeaS server'),
-    checklistPanel(),
-    h('div', { class: 'panel' },
-      h('p', null, h('span', { class: `dot ${S.running ? 'ok' : 'bad'}`, style: 'display:inline-block;vertical-align:-4px;margin-right:8px' }), S.running ? 'Running' : 'Not running'),
-      // Why it didn't start, and what to do about it.
-      !S.running && h('div', null,
-        S.lastStartError ? h('p', { class: 'err' }, `It didn’t start: ${S.lastStartError}`) : h('p', { class: 'muted small' }, 'Start it here. If it doesn’t start, the log says why.'),
-        h('div', { class: 'row' },
-          h('button', { class: 'btn primary', disabled: S.busy, onclick: async () => {
-            S.busy = true; S.error = ''; render();
-            try { await call(k.start); } catch {}
-            S.busy = false; await load().catch(fail);
-          } }, S.busy ? 'Starting…' : S.lastStartError ? 'Try again' : 'Start the Hub'),
-          h('button', { class: 'btn', onclick: () => call(k.openLog).catch(fail) }, 'Open log'))),
-      c.publicUrl ? h('p', null, 'Public address: ', h('span', { class: 'url' }, c.publicUrl), ' ',
-        h('button', { class: 'btn', disabled: S.busy, onclick: async () => {
-          if (!(await askInPage('Turn off public access?', 'Nobody outside this computer can reach the Hub until you make it reachable again here.', 'Turn it off'))) return;
-          try { S.busy = true; render(); await call(k.tsFunnelOff); await load(); } catch (e) { fail(e); } finally { S.busy = false; render(); }
-        } }, 'Turn off public access'))
-        : h('p', null, h('span', { class: 'muted' }, 'Only reachable on this computer. '),
-          c.role === 'hub' && h('button', { class: 'btn', disabled: S.busy, onclick: () => { S.reach = 'tailscale'; S.tsChecked = false; S.ts = {}; S.log = []; S.publicUrl = null; go('reachSettings'); } }, 'Make it reachable from anywhere…')),
-      h('p', null, 'Data: ', h('span', { class: 'url' }, c.dataDir), ' ', h('button', { class: 'btn', onclick: () => k.openFolder({ dir: c.dataDir }) }, 'Open folder')),
-      c.role === 'hub' && h('p', { class: 'muted small' }, `Each account gets ${c.quotaGb || 5} GB of Kea storage. Owner: ${c.ownerEmail || 'not set'}.`)),
-    c.role === 'hub' && h('div', { class: 'panel' },
-      h('p', null, h('b', null, 'Startup and power')),
-      h('p', { class: 'muted small' }, c.boot?.installed ? 'The Hub starts when Windows starts, before anyone signs in.' : S.startWithWindows ? 'The Hub starts when you sign in to Windows (KeaS starts then).' : 'The Hub runs while KeaS is open. KeaS doesn’t start with Windows.',
-        c.boot?.powerApplied ? ' This PC stays awake on AC power.' : '', S.hubExternal ? ' The Hub running now was started before sign-in.' : ''),
-      h('button', { class: 'btn', onclick: () => { S.bs = null; S.bo = null; S.bootScript = null; S.bootResult = null; go('settings'); } }, 'Change…')),
-    c.role === 'hub' && c.publicUrl && h('p', null, h('button', { class: 'btn', onclick: () => k.openExternal({ url: `${c.publicUrl}/terms` }) }, 'Open the terms page')),
-    c.role === 'hub' && c.boot?.installed && (c.boot.layout !== 2 || c.boot.repair) && h('div', { class: 'err' }, 'Starting the Hub before sign-in needs to be set up again, so what it runs is kept in a protected folder. ', h('button', { class: 'btn', onclick: () => { S.bs = null; S.bo = null; S.bootScript = null; S.bootResult = null; go('settings'); } }, 'Set it up again')),
-    S.folderProblem && h('div', { class: 'err' }, S.folderProblem),
-    S.folderWarning && h('div', { class: 'err' }, S.folderWarning),
-    updatePanel(),
-    h('h2', { style: 'margin-top:22px' }, 'Your Kea account'),
-    accountPanel(),
-    c.role === 'hub' && ownerVerifyPanel(),
-    peoplePanel(),
-    h('h2', { style: 'margin-top:22px' }, 'Payroll'),
-    payrollPanel(),
-    S.error && h('div', { class: 'err' }, S.error),
-    h('p', { class: 'muted small' }, 'Closing this window keeps the server running in the tray. Quit from the tray icon to stop it.'),
-  ];
-}
-
 // ---------- Payroll: opened with the signed-in Kea account; the passphrase asked once per run ----------
 const US_STATES = ['AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'DC', 'FL', 'GA', 'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD', 'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ', 'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC', 'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY'];
 const TIME_ZONES = ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Phoenix', 'America/Los_Angeles', 'America/Anchorage', 'Pacific/Honolulu'];
@@ -581,7 +762,7 @@ async function openPay() {
     if (!r.opened) document.getElementById('payroll')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) {
     S.busy = false;
-    if (e.data && e.data.need === 'signin') { go('signin'); return; }
+    if (e.data && e.data.need === 'signin') { go('account'); return; }
     S.payError = e.message; render();
   }
 }
@@ -590,9 +771,9 @@ function payOpened() { S.payForm = null; S.payData = null; S.payLocked = null; S
 function payrollPanel() {
   const p = S.pay;
   if (!p) { loadPayroll(); return h('div', { class: 'panel' }, h('p', { class: 'muted small' }, 'Loading…')); }
-  const intro = h('p', null, 'Pay runs, tax forms and HR records for your organization. Payroll runs only on this computer: SSNs and bank details are encrypted with a passphrase you choose and never go to the Hub.');
+  const intro = h('p', null, 'Pay runs, tax forms and HR records for your organization. Payroll runs only on this computer: SSNs and bank details are encrypted with a passphrase you choose and never leave this computer.');
   if (!p.signedIn)
-    return h('div', { class: 'panel' }, intro, h('p', null, h('button', { class: 'btn primary', onclick: () => go('signin') }, 'Sign in to use Payroll')));
+    return h('div', { class: 'panel' }, intro, h('p', null, h('button', { class: 'btn primary', onclick: () => go('account') }, 'Sign in to use Payroll')));
   const f = S.payForm;
   const d = S.payData || (S.payData = {});
   const field = (label, key, type = 'text', extra = {}) => h('label', { class: 'field' }, label, h('input', { type, value: d[key] || '', oninput: (e) => (d[key] = e.target.value), ...extra }));
@@ -621,16 +802,16 @@ function payrollPanel() {
     ];
   } else if (f.need === 'setup') {
     const zone = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { return 'America/Denver'; } })();
-    // (Starts from the organization on the Kea Hub, when there is one.)
+    // (Starts from the organization on the KeaS server, when there is one.)
     const o = S.cl && S.cl.org;
     if (o && d.orgName === undefined) { d.orgName = o.name; d.state = d.state || o.state || ''; if (o.tz) d.tz = o.tz; }
     if (!d.tz) d.tz = zone;
     const zones = TIME_ZONES.includes(d.tz) ? TIME_ZONES : [d.tz, ...TIME_ZONES];
     const a = S.acct || {};
     const tables = (p.taxStates || []);
-    const confirmKey = !f.ownHub && f.fingerprint;
+    const confirmKey = !f.ownserver && f.fingerprint;
     body = form(async () => {
-      const why = !(d.orgName || '').trim() ? 'Enter the organization’s name.' : !d.state ? 'Pick the state.' : (d.passphrase || '').length < 12 ? 'The passphrase needs 12 or more characters.' : d.passphrase !== d.passphrase2 ? 'The two passphrases don’t match.' : confirmKey && !d.keyOk ? 'Compare the Kea Hub’s key fingerprint first.' : '';
+      const why = !(d.orgName || '').trim() ? 'Enter the organization’s name.' : !d.state ? 'Pick the state.' : (d.passphrase || '').length < 12 ? 'The passphrase needs 12 or more characters.' : d.passphrase !== d.passphrase2 ? 'The two passphrases don’t match.' : confirmKey && !d.keyOk ? 'Compare the KeaS server’s key fingerprint first.' : '';
       if (why) { S.payError = why; render(); return; }
       S.busy = true; S.payError = ''; render();
       try {
@@ -651,8 +832,8 @@ function payrollPanel() {
     field('Vault passphrase again', 'passphrase2', 'password', { autocomplete: 'new-password' }),
     h('p', { class: 'muted small' }, 'It encrypts SSNs, bank details and documents. It can’t be recovered if it’s lost, so keep it somewhere safe. KeaS asks for it once each time you start KeaS.'),
     confirmKey && h('div', { class: 'panel' },
-      h('p', { class: 'small' }, 'Kea Hub key fingerprint: ', h('code', null, f.fingerprint)),
-      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !!d.keyOk, onchange: (e) => { d.keyOk = e.target.checked; render(); } }), 'It matches the one shown on the Hub’s PC (KeaS there: Payroll, Advanced)')),
+      h('p', { class: 'small' }, 'KeaS server key fingerprint: ', h('code', null, f.fingerprint)),
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !!d.keyOk, onchange: (e) => { d.keyOk = e.target.checked; render(); } }), 'It matches the one shown on this PC (KeaS there: Payroll, Advanced)')),
     h('details', null, h('summary', null, 'Advanced'),
       field('First day of a pay period', 'anchor', 'date'),
       h('p', { class: 'muted small' }, 'Biweekly periods count from this day. Empty: this week’s Sunday.'),
@@ -685,369 +866,46 @@ function payrollPanel() {
 }
 
 // Payroll settings only this app can change (the payroll page can't): the local password fallback, and accepting the
-// Kea Hub's signing key after the Hub was moved or reinstalled.
+// KeaS server's signing key after the server was moved or reinstalled.
 function payrollAdvanced() {
   return h('details', { open: !!S.payAdv, ontoggle: (e) => { S.payAdv = e.target.open; if (S.payAdv && !S.ps) call(k.payrollSettings).then((v) => { S.ps = v; render(); }).catch(fail); } }, h('summary', null, 'Advanced'),
     !S.ps ? h('p', { class: 'muted small' }, 'Loading…') : [
-      h('p', { class: 'muted small' }, `Payroll admins sign in with their Kea Hub account at ${S.ps.hubUrl || '(no Kea Hub set)'}, plus the vault passphrase.`),
+      h('p', { class: 'muted small' }, `Payroll admins sign in with their Kea account at ${S.ps.hubUrl || '(no KeaS server set)'}, plus the vault passphrase.`),
       h('label', { class: 'check' },
         h('input', { type: 'checkbox', checked: S.ps.localSignIn, onchange: async (e) => { try { S.ps = await call(k.payrollLocalSignIn, { on: e.target.checked }); render(); } catch (err) { fail(err); } } }),
-        h('span', null, 'Allow a local password while the Kea Hub can’t be reached',
-          h('span', { class: 'muted small' }, ' Each payroll admin can then set a long local password (16 or more characters) in Payroll. It only works while the Hub can’t be reached, still needs the vault passphrase, and skips the Hub’s two-step sign-in, so leave it off unless you need it. Off by default.'))),
+        h('span', null, 'Allow a local password while the KeaS server can’t be reached',
+          h('span', { class: 'muted small' }, ' Each payroll admin can then set a long local password (16 or more characters) in Payroll. It only works while the server can’t be reached, still needs the vault passphrase, and skips the server’s two-step sign-in, so leave it off unless you need it. Off by default.'))),
       S.ps.exportsDir && h('p', { class: 'muted small' }, `Files Payroll saves (tax form data, bank files, reports) go to ${S.ps.exportsDir}, a folder only your Windows account can open. `,
         h('button', { class: 'btn', onclick: () => call(k.payrollOpenExports).catch(fail) }, 'Open Exports folder')),
       S.ps.folderProblem && h('p', { class: 'err' }, `The payroll folder’s permissions: ${S.ps.folderProblem}`),
-      S.ps.ownHubFingerprint && h('p', { class: 'small' }, 'This Hub’s key fingerprint (payroll on another PC asks you to compare it): ', h('code', {}, S.ps.ownHubFingerprint)),
-      h('p', { class: 'muted small' }, 'Payroll trusts the Kea Hub’s signing key from when it was set up. If the Hub’s key changes, sign-in is refused until you check the new key here and accept it. Only do this for your own Hub.'),
-      h('p', null, h('button', { class: 'btn', onclick: async () => { try { S.hubKey = await call(k.payrollHubKey); S.error = ''; S.repinned = ''; render(); } catch (err) { fail(err); } } }, 'Check the Kea Hub’s key')),
+      S.ps.ownHubFingerprint && h('p', { class: 'small' }, 'This server’s key fingerprint (payroll on another PC asks you to compare it): ', h('code', {}, S.ps.ownHubFingerprint)),
+      h('p', { class: 'muted small' }, 'Payroll trusts the KeaS server’s signing key from when it was set up. If the server’s key changes, sign-in is refused until you check the new key here and accept it. Only do this for your own server.'),
+      h('p', null, h('button', { class: 'btn', onclick: async () => { try { S.hubKey = await call(k.payrollHubKey); S.error = ''; S.repinned = ''; render(); } catch (err) { fail(err); } } }, 'Check the KeaS server’s key')),
       S.hubKey && hubKeyPanel(S.hubKey),
       S.repinned && h('p', { class: 'small ok' }, S.repinned),
     ]);
 }
-/** The Hub's current key next to the trusted one: the owner compares fingerprints, reads why it might change, then confirms. */
+/** The server's current key next to the trusted one: the owner compares fingerprints, reads why it might change, then confirms. */
 function hubKeyPanel(s) {
   const fp = (t) => h('code', { style: 'font-size:12px;word-break:break-all' }, t || '—');
-  if (!s.changed && s.pinned) return h('p', { class: 'small ok' }, 'The Kea Hub’s key is the one payroll trusts. Nothing to do. Fingerprint: ', fp(s.current.fingerprint));
+  if (!s.changed && s.pinned) return h('p', { class: 'small ok' }, 'The KeaS server’s key is the one payroll trusts. Nothing to do. Fingerprint: ', fp(s.current.fingerprint));
   return h('div', { class: 'panel' },
-    h('p', null, h('b', null, s.pinned ? 'The Kea Hub is offering a different key from the one payroll trusts.' : 'Payroll doesn’t trust a Kea Hub key yet.')),
+    h('p', null, h('b', null, s.pinned ? 'The KeaS server is offering a different key from the one payroll trusts.' : 'Payroll doesn’t trust a KeaS server key yet.')),
     h('p', { class: 'small' }, 'New key: ', fp(s.current.fingerprint)),
     s.pinned && h('p', { class: 'small' }, `Trusted since ${new Date(s.pinned.at).toLocaleString()}: `, fp(s.pinned.fingerprint)),
-    s.localHub && h('p', { class: s.localHub.matches ? 'small ok' : 'err' }, s.localHub.matches ? 'It matches this PC’s own Kea Hub key file.' : 'It does NOT match this PC’s own Kea Hub key file. Don’t accept it.'),
-    h('p', { class: 'small' }, 'A Hub’s key changes when:'),
+    s.localserver && h('p', { class: s.localHub.matches ? 'small ok' : 'err' }, s.localHub.matches ? 'It matches this PC’s own KeaS server key file.' : 'It does NOT match this PC’s own KeaS server key file. Don’t accept it.'),
+    h('p', { class: 'small' }, 'A server’s key changes when:'),
     h('ul', { class: 'small' }, ...s.reasons.map((r) => h('li', null, r))),
-    h('p', { class: 'small' }, s.warning, ' Compare the new key with the fingerprint shown on the Hub’s PC before accepting it.'),
+    h('p', { class: 'small' }, s.warning, ' Compare the new key with the fingerprint shown on this PC before accepting it.'),
     h('p', null, h('button', { class: 'btn', onclick: async () => {
-      if (!window.confirm(`Accept the Kea Hub key ${s.current.fingerprint}?\n\nOnly if you know why it changed and it matches your Hub.`)) return;
-      try { const r = await call(k.payrollRepinHub, { fingerprint: s.current.fingerprint }); S.error = ''; S.hubKey = null; S.repinned = `Accepted the Kea Hub’s key ${r.fingerprint}.`; render(); } catch (err) { fail(err); }
+      if (!window.confirm(`Accept the KeaS server key ${s.current.fingerprint}?\n\nOnly if you know why it changed and it matches your Hub.`)) return;
+      try { const r = await call(k.payrollRepinHub, { fingerprint: s.current.fingerprint }); S.error = ''; S.hubKey = null; S.repinned = `Accepted the KeaS server’s key ${r.fingerprint}.`; render(); } catch (err) { fail(err); }
     } }, 'Accept this key')));
 }
 
-// ---------- the Kea account: sign in or create one (everyone), then the home screen ----------
 /** A form: Enter submits it (the page never navigates). */
 function form(onsubmit, ...kids) {
   return h('form', { onsubmit: (e) => { e.preventDefault(); onsubmit(); } }, ...kids);
-}
-/**
- * The terms, one section at a time, each ticked. Ticking only changes that section and the button (no re-render),
- * so the box stays where it was scrolled to.
- */
-function termsBox(sections, agreed, buttonId) {
-  const sync = () => { const b = document.getElementById(buttonId); if (b) b.disabled = S.busy || !sections.every((s) => agreed.has(s.id)) || (b.dataset.extra === 'off'); };
-  return h('div', { class: 'terms' }, sections.map((s) => {
-    const box = h('div', { class: `term ${agreed.has(s.id) ? 'agreed' : ''}` }, h('h3', null, s.title), sectionBody(s.body));
-    box.append(h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: agreed.has(s.id), onchange: (e) => {
-      if (e.target.checked) agreed.add(s.id); else agreed.delete(s.id);
-      box.classList.toggle('agreed', e.target.checked);
-      sync();
-    } }), 'I agree to this section'));
-    return box;
-  }));
-}
-/** Advanced: the Hub address (shown openly while the Hub can't be reached: a wrong address is the usual reason). */
-function hubAddress() {
-  const a = S.acctStatus || {};
-  const v = S.hubUrlInput ?? (a.custom ? a.url : '');
-  return h('details', { open: !!S.hubAdv || a.reachable === false, ontoggle: (e) => (S.hubAdv = e.target.open) }, h('summary', null, 'Advanced'),
-    a.reachable === false && h('p', { class: 'err' }, `Can’t reach the Kea Hub at ${a.url}.`),
-    form(async () => {
-      S.busy = true; S.error = ''; render();
-      try { S.acctStatus = await call(k.accountSetUrl, { url: S.hubUrlInput ?? '' }); S.hubUrlInput = null; S.busy = false; render(); } catch (e) { fail(e); }
-    },
-    h('label', { class: 'field' }, 'Hub address', h('div', { class: 'row' },
-      h('input', { type: 'text', value: v, placeholder: a.defaultUrl || 'http://127.0.0.1:4860', oninput: (e) => (S.hubUrlInput = e.target.value) }),
-      h('button', { class: 'btn', type: 'submit', disabled: S.busy }, 'Use this address'))),
-    h('p', { class: 'muted small' }, `Empty: the standard address (${a.defaultUrl || 'http://127.0.0.1:4860'}). It must start with https://, except for a Hub on this computer.`)));
-}
-function signedInNow(st) {
-  S.acctStatus = st; S.acct = st.account; S.busy = false; S.sf = null; S.cf = null; S.signStep = null; S.error = ''; S.signupAgreed = null; S.useBackup = false; S.op = null;
-  // (load() picks the screen: home, or the Hub's status on the Hub's PC.)
-  load().catch(fail);
-}
-function signin() {
-  const f = S.sf || (S.sf = { email: '', password: '', code: '' });
-  const send = async () => {
-    S.busy = true; S.error = ''; render();
-    try { signedInNow(await call(k.accountLogin, { email: f.email, password: f.password, code: S.signStep === 'code' ? f.code : undefined })); }
-    catch (e) {
-      if (e.data && e.data.totpRequired && S.signStep !== 'code') { S.signStep = 'code'; S.busy = false; S.error = ''; render(); return; }
-      f.code = '';
-      fail(e);
-    }
-  };
-  if (S.signStep === 'code')
-    return [
-      h('h1', null, 'Two-step sign-in'),
-      h('p', { class: 'muted' }, S.useBackup ? `Enter one of your backup codes for ${f.email}. Each one works once.` : `Enter the 6-digit code from your authenticator app for ${f.email}.`),
-      form(send,
-        codeInput(() => f.code, (v) => (f.code = v), { label: 'Code', autofocus: true }),
-        S.error && h('div', { class: 'err' }, S.error),
-        h('div', { class: 'actions' },
-          h('button', { class: 'btn', type: 'button', disabled: S.busy, onclick: () => { S.signStep = null; f.code = ''; S.error = ''; render(); } }, 'Back'),
-          h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, S.busy ? 'Signing in…' : 'Sign in'))),
-    ];
-  return [
-    h('h1', null, 'Sign in to Kea'),
-    h('p', { class: 'muted' }, 'Use your Kea account, the same one you use in the Kea app.'),
-    form(send,
-      h('label', { class: 'field' }, 'Email', h('input', { type: 'email', autocomplete: 'username', value: f.email, oninput: (e) => (f.email = e.target.value) })),
-      h('label', { class: 'field' }, 'Password', h('input', { type: 'password', autocomplete: 'current-password', value: f.password, oninput: (e) => (f.password = e.target.value) })),
-      S.error && h('div', { class: 'err' }, S.error),
-      h('div', { class: 'actions' },
-        S.hub && S.config.setupDone && h('button', { class: 'btn', type: 'button', onclick: () => go('status') }, 'Back'),
-        h('button', { class: 'btn', type: 'button', disabled: S.busy, onclick: () => { S.error = ''; S.step = 'signup'; render(); } }, 'Create an account'),
-        h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, S.busy ? 'Signing in…' : 'Sign in'))),
-    h('p', { class: 'muted small' }, 'Forgot your password? Reset it in the Kea app (Kea account, Forgot password).'),
-    hubAddress(),
-  ];
-}
-function signup() {
-  const f = S.cf || (S.cf = { name: '', email: '', password: '', age13: false, part: 'details' });
-  if (f.part === 'terms') {
-    if (!S.acctTerms) { call(k.accountTerms).then((t) => { S.acctTerms = t.terms; render(); }).catch((e) => { f.part = 'details'; fail(e); }); return [h('p', { class: 'muted' }, 'Getting the terms…')]; }
-    const t = S.acctTerms;
-    const agreed = S.signupAgreed || (S.signupAgreed = new Set());
-    return [
-      h('h1', null, 'The Kea terms'),
-      h('p', { class: 'muted' }, `${t.title} · version ${t.version}. Read each section and tick it.`),
-      termsBox(t.sections, agreed, 'create'),
-      S.error && h('div', { class: 'err' }, S.error),
-      h('div', { class: 'actions' },
-        h('button', { class: 'btn', disabled: S.busy, onclick: () => { f.part = 'details'; S.error = ''; render(); } }, 'Back'),
-        h('button', { class: 'btn primary', id: 'create', disabled: S.busy || !t.sections.every((s) => agreed.has(s.id)), onclick: async () => {
-          S.busy = true; S.error = ''; render();
-          try { signedInNow(await call(k.accountRegister, { name: f.name, email: f.email, password: f.password, age13: f.age13, termsVersion: t.version, termsSections: t.sections.map((s) => s.id) })); }
-          catch (e) {
-            if (e.data && e.data.termsVersion) { S.acctTerms = null; S.signupAgreed = null; }
-            if ((e.data && e.data.field) || e.status === 409) f.part = 'details';
-            if (e.data && e.data.exists) { S.step = 'signin'; S.sf = { email: f.email, password: '', code: '' }; }
-            fail(e);
-          }
-        } }, S.busy ? 'Creating…' : 'Agree and create my account')),
-    ];
-  }
-  const ok = f.name.trim() && f.email.trim() && f.password.length >= 10 && f.age13;
-  return [
-    h('h1', null, 'Create a Kea account'),
-    h('p', { class: 'muted' }, 'One account for Kea and KeaS.'),
-    form(() => {
-      // (Checked now, not when the screen was drawn: the fields change without redrawing it.)
-      const why = !f.name.trim() ? 'Enter your name.' : !f.email.trim() ? 'Enter your email.' : f.password.length < 10 ? 'The password needs 10 or more characters.' : !f.age13 ? 'Kea accounts are for people 13 and older.' : '';
-      S.error = why;
-      if (!why) f.part = 'terms';
-      render();
-    },
-      h('label', { class: 'field' }, 'Name', h('input', { type: 'text', placeholder: 'What people see', value: f.name, oninput: (e) => { f.name = e.target.value; syncNext(); } })),
-      h('label', { class: 'field' }, 'Email', h('input', { type: 'email', autocomplete: 'username', value: f.email, oninput: (e) => { f.email = e.target.value; syncNext(); } })),
-      h('label', { class: 'field' }, 'Password (10+ characters; a few random words works well)', h('input', { type: 'password', autocomplete: 'new-password', value: f.password, oninput: (e) => { f.password = e.target.value; syncNext(); } })),
-      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: f.age13, onchange: (e) => { f.age13 = e.target.checked; syncNext(); } }), 'I’m 13 or older'),
-      S.error && h('div', { class: 'err' }, S.error),
-      h('div', { class: 'actions' },
-        h('button', { class: 'btn', type: 'button', onclick: () => { S.error = ''; S.step = 'signin'; render(); } }, 'I have an account'),
-        h('button', { class: 'btn primary', type: 'submit', id: 'next', disabled: !ok }, 'Next: the terms'))),
-    hubAddress(),
-  ];
-  function syncNext() { const b = document.getElementById('next'); if (b) b.disabled = !(f.name.trim() && f.email.trim() && f.password.length >= 10 && f.age13); }
-}
-/** New terms to agree to (the Hub changed them since this account last agreed). */
-function termsAccept() {
-  if (!S.acctTerms) { call(k.accountTerms).then((t) => { S.acctTerms = t.terms; render(); }).catch(fail); return [h('p', { class: 'muted' }, 'Getting the terms…')]; }
-  const t = S.acctTerms;
-  const agreed = S.acceptAgreed || (S.acceptAgreed = new Set());
-  return [
-    h('h1', null, 'The Kea terms changed'),
-    h('p', { class: 'muted' }, `${t.title} · version ${t.version}. Read each section and tick it to keep using your Kea account.`),
-    termsBox(t.sections, agreed, 'accept'),
-    S.error && h('div', { class: 'err' }, S.error),
-    h('div', { class: 'actions' },
-      h('button', { class: 'btn', onclick: () => go(S.hub ? 'status' : 'home') }, 'Not now'),
-      h('button', { class: 'btn primary', id: 'accept', disabled: S.busy || !t.sections.every((s) => agreed.has(s.id)), onclick: async () => {
-        S.busy = true; render();
-        try { S.acctStatus = await call(k.accountAcceptTerms, { termsVersion: t.version, termsSections: t.sections.map((s) => s.id) }); S.acctTerms = null; S.acceptAgreed = null; S.busy = false; go(S.hub ? 'status' : 'home'); } catch (e) { fail(e); }
-      } }, 'Agree')),
-  ];
-}
-/** Who KeaS is signed in as (the home screen, and the Hub's status screen). */
-function accountPanel() {
-  const st = S.acctStatus;
-  const a = (st && st.account) || S.acct;
-  if (!a || (st && !st.signedIn))
-    return h('div', { class: 'panel' },
-      h('p', null, h('b', null, 'Your Kea account')),
-      h('p', { class: 'muted small' }, 'Sign in to use Payroll with your Kea account.'),
-      h('button', { class: 'btn primary', onclick: () => { S.error = ''; go('signin'); } }, 'Sign in'));
-  const needsTerms = a.terms && a.terms.needsAgreement;
-  return h('div', { class: 'panel' },
-    h('p', null, h('b', null, a.name || a.email), a.name ? h('span', { class: 'muted' }, `  ${a.email}`) : null),
-    h('p', { class: 'muted small' }, `Kea Hub: ${(st && st.url) || a.hub || ''}`, st && st.reachable === false ? ' · can’t be reached right now' : '', a.totpEnabled ? ' · two-step sign-in on' : ''),
-    needsTerms && h('p', { class: 'err' }, 'The Kea terms changed. ', h('button', { class: 'btn', onclick: () => { S.acctTerms = null; go('termsAccept'); } }, 'Read and agree')),
-    a.totpEnabled && backupCodesPart(a),
-    h('button', { class: 'btn', disabled: S.busy, onclick: async () => {
-      if (!(await askInPage('Sign out of your Kea account on this PC?', S.payrollOpen ? 'Payroll locks too.' : ''))) return;
-      try { S.acctStatus = await call(k.accountLogout); S.acct = null; go(S.hub ? 'status' : 'signin'); } catch (e) { fail(e); }
-    } }, 'Sign out'));
-}
-/** Two-step backup codes: how many are left, and making new ones (the password and a code from the app). */
-function backupCodesPart(a) {
-  const left = a.backupCodesLeft;
-  const f = S.bcForm;
-  if (!f)
-    return h('p', { class: 'muted small' }, left == null ? 'Backup codes: ' : `Backup codes: ${left} left. `,
-      h('button', { class: 'btn', onclick: () => { S.bcForm = { password: '', code: '' }; S.bcError = ''; render(); } }, left === 0 ? 'Make backup codes' : 'New backup codes'));
-  return form(async () => {
-    S.busy = true; S.bcError = ''; render();
-    try {
-      S.backupCodes = await call(k.accountBackupCodes, { password: f.password, code: f.code });
-      S.codesSaved = false; S.bcForm = null; S.busy = false; go('codes');
-    } catch (e) { S.busy = false; f.code = ''; S.bcError = e.message; render(); }
-  },
-  h('p', { class: 'small' }, 'New backup codes. The old ones stop working.'),
-  h('label', { class: 'field' }, 'Kea password', h('input', { type: 'password', autocomplete: 'current-password', value: f.password, oninput: (e) => (f.password = e.target.value) })),
-  h('label', { class: 'field' }, 'Code from your authenticator app', h('input', { type: 'text', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: '6', value: f.code, oninput: (e) => (f.code = e.target.value) })),
-  S.bcError && h('div', { class: 'err' }, S.bcError),
-  h('div', { class: 'actions' },
-    h('button', { class: 'btn', type: 'button', disabled: S.busy, onclick: () => { S.bcForm = null; S.bcError = ''; render(); } }, 'Cancel'),
-    h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, 'Make new codes')));
-}
-// ---------- People asking to join (an unverified email always asks), and verifying emails ----------
-function loadPeople() {
-  if (S.opLoading) return;
-  S.opLoading = true;
-  call(k.orgPeople).then((v) => { S.op = v; S.opLoading = false; if (['home', 'status'].includes(S.step) && !S.busy && !typingNow()) render(); })
-    .catch((e) => { S.opLoading = false; S.op = { error: e.message }; });
-}
-async function personAction(fn, arg, done) {
-  S.busy = true; S.opError = ''; S.opOk = ''; render();
-  try { await call(fn, arg); S.opOk = done; } catch (e) { S.opError = e.message; }
-  S.busy = false; S.op = null; loadPeople(); render();
-}
-function peoplePanel() {
-  const st = S.acctStatus;
-  if (!st || !st.signedIn) return null;
-  if (!S.op) { loadPeople(); return null; }
-  if (S.op.error || !S.op.some((g) => g.pending.length || g.unverified.length)) return S.opOk ? h('p', { class: 'ok small' }, S.opOk) : null;
-  const who = (m) => h('div', { style: 'flex:1' }, h('b', null, m.name), !m.emailVerified && h('span', { class: 'tag' }, 'Email not verified'), h('div', { class: 'muted small' }, m.email || ''));
-  const verifyBtn = (g, m) => !m.emailVerified && h('button', { class: 'btn', disabled: S.busy, onclick: async () => {
-    if (!(await askInPage(`Verify ${m.email || m.name}?`, 'Only if you know this email address really is theirs. It counts everywhere on the Kea Hub, payroll too.', 'Verify'))) return;
-    personAction(k.orgVerifyEmail, { id: g.org.id, accountId: m.id }, `${m.name}’s email is verified.`);
-  } }, 'Verify email');
-  return h('div', null,
-    h('h2', { style: 'margin-top:22px' }, 'People'),
-    S.op.map((g) => (g.pending.length || g.unverified.length) && h('div', { class: 'panel' },
-      h('p', null, h('b', null, g.org.name)),
-      g.pending.length > 0 && h('p', { class: 'small' }, h('b', null, 'Asking to join. '), h('span', { class: 'muted' }, 'Someone whose email isn’t verified can still join once you approve it.')),
-      h('ul', { class: 'steps' }, g.pending.map((m) => h('li', null, who(m),
-        verifyBtn(g, m),
-        h('button', { class: 'btn', disabled: S.busy, onclick: () => personAction(k.orgApprove, { id: g.org.id, accountId: m.id, approve: false }, `Declined ${m.name}.`) }, 'Decline'),
-        h('button', { class: 'btn primary', disabled: S.busy, onclick: () => personAction(k.orgApprove, { id: g.org.id, accountId: m.id, approve: true }, `${m.name} is in.`) }, 'Approve')))),
-      g.unverified.length > 0 && h('p', { class: 'small', style: g.pending.length ? 'margin-top:18px' : '' }, h('b', null, 'Email not verified. '), h('span', { class: 'muted' }, 'Payroll needs a verified email.')),
-      h('ul', { class: 'steps' }, g.unverified.map((m) => h('li', null, who(m), verifyBtn(g, m)))))),
-    S.opOk && h('p', { class: 'ok small' }, S.opOk),
-    S.opError && h('div', { class: 'err' }, S.opError));
-}
-/** The Hub's owner, on the Hub's PC: verify any account's email by hand. */
-function ownerVerifyPanel() {
-  const f = S.vf || (S.vf = { email: '' });
-  return h('div', { class: 'panel' },
-    h('p', null, h('b', null, 'Verify someone’s email')),
-    h('p', { class: 'muted small' }, 'For someone who can’t use Verify with Google (an Outlook or school email). Only when you know the address is theirs.'),
-    form(async () => {
-      S.busy = true; S.vfMsg = ''; S.vfErr = ''; render();
-      try { const r = await call(k.ownerVerifyEmail, { email: f.email }); S.vfMsg = `${r.email} is verified.`; f.email = ''; } catch (e) { S.vfErr = e.message; }
-      S.busy = false; render();
-    },
-    h('div', { class: 'row' },
-      h('input', { type: 'email', placeholder: 'Their email', value: f.email, oninput: (e) => (f.email = e.target.value), style: 'max-width:300px' }),
-      h('button', { class: 'btn', type: 'submit', disabled: S.busy }, 'Verify'))),
-    S.vfMsg && h('p', { class: 'ok small' }, S.vfMsg),
-    S.vfErr && h('div', { class: 'err' }, S.vfErr));
-}
-// ---------- Get set up: every step until this person is good to go (desktop/checklist.cjs decides the steps) ----------
-function loadChecklist() {
-  if (S.clLoading) return;
-  S.clLoading = true;
-  call(k.checklist).then((v) => { S.cl = v; S.clLoading = false; if (['home', 'status'].includes(S.step) && !S.busy && !typingNow()) render(); }).catch(() => { S.clLoading = false; });
-}
-const typingNow = () => !!document.activeElement && ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName);
-// (Each step checks itself again when KeaS comes back to the front, and every half minute while the list is open.)
-window.addEventListener('focus', () => { if (['home', 'status'].includes(S.step)) { loadChecklist(); S.op = null; loadPeople(); } });
-setInterval(() => { if (['home', 'status'].includes(S.step) && !document.hidden && S.cl && !S.cl.allSet) loadChecklist(); }, 30_000);
-const STATES = ['AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'DC', 'FL', 'GA', 'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD', 'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ', 'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC', 'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY'];
-/** Where each step's button takes the person. */
-async function stepAction(s) {
-  S.clOpen = s.id;
-  switch (s.action) {
-    case 'status': return go('status');
-    case 'startHub': S.busy = true; render(); try { await call(k.start); } catch {} S.busy = false; await load(); return loadChecklist();
-    case 'reach': S.reach = 'tailscale'; S.tsChecked = false; S.ts = {}; S.log = []; S.publicUrl = null; return go('reachSettings');
-    case 'settings': S.bs = null; S.bo = null; S.bootScript = null; S.bootResult = null; return go('settings');
-    case 'update': { const u = S.update || {}; if (await askInPage(`Restart KeaS now to install ${u.version || 'the update'}?`, '', 'Restart and update')) call(k.installUpdate).catch(fail); return; }
-    case 'signin': return go('signin');
-    case 'termsAccept': S.acctTerms = null; return go('termsAccept');
-    case 'payroll': return openPay();
-    case 'org': case 'orgEdit': S.orgForm = S.orgForm || { name: '', state: '', code: '' }; return render();
-    default: return loadChecklist();
-  }
-}
-/** Create or join the organization, or set where people work (inside its step). */
-function orgForm(s) {
-  const f = S.orgForm;
-  const err = S.orgError && h('div', { class: 'err' }, S.orgError);
-  const done = async (p) => { S.busy = true; S.orgError = ''; render(); try { await p; S.orgForm = null; S.busy = false; loadChecklist(); render(); } catch (e) { S.busy = false; S.orgError = e.message; render(); } };
-  const stateSel = h('select', { onchange: (e) => (f.state = e.target.value) }, h('option', { value: '' }, 'State where people work'), STATES.map((x) => h('option', { value: x, selected: f.state === x }, x)));
-  const tz = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { return 'America/Denver'; } })();
-  if (s.action === 'orgEdit')
-    return form(() => done(call(k.orgUpdate, { id: S.cl.org.id, state: f.state })), h('div', { class: 'row' }, stateSel, h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, 'Save')), err);
-  return h('div', null,
-    form(() => done(call(k.orgCreate, { name: f.name, state: f.state, tz })),
-      h('label', { class: 'field' }, 'Organization name', h('input', { type: 'text', value: f.name, oninput: (e) => (f.name = e.target.value) })),
-      h('div', { class: 'row' }, stateSel, h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, 'Create it'))),
-    h('p', { class: 'muted small' }, 'The Kea Hub’s owner approves new organizations. Or join one with the code someone gave you:'),
-    form(() => done(call(k.orgJoin, { code: f.code })),
-      h('div', { class: 'row' }, h('input', { type: 'text', placeholder: 'Join code', value: f.code, oninput: (e) => (f.code = e.target.value), style: 'max-width:260px' }), h('button', { class: 'btn', type: 'submit', disabled: S.busy }, 'Join'))),
-    err);
-}
-function checklistPanel() {
-  const cl = S.cl;
-  if (!cl) { loadChecklist(); return h('div', { class: 'panel' }, h('p', { class: 'muted small' }, 'Checking what’s left to set up…')); }
-  // All set: one small line, with a way back to the steps.
-  if (cl.allSet && !S.clShow)
-    return h('p', { class: 'ok small' }, h('span', { class: 'dot ok', style: 'display:inline-block;vertical-align:-5px;margin-right:8px' }),
-      cl.waiting ? 'All set. Tax tables are waiting for a KeaS update. ' : 'All set. ',
-      h('button', { class: 'btn', onclick: () => { S.clShow = true; render(); } }, 'Show setup steps'));
-  return h('div', { class: 'panel' },
-    h('div', { class: 'row', style: 'justify-content:space-between' },
-      h('h2', { style: 'margin:0' }, cl.allSet ? 'Setup steps' : `Get set up: ${cl.left} step${cl.left === 1 ? '' : 's'} left`),
-      h('div', { class: 'row' },
-        h('button', { class: 'btn', disabled: S.clLoading, onclick: () => loadChecklist() }, S.clLoading ? 'Checking…' : 'Check again'),
-        cl.allSet && h('button', { class: 'btn', onclick: () => { S.clShow = false; render(); } }, 'Hide'))),
-    h('ul', { class: 'steps', style: 'margin-top:12px' }, cl.steps.map((s) => h('li', null,
-      h('span', { class: `dot ${s.done ? 'ok' : s.waiting ? 'run-static' : ''}` }),
-      h('div', { style: 'flex:1' },
-        h('b', null, s.title), s.optional && h('span', { class: 'tag' }, 'Optional'), s.waiting && h('span', { class: 'tag' }, 'Waiting for an update'),
-        h('div', { class: 'muted small' }, s.text),
-        !s.done && S.orgForm && (s.action === 'org' || s.action === 'orgEdit') && orgForm(s)),
-      !s.done && s.action && s.action !== 'recheck' && !(S.orgForm && (s.action === 'org' || s.action === 'orgEdit')) && h('button', { class: 'btn primary', disabled: S.busy, onclick: () => stepAction(s) }, ACTION_WORDS[s.action] || 'Do this'),
-      !s.done && s.action === 'recheck' && h('button', { class: 'btn', disabled: S.clLoading, onclick: () => loadChecklist() }, 'Check again')))));
-}
-const ACTION_WORDS = { status: 'Open', startHub: 'Start the Hub', reach: 'Set it up', settings: 'Set it up', update: 'Restart and update', signin: 'Sign in', termsAccept: 'Read and agree', payroll: 'Open Payroll', org: 'Create or join', orgEdit: 'Add the state' };
-
-/** The home screen for everyone who isn't running the Hub. */
-function home() {
-  return [
-    h('h1', null, 'KeaS'),
-    checklistPanel(),
-    accountPanel(),
-    peoplePanel(),
-    h('h2', { style: 'margin-top:22px' }, 'Payroll'),
-    payrollPanel(),
-    h('h2', { style: 'margin-top:22px' }, 'Settings'),
-    h('div', { class: 'panel' },
-      h('label', { class: 'check', style: 'margin-top:0' }, h('input', { type: 'checkbox', checked: !!S.startWithWindows, onchange: async (e) => {
-        try { S.startWithWindows = await call(k.setStartWithWindows, { on: e.target.checked }); render(); } catch (err) { fail(err); }
-      } }), h('span', null, 'Start KeaS when I sign in to Windows', h('span', { class: 'muted small' }, ' It waits in the tray. Off unless you turn it on.')))),
-    updatePanel(),
-    S.error && h('div', { class: 'err' }, S.error),
-  ];
 }
 /** A yes/no question inside the page (instead of the browser's own dialog). */
 function askInPage(title, text, yes = 'OK') {
@@ -1061,95 +919,3 @@ function askInPage(title, text, yes = 'OK') {
     dlg.showModal();
   });
 }
-
-const VIEWS = { codes: codesView, welcome, storage, reach, reachSettings: reach, owner, boot, done, status, settings, signin, signup, termsAccept, home };
-const TITLES = { reachSettings: 'KeaS ? Reachable from anywhere', status: 'KeaS · Kea Hub', settings: 'KeaS · Startup and power', signin: 'KeaS · Sign in', signup: 'KeaS · Create an account', termsAccept: 'KeaS · Kea terms', home: 'KeaS', codes: 'KeaS · Backup codes' };
-function render() {
-  renderProgress();
-  document.title = TITLES[S.step] || 'KeaS · Set up the Kea Hub';
-  app.replaceChildren(...VIEWS[S.step]().filter((x) => x != null && x !== false && x !== ''));
-}
-
-async function load() {
-  const st = await call(k.state);
-  S.config = st.config; S.defaults = st.defaults; S.folderProblem = st.folderProblem || null; S.folderWarning = st.folderWarning || S.folderWarning || null;
-  S.running = st.running.hub || st.running.org;
-  S.lastStartError = st.lastStartError || null;
-  S.hubExternal = !!st.running.hubExternal;
-  S.version = st.version;
-  S.update = await call(k.updateState).catch(() => null);
-  document.getElementById('theme').value = st.config.theme || 'system';
-  applyTheme(st.config.theme || 'system');
-  S.hub = !!st.hub;
-  S.startWithWindows = !!st.startWithWindows;
-  if (st.account) S.acct = st.account;
-  if (!S.hub) {
-    // Not the Hub's PC: the Kea account's home, or signing in. (No Hub setup here.)
-    S.step = st.view;
-    S.drives = [];
-    render();
-    refreshAccount();
-    if (S.step === 'home') loadChecklist();
-    return;
-  }
-  if (st.config.setupDone) { S.role = st.config.role; S.step = 'status'; refreshAccount(); loadChecklist(); }
-  else if (!S.resumed && st.resume) {
-    // An unfinished setup: back where it stopped, with what was already chosen.
-    S.resumed = true;
-    const r = st.resume;
-    Object.assign(S, { step: r.step, dataDir: r.dataDir, storageDir: r.storageDir, quotaGb: r.quotaGb, reach: r.reach });
-    if (r.needsHub && !S.running) {
-      try { await call(k.start); S.running = true; } catch (e) { S.step = 'storage'; S.error = `The Hub didn’t start: ${e.message}`; }
-    }
-  }
-  S.drives = await call(k.drives).catch(() => []);
-  render();
-}
-/** What the Hub says about this sign-in now (it may have ended elsewhere, or the terms changed). */
-function refreshAccount() {
-  call(k.accountStatus).then((a) => {
-    S.acctStatus = a;
-    S.acct = a.account || (a.signedIn ? S.acct : null);
-    if (!a.signedIn && S.step === 'home') S.step = 'signin';
-    if (['home', 'status', 'signin'].includes(S.step) && !S.busy) render();
-  }).catch(() => {});
-}
-function applyTheme(t) {
-  if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
-  else delete document.documentElement.dataset.theme;
-}
-document.getElementById('theme').addEventListener('change', (e) => { applyTheme(e.target.value); k.setTheme({ theme: e.target.value }); });
-k.onUpdate((u) => { S.update = u; if (S.step === 'status') render(); });
-k.onProgress((line) => { S.log.push(line); if (S.step === 'reach' || S.step === 'reachSettings') render(); });
-// The tray (and Payroll) can send the window to a screen: Startup and power, the Payroll panel, or sign-in.
-k.onNavigate((nav) => {
-  const view = typeof nav === 'string' ? nav : nav && nav.view;
-  if (view === 'settings') {
-    if (!S.hub || !S.config.setupDone || S.busy) return;
-    S.bs = null; S.bo = null; S.bootScript = null; S.bootResult = null;
-    go('settings');
-  } else if (view === 'payroll') {
-    S.pay = null; S.payError = ''; S.busy = false;
-    if (nav.locked) { S.payLocked = nav.locked; S.payForm = null; S.payData = null; }
-    if (nav.open && nav.open.need) { S.payForm = nav.open; S.payData = {}; }
-    S.step = S.hub && S.config.setupDone ? 'status' : S.acct ? 'home' : 'signin';
-    render();
-  } else if (view === 'payrollClosed') {
-    S.pay = null;
-    if (['home', 'status'].includes(S.step) && !S.busy && !typingNow()) render();
-    loadChecklist();
-  } else if (view === 'signin' && !S.busy) { S.error = ''; go('signin'); }
-});
-load().catch(fail);
-// The Hub's status page stays current by itself (while the window is shown and nothing is being typed or run).
-setInterval(async () => {
-  if (S.step !== 'status' || document.hidden || S.busy) return;
-  try {
-    const st = await call(k.state);
-    const running = st.running.hub || st.running.org;
-    if (running !== S.running || (st.lastStartError || null) !== S.lastStartError || st.config.publicUrl !== S.config.publicUrl) {
-      S.running = running; S.lastStartError = st.lastStartError || null; S.config = st.config; S.hubExternal = !!st.running.hubExternal;
-      if (!document.activeElement || !['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName)) render();
-    }
-  } catch {}
-}, 15_000);

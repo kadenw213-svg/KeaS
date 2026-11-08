@@ -152,7 +152,7 @@ test('M: securing a data folder that was open refuses links and hard links, then
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('M: after an open Hub folder is locked down, its owner key and signing key are replaced (the Hub makes new ones)', async () => {
+test('M: after an open data folder is locked down, its owner key and identity key are replaced (the server makes new ones)', async () => {
   const root = mkdtempSync(join(tmpdir(), 'keas-rotate-'));
   try {
     writeFileSync(join(root, 'owner.key'), 'old-owner-key');
@@ -163,9 +163,9 @@ test('M: after an open Hub folder is locked down, its owner key and signing key 
     assert.ok(existsSync(join(root, 'hub.db')), 'only the keys');
     rmSync(join(root, 'hub.db'));
     const { createHub } = await import('../../hub/index.mjs');
-    const hub = createHub({ dataDir: root, log: false });
+    const hub = createHub({ dataDir: root, log: false, keacStart: false });
     try {
-      assert.ok(existsSync(join(root, 'owner.key')) && existsSync(join(root, 'hub-signing-key.pem')), 'new keys at the next start');
+      assert.ok(existsSync(join(root, 'owner.key')) && existsSync(join(root, 'server-identity.pem')), 'new keys at the next start');
       assert.notEqual(readFileSync(join(root, 'owner.key'), 'utf8').trim(), 'old-owner-key');
     } finally { await hub.close?.(); }
     assert.deepEqual(b.rotateHubSecrets(join(root, 'missing')), []);

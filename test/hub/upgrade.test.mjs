@@ -103,7 +103,14 @@ test('after the move: keas.db from a copy, the Hub’s files untouched, its key 
       arch.close();
       const p = await hub.listen({ port: 0, ownerPort: 0 });
       const base = `http://127.0.0.1:${p.port}`;
-      assert.equal((await call(base, 'POST', '/v1/auth/login', null, { email: 'ana@old.org', password: PW })).status, 404, 'no more Hub sign-in');
+      // Kea apps still pointed here are told where the accounts went (and follow only to the same key kid).
+      const health = (await call(base, 'GET', '/v1/health')).body;
+      assert.deepEqual([health.service, health.movedTo, health.keacKeyKid], ['keas', keac.url, hubKey.kid]);
+      for (const [m, p] of [['POST', '/v1/auth/login'], ['POST', '/v1/auth/register'], ['GET', '/v1/terms'], ['POST', '/v1/me/totp/setup'], ['GET', '/v1/keys'], ['GET', '/v1/classes']]) {
+        const r = await call(base, m, p, null, m === 'POST' ? {} : undefined);
+        assert.deepEqual([r.status, r.body.error, r.body.movedTo], [410, 'Kea accounts moved', keac.url], p);
+      }
+      assert.equal((await call(base, 'GET', '/v1/orgs-calendar')).status, 401, 'KeaS’s own routes are untouched');
       // Ana's pass from KeaC (signed with the key KeaC took over), for her old account id.
       const old = new DatabaseSync(join(dir, 'hub.db'), { readOnly: true });
       const ana = old.prepare("SELECT id FROM accounts WHERE email = 'ana@old.org'").get().id;
@@ -149,4 +156,46 @@ test('after the move, with a marker naming another key: nothing is trusted until
       assert.equal((await call(base, 'POST', '/v1/auth/pass', null, { pass })).status, 200);
     } finally { await hub.close(); }
   } finally { await keac.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('moved with no address in the marker: the KeaS config’s KeaC address, else movedTo null', async () => {
+  for (const keacUrl of ['https://keac.example.net', null]) {
+    const dir = hubFolder();
+    try {
+      writeMarker(dir, { keacUrl: null, keacKeyKid: null });
+      const hub = await openServer({ dataDir: dir, log: false, minFreeBytes: 0, keacStart: false, keacUrl });
+      try {
+        const p = await hub.listen({ port: 0, ownerPort: 0 });
+        const base = `http://127.0.0.1:${p.port}`;
+        assert.equal((await call(base, 'GET', '/v1/health')).body.movedTo, keacUrl);
+        const r = await call(base, 'POST', '/v1/auth/login', null, {});
+        assert.deepEqual([r.status, r.body.movedTo], [410, keacUrl]);
+        assert.ok(r.body.error);
+      } finally { await hub.close(); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('after KeaS 0.6 installs over a 0.5 Hub (nightly or not): the server the start-up task runs is still the Kea Hub, with 0.5 sign-in', async () => {
+  const { spawn } = await import('node:child_process');
+  const dir = hubFolder();
+  const entry = fileURLToPath(new URL('../../hub/index.mjs', import.meta.url));
+  const { ELECTRON_RUN_AS_NODE, ...env } = process.env;
+  const child = spawn(process.execPath, [entry], { env: { ...env, KEA_HUB_DATA: dir, KEA_HUB_PORT: '0', KEA_HUB_OWNER_PORT: '0', KEA_HUB_STORAGE: join(dir, 'storage') }, stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    const port = await new Promise((resolve, reject) => {
+      let out = '';
+      const t = setTimeout(() => reject(new Error(`no port: ${out}`)), 20_000);
+      child.stdout.on('data', (c) => { out += c; const m = /on http:\/\/127\.0\.0\.1:(\d+)/.exec(out); if (m) { clearTimeout(t); resolve(Number(m[1])); } });
+      child.on('exit', (code) => reject(new Error(`exited ${code}: ${out}`)));
+    });
+    const base = `http://127.0.0.1:${port}`;
+    assert.equal((await call(base, 'GET', '/v1/health')).body.service, 'kea-hub');
+    assert.equal((await call(base, 'POST', '/v1/auth/login', null, { email: 'boss@old.org', password: PW })).status, 200);
+    assert.equal(existsSync(join(dir, 'keas.db')), false);
+  } finally {
+    child.kill();
+    await new Promise((r) => (child.exitCode != null ? r() : child.once('exit', r)));
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

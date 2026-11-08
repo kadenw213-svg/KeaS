@@ -55,6 +55,8 @@ export const PAYROLL_TOKEN_MINUTES = 15;
 export const PAYROLL_AUDIENCE = 'keas-payroll';
 export const IDENTITY_KEY_FILE = 'server-identity.pem';
 export const SETUP_FILE = 'setup.secret';
+// The Kea Hub's (KeaS 0.5) account routes, none of which a KeaS server has: answered 410 with movedTo once moved.
+const LEGACY_ROUTE = /^\/v1\/(auth\/(register|login|google|oauth|reset\/.*|token)|keys|terms(\/.*)?|me\/(password|totp\/.*|delete|export|verify\/.*|consent(\/.*)?|leaderboard|phone|birth-year)|consent\/.*|hosting(\/.*)?|classes(\/.*)?|invites\/.*|join|class-sessions\/.*|calendar|sets\/.*|course-sections\/.*|course-files?|scan(\/.*)?|support)$/;
 export const LEGACY_MESSAGE = 'Your Kea accounts are still here. Move them to your Kea account server, then this PC becomes your organization’s server.';
 const FEATURES = ['passes', 'orgs', 'orgRoles', 'orgClock', 'payCodes', 'payCodeRates', 'stubs', 'files'];
 
@@ -312,7 +314,11 @@ export function createHub({
   const R = api.add;
   const O = own.add;
 
-  R('GET', '/v1/health', () => ({ ok: true, service: 'keas', version: VERSION, serverId, features: FEATURES, claimed: !!operatorId() }), { auth: false });
+  // A folder that was a Kea Hub: its Kea accounts moved to KeaC (moved-to-keac.json). Kea apps still pointed at this
+  // address are told where (they follow only when that address lists the same key kid at /v1/keys).
+  const moved = readMarker(dataDir);
+  const movedTo = () => (moved ? moved.keacUrl || keacAddress() || null : null);
+  R('GET', '/v1/health', () => ({ ok: true, service: 'keas', version: VERSION, serverId, features: FEATURES, claimed: !!operatorId(), ...(moved ? { movedTo: movedTo(), keacKeyKid: moved.keacKeyKid } : {}) }), { auth: false });
   // Proves this server holds the key its id is made from: signs `kea-server-identity:<serverId>:<nonce>`.
   R('GET', '/v1/identity', ({ query }) => {
     const n = String(query.nonce ?? '');
@@ -512,6 +518,13 @@ export function createHub({
     const url = new URL(req.url, 'http://localhost');
     if (req.method !== 'PUT') { const tm = setTimeout(() => { if (!req.complete) req.socket.destroy(); }, 30_000); tm.unref?.(); res.once('close', () => clearTimeout(tm)); }
     let status = 200, payload;
+    // The Kea Hub's account routes, after its accounts moved: where they went.
+    if (moved && LEGACY_ROUTE.test(url.pathname)) {
+      const to = movedTo();
+      send(res, 410, to ? { error: 'Kea accounts moved', movedTo: to, keacKeyKid: moved.keacKeyKid } : { error: 'Kea accounts moved to the Kea account server.', movedTo: null });
+      hlog.request(req.method, url.pathname, 410, Date.now() - t0);
+      return;
+    }
     try {
       const fileMatch = /^\/v1\/files\/(.+)$/.exec(url.pathname);
       const fileRoute = fileMatch && ['GET', 'PUT', 'DELETE'].includes(req.method);

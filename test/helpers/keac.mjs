@@ -19,13 +19,34 @@ export function signWith(key, payload, kid = key.kid) {
 }
 
 export async function fakeKeac({ now = () => Date.now() } = {}) {
-  const st = { keys: [{ ...newKey(), status: 'current' }], revoked: new Map(), down: false, calls: [] };
+  const st = { keys: [{ ...newKey(), status: 'current' }], revoked: new Map(), down: false, calls: [], accounts: new Map(), sessions: new Map() };
   const current = () => st.keys.find((k) => k.status === 'current');
   const srv = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://x');
     st.calls.push(`${req.method} ${u.pathname}${u.search}`);
     if (st.down) { req.socket.destroy(); return; }
     const json = (status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    // (Kea accounts, enough for the KeaS app: sign-in with a two-step code when set, /v1/me, passes, sign-out.)
+    const body = () => new Promise((r) => { let t = ''; req.on('data', (c) => (t += c)); req.on('end', () => { try { r(JSON.parse(t || '{}')); } catch { r({}); } }); });
+    const me = () => st.sessions.get(String(req.headers.authorization || '').replace(/^Bearer /, ''));
+    const pub = (a) => ({ id: a.id, email: a.email, displayName: a.name, totpEnabled: !!a.code });
+    if (u.pathname === '/v1/health') return json(200, { ok: true, service: 'keac', features: ['pass'] });
+    if (u.pathname === '/v1/auth/login') return body().then((b) => {
+      const a = st.accounts.get(String(b.email || '').toLowerCase());
+      if (!a || a.password !== b.password) return json(401, { error: 'Wrong email or password.' });
+      if (a.code && b.code !== a.code) return json(401, { error: b.code ? 'That code is wrong.' : 'Enter your two-step code.', totpRequired: true });
+      const token = Math.random().toString(16).slice(2) + Date.now();
+      st.sessions.set(token, a);
+      json(200, { token, me: pub(a), account: pub(a) });
+    });
+    if (u.pathname === '/v1/me') { const a = me(); return a ? json(200, { account: pub(a) }) : json(401, { error: 'Sign in again.' }); }
+    if (u.pathname === '/v1/auth/logout') { st.sessions.delete(String(req.headers.authorization || '').replace(/^Bearer /, '')); return json(200, { ok: true }); }
+    if (u.pathname === '/v1/pass') return body().then((b) => {
+      const a = me();
+      if (!a) return json(401, { error: 'Sign in again.' });
+      const iat = Math.floor(now() / 1000), exp = iat + 7 * 86400;
+      json(200, { pass: signWith(current(), { iss: 'kea', aud: `keas:${b.serverId}`, sub: a.id, email: a.email, name: a.name, ev: true, iat, exp }), exp: exp * 1000 });
+    });
     if (u.pathname === '/v1/keys') return json(200, { keys: st.keys.filter((k) => k.status !== 'removed').map((k) => ({ ...k.jwk, status: k.status })) });
     if (u.pathname === '/v1/revoked') {
       const since = Number(u.searchParams.get('since')) || 0;
@@ -44,6 +65,8 @@ export async function fakeKeac({ now = () => Date.now() } = {}) {
     pass({ serverId, aud = `keas:${serverId}`, sub, email, name = '', iat = Math.floor(now() / 1000), exp = iat + 7 * 86400, key = current(), ev = true, iss = 'kea', extra = {} }) {
       return signWith(key, { iss, aud, sub, email, name, ev, iat, exp, ...extra });
     },
+    /** A Kea account people can sign in to (code: its two-step code, when on). */
+    addAccount({ id, email, password, name = '', code = null }) { st.accounts.set(email.toLowerCase(), { id, email: email.toLowerCase(), password, name, code }); },
     revoke(id) { st.revoked.set(id, { at: now(), active: true }); },
     unrevoke(id) { const r = st.revoked.get(id); if (r) { r.active = false; r.at = now(); } },
     /** Publishes a new key as 'next'; promote() makes it current and retires the old one. */

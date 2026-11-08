@@ -3,9 +3,11 @@
 // the vault passphrase, and never goes to the Hub. Closing the window stops the vault server, so the key leaves the
 // vault's memory.
 //
-// Signing in: KeaS is already signed in to the payroll admin's Kea account (account.cjs), so payroll never asks for the
-// email and password again. KeaS gets a short-lived "keas-payroll" token from that Hub and hands it to the vault in
-// this process (never over HTTP) with the passphrase. The passphrase is asked once per run of KeaS and kept in memory
+// Signing in: KeaS is already signed in to the payroll admin's Kea account and to the KeaS server on this PC with a
+// pass from it (keas.cjs), so payroll never asks for the email and password again. KeaS gets a 15-minute
+// "keas-payroll" token that the KeaS server signs for that session (its owner console) and hands it to the vault in
+// this process (never over HTTP) with the passphrase; the vault checks it against the server's identity key, read from
+// the data folder here. (A PC still running the Kea Hub signs in at that Hub, as before: legacy-account.cjs.) The passphrase is asked once per run of KeaS and kept in memory
 // only (passkeeper.cjs). With "Ask for my sign-in every time I open Payroll" on, every open asks for the password, the
 // passphrase and then the two-step code (the code last, so it doesn't run out while the passphrase is typed).
 //
@@ -28,7 +30,7 @@ const path = require('path');
 const { pathToFileURL } = require('url');
 const { BrowserWindow, shell, nativeTheme, session } = require('electron');
 const bootstart = require('./bootstart.cjs');
-const { hubPublicKey } = require('./hubid.cjs');
+const { hubPublicKey, serverIdentity } = require('./hubid.cjs');
 const { createPassKeeper } = require('./passkeeper.cjs');
 
 // The payroll window's own browser session, kept in memory only (nothing of it is saved when KeaS quits).
@@ -53,7 +55,9 @@ function createPayroll({ getConfig, setConfig, userData, root, hubPort, account,
   const keeper = createPassKeeper();
   const dir = () => getConfig().payrollDir || path.join(userData, 'Payroll');
   const exportsDir = () => path.join(dir(), 'Exports');
-  const hubUrl = () => { const c = getConfig(); return c.role === 'hub' ? `http://127.0.0.1:${hubPort}` : (account?.signedIn() ? account.url() : c.hubUrl || null); };
+  // (The KeaS server on this PC: its own address. A Kea Hub here whose accounts haven't moved: the Hub's.)
+  const hubUrl = () => `http://127.0.0.1:${hubPort}`;
+  const keasServer = () => getConfig().role !== 'hub' && !!getConfig().dataDir && !!serverIdentity(getConfig().dataDir);
   const localSignIn = () => !!getConfig().payrollLocalSignIn;
   const askEveryTime = () => !!getConfig().payrollAskEveryTime;
   /** The states KeaS has tax tables for (shared/tax/<ST>-<year>.json). */
@@ -92,15 +96,22 @@ function createPayroll({ getConfig, setConfig, userData, root, hubPort, account,
     fs.mkdirSync(dir(), { recursive: true });
     // When this PC is the Hub, payroll checks whatever answers on the Hub's port against the key in the Hub's data
     // folder (desktop/hubid.cjs) before trusting it.
+    // The key payroll trusts, read from the data folder on this PC: the KeaS server's identity key (its tokens are
+    // issued as 'keas:<server id>'), or the Kea Hub's signing key while this PC is still the Hub.
     const hubTrustKeys = () => {
       const c = getConfig();
-      if (c.role !== 'hub' || !c.dataDir) return null;
-      const pub = hubPublicKey(c.dataDir);
+      if (!c.dataDir) return null;
+      const me = keasServer() ? serverIdentity(c.dataDir) : null;
+      if (me) return [{ kty: 'OKP', crv: 'Ed25519', x: me.x }];
+      const pub = c.role === 'hub' ? hubPublicKey(c.dataDir) : null;
       return pub ? [{ kty: 'OKP', crv: 'Ed25519', x: pub.export({ format: 'jwk' }).x }] : null;
     };
+    const serverIssuer = () => { const me = keasServer() ? serverIdentity(getConfig().dataDir) : null; return me ? `keas:${me.serverId}` : null; };
+    // Finalized stubs to each member (org/stubs.mjs), in the organization payroll pays.
+    const publishStubs = async (b) => { const o = await payrollOrg(); return account.publishStubs({ id: o.id, ...b }); };
     // setupToken: only this app's payroll window gets it (in the address's fragment, which never reaches a server or a
     // log), so nothing else on this PC can claim an empty vault by reaching the port first.
-    server = createApp({ dbFile: path.join(dir(), 'payroll-vault.db'), vault: true, hubUrl: hubUrl(), localSignIn, hubTrustKeys, log: false, setupToken: crypto.randomBytes(32).toString('base64url'), onVaultLock: (why) => setImmediate(() => locked(why)), engineFeed });
+    server = createApp({ dbFile: path.join(dir(), 'payroll-vault.db'), vault: true, hubUrl: hubUrl(), localSignIn, hubTrustKeys, serverIssuer, publishStubs: account.publishStubs ? publishStubs : null, log: false, setupToken: crypto.randomBytes(32).toString('base64url'), onVaultLock: (why) => setImmediate(() => locked(why)), engineFeed });
     port = await server.listen(0);
     log('payroll vault started', dir());
     return port;
@@ -246,9 +257,10 @@ function createPayroll({ getConfig, setConfig, userData, root, hubPort, account,
   /** This PC's own Hub key (when this PC is the Hub): its fingerprint, to check the key the Hub offers against. */
   async function localHubFingerprint() {
     const c = getConfig();
-    if (c.role !== 'hub' || !c.dataDir) return null;
+    if (!c.dataDir) return null;
     try {
-      const x = crypto.createPublicKey(crypto.createPrivateKey(fs.readFileSync(path.join(c.dataDir, 'hub-signing-key.pem')))).export({ format: 'jwk' }).x;
+      const me = keasServer() ? serverIdentity(c.dataDir) : null;
+      const x = me ? me.x : crypto.createPublicKey(crypto.createPrivateKey(fs.readFileSync(path.join(c.dataDir, 'hub-signing-key.pem')))).export({ format: 'jwk' }).x;
       const { keyFingerprint } = await import(pathToFileURL(path.join(root, 'server', 'payroll', 'hub.mjs')).href);
       return keyFingerprint([{ x }]);
     } catch { return null; }

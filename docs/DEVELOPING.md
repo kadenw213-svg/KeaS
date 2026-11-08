@@ -7,40 +7,71 @@ Needs Node 24.
 | What | Command |
 |---|---|
 | Install dependencies (first time) | `npm install` (if Electron's download is skipped: `node node_modules/electron/install.js`) |
-| Run the Kea Hub | `npm run hub`: API on 127.0.0.1:4860, owner console on 127.0.0.1:4861 |
+| Run the KeaS server | `npm run hub`: API on 127.0.0.1:4860, owner console on 127.0.0.1:4861 |
 | Run the KeaS app | `npm run desktop` |
 | Build the Windows installer | `npm run desktop:build` → `%LOCALAPPDATA%\KeaBuild\KeaS\release\KeaS Setup <version>.exe` |
 | All tests | `npm test` |
-| Hub tests only | `npm run test:hub` |
+| Server tests only | `npm run test:hub` (and `npm run test:legacy` for the Kea Hub of KeaS 0.5) |
 | Org engine tests only | `npm run test:org` |
 | Workforce server with sample data | `node server/seed.mjs --reset`, then `npm run dev` and open http://127.0.0.1:5173 |
 | Type-check the web app | `npm run typecheck` |
 
-## The Hub
+## The KeaS server (`hub/`)
 
-- **Running the Hub from the KeaS app (the owner only):** start KeaS with `--host-hub` (for example
-  `KeaS.exe --host-hub`, or `npm run desktop -- --host-hub`). That opens the Hub setup wizard; nothing else in KeaS
-  leads there. Once a PC runs a Hub (setup finished), KeaS shows the Hub's status page without the switch. Everyone
-  else gets "Sign in to Kea" / "Create an account" (the Hub address is under Advanced; `desktop/account.cjs`).
-  Setup remembers its step (`setupStep` in `keas-config.json`), so it picks up where it stopped.
-- **Data:** `hub/data/` (or `KEA_HUB_DATA`); account files in `KEA_HUB_STORAGE`.
-- **Owner tools** (run on the Hub's own computer):
-  - `node hub/owner.mjs make-owner <email>`;
-  - `node hub/owner.mjs publish-terms` publishes `hub/terms/terms.json`. Keep each section's id when you only reword it; new sections get new ids. Everyone agrees again and sees only what changed.
-  - `node hub/owner.mjs console owner/stats`.
-- **One account** (`console GET owner/accounts/<email>` shows everything below). Each change is audited and sends the person a notification; add `"note"` for a line of your own.
-  - Storage: `console POST owner/accounts/<email>/quota '{"gb":5000}'`; `{"gb":null}` goes back to the standard size.
-  - Shared Claude: `console POST owner/accounts/<email>/claude '{"limits":{"perAccountWeekly":20}}'`. Any limit in `ACCOUNT_LIMITS` (`hub/lib/budget.mjs`) can be set; `null` goes back to the Hub-wide number. `{"trusted":true}` lifts their own caps, `{"blocked":true,"reason":"…"}` turns it off for them, and `{"reset":true}` clears everything.
-  - Supporter: `console POST owner/accounts/<email>/supporter '{"months":1}'` (renewing adds to the end), `{"until":"2027-06-01"}`, or `{"end":true}`. It gives supporter storage and a badge only; it never changes shared-Claude limits.
-  - A notice: `console POST owner/accounts/<email>/notify '{"title":"…","body":"…"}'`.
-- **Storage sizes:** `console POST owner/settings '{"storage":{"defaultGb":5,"supporterGb":25}}'`. The standard size is 5 GB and a supporter's 25 GB unless set here. A smaller size never deletes anything: people over it can't add files until they're under it again.
-- **Backups:** `node hub/backup.mjs create <folder>`, with `KEA_BACKUP_PASSPHRASE` set (sealed with AES-256-GCM).
-- **Never tunnel port 4861.** The owner console must only ever be reachable on the Hub's own computer.
-- **Bringing in an org server's people and time clock:** `node hub/import-org-server.mjs --server <org.db> --org <orgId> --dry-run` shows what would come in (people are matched to Kea accounts by the account their payroll sign-in is linked to, then by email); without `--dry-run` it imports. `KEAS_VAULT_PASSPHRASE` is that server's vault passphrase. Running it again only adds what's missing.
+Every KeaS PC runs its organization's server (`hub/index.mjs`; the folder keeps its old name). People sign in with
+their Kea accounts on KeaC (the Kea account server) through passes: `docs/protocol.md` sections 2 and 7. KeaS has no
+passwords, two-step codes, sign-up, terms or personal storage of its own.
+
+- **Run it:** `npm run hub` (API on 127.0.0.1:4860, which Tailscale Funnel forwards; owner console on 127.0.0.1:4861,
+  never tunneled). Data: `hub/data/` (or `KEA_HUB_DATA`): `keas.db`, `server-identity.pem` (its Ed25519 key; the
+  server id is base64url(SHA-256(raw public key)) cut to 22), `owner.key` (the owner console's HMAC key),
+  `org-data.key` (seals pay code rates and stubs), `member-files/`, and `setup.secret` until someone sets it up.
+- **KeaC:** its address is `KEAC_URL` (or the KeaS app's settings, or the address confirmed at setup; `KEAC_URL` in
+  `hub/lib/keac.mjs` is the built-in one, not known yet). Its key: built in (`KEAC_KEYS`, empty until KeaC's key is
+  published), `KEAC_KEY` (a JWK as JSON), or the one the owner confirmed by fingerprint (`/owner/keac/offer`,
+  `/owner/keac/pin`: trust on first use, compared with KeaC's Keys screen). The key list (`<KeaC>/v1/keys`) is fetched
+  at start and every 6 hours and taken only when it still has a trusted key, so rotations (KeaC's `next` keys) are
+  followed and a look-alike at the address isn't. The last good list is kept, so passes keep checking out while KeaC
+  is down. Revocation: hourly `?since=` (a minute of overlap) and a daily full list; revoked accounts' sessions end.
+- **Passes** (`hub/lib/keac.mjs checkPass`): EdDSA, a known `kid`, the signature, `iss: 'kea'`, `aud: 'keas:<serverId>'`,
+  `exp` in the future, `iat` no more than 2 minutes ahead, at most 8 days long, `sub` and `ev: true`, not revoked. Then a
+  KeaS session (hashed, 30 days; a newer pass sent with it renews it) and the member row (`keas_members`: name and email
+  from the newest pass). `org/identity.mjs passIdentity` is the org engine's adapter over it.
+- **Setting up a fresh server** happens only at the owner console (loopback, HMAC with `owner.key`): `POST /owner/claim
+  { pass, secret }` with the one-time setup code (`setup.secret`, shown in the KeaS app on this PC, or
+  `node hub/owner.mjs setup-code`). Whoever claims it is its operator: they make organizations (others only when the
+  operator allows: `POST /owner/settings { orgs: { anyoneCreates, autoApprove } }`).
+- **Owner console** (what the KeaS app needs): `/owner/stats`, `/owner/claim`, `/owner/settings`, `/owner/keac`,
+  `/owner/keac/offer`, `/owner/keac/pin`, `/owner/keac/refresh`, `/owner/payroll-token`, `/owner/members` (and
+  `/:id/sign-out`, `/:id/forget`), `/owner/audit`, and the org engine's `/owner/orgs/*`.
+- **Members' files:** `/v1/files/*` as the Kea Hub had it (If-Match versions, paths checked), for members of an active
+  organization; each organization's `settings.filesQuotaGb` (1 by default; the biggest of a member's organizations).
+- **Owner tools:** `node hub/owner.mjs console GET owner/stats | setup-code | rotate-key | server-id | where`.
+- **Backups:** `node hub/backup.mjs create <folder>` with `KEA_BACKUP_PASSPHRASE` (keas.db, a Kea Hub's hub.db if it's
+  still there, and the keys). **Never tunnel port 4861.**
+- **Bringing in an org server's people and time clock:** `node hub/import-org-server.mjs --server <org.db> --org <orgId> --dry-run` (people are matched to members who signed in here, by linked Kea account, then email).
+
+### A PC that was the Kea Hub (KeaS 0.5)
+
+- While its data folder still holds the Kea accounts (`hub.db` with an accounts table, no `moved-to-keac.json`), KeaS
+  0.6 runs the Kea Hub exactly as 0.5 did (`hub/legacy/`, chosen by `hub/index.mjs openServer`; its tests are
+  `test/legacy/`), and says "Your Kea accounts are still here. Move them to your Kea account server, then this PC
+  becomes your organization's server." Updating KeaS (by hand or at night) over such a PC is safe for that reason.
+- **The marker:** `moved-to-keac.json` in the data folder, `{ "at": <ms>, "keacUrl": <string or null>, "keacKeyKid":
+  <string or null> }`, written by KeaC's migration or by "My Kea accounts have moved" in the KeaS app.
+- Then `hub/upgrade.mjs` makes `keas.db` from a copy of `hub.db` (the organization side; references to accounts taken
+  out of those tables' definitions; members' names from the accounts; the Hub's owner becomes the operator), copies
+  `hub.db` to `keas-0.5-archive/hub.db`, and writes `keas-upgrade-report.json`. `hub.db`, `hub-signing-key.pem` and
+  `storage/` are never changed, moved or deleted (clean them up by hand later). When `keacKeyKid` is the kid of this
+  folder's own `hub-signing-key.pem` (KeaC took that key over to sign passes), it's trusted as KeaC's key at once.
+- After the move the old account routes answer 410 `{ error: 'Kea accounts moved', movedTo, keacKeyKid }` and
+  `/v1/health` carries `movedTo` and `keacKeyKid`, so Kea apps still pointed here can follow.
+- Organization members keep their ids (KeaC's migration keeps the Hub's account ids) and sign in again once with a pass.
+- The payroll vault set up with the Hub's key moves to the server's own key by itself (it reads it from the data folder).
 
 ## The org engine (`org/`)
 
-One module for organizations that any KeaS server mounts: `mountOrg({ R, h, now, audit, notify, identity })` (`org/index.mjs`). The Hub mounts it with its accounts as the identity (`hub/orgIdentity.mjs`).
+One module for organizations that any KeaS server mounts: `mountOrg({ R, h, now, audit, notify, identity })` (`org/index.mjs`). The KeaS server mounts it with members from passes as the identity (`org/identity.mjs passIdentity`); the Kea Hub of KeaS 0.5 (`hub/legacy/`) with its accounts.
 
 - **Roles** (`org/roles.mjs`): a role is a name and a list of abilities. Owner, Admin, Manager and Member are templates every org gets, with what the fixed roles of KeaS 0.5 could do. A role is given for the whole org or for chosen departments (and every team under them). Every check is `can(ability, department)`; to give a role, make a code for it, or change or remove someone, you must outrank them. Owners have every ability and the last owner can't go. `GET /v1/orgs/:id` tells each person their `me.abilities` and `me.scopes`; `role` is still there for older Kea (the highest template they have org-wide).
 - **Roles API:** `GET/POST /v1/orgs/:id/roles`, `POST /v1/orgs/:id/roles/:rid` (change), `POST /v1/orgs/:id/roles/:rid/delete`, `GET/POST /v1/orgs/:id/members/:aid/roles` (`{ roleId, scope: 'org' | [departmentIds] }`), `POST /v1/orgs/:id/members/:aid/roles/:rid/delete`.
@@ -55,6 +86,10 @@ One module for organizations that any KeaS server mounts: `mountOrg({ R, h, now,
     `.../pay-codes/:cid/delete`, `POST /v1/orgs/:id/shifts/:shid/pay-code` and `POST /v1/orgs/:id/punches/:pid/pay-code`
     (`{ payCodeId }`), `GET /v1/orgs/:id/pay-feed?from=&to=` (what payroll pays from; `rates.view` and `timecards.view`
     for the whole organization).
+  - **Rate history:** `POST /v1/orgs/:id/pay-codes/:cid { rate, effectiveFrom }` (today when no date; on or before the
+    day the code was made it's the first rate). Hours are paid at the rate in effect on the day worked; the pay feed
+    sends each code's `rates: [{ from, rateCents }]` and the vault pays each day by it. A change not started yet can be
+    taken back: `POST .../pay-codes/:cid/rates/:from/delete`. Each change is sealed for its code and date.
   - Shifts and punches carry `pay_code_id`. A shift given to someone gets their default code (schema triggers); one that
     changes hands keeps its code only if the new person has it. Clocking in takes `payCodeId` (one of yours), else the
     shift's code, else your default; a clock-out carries its clock-in's. Switching a punch's code is recorded in
@@ -115,10 +150,20 @@ test/           node:test suites for the Hub, the org engine and the workforce s
   `server/payroll/schema.mjs`) are sealed by triggers as they're written and opened by `server/db.mjs` as they're
   read, so nothing may filter or sum them in SQL. The key is only in memory while the vault is open; closing the
   Payroll window stops the server. Changing the passphrase re-encrypts every sealed column.
-- **Sign-in:** the Kea Hub account (the vault relays the password to the Hub the KeaS app names, never one a
-  request names, gets an Ed25519 token for the audience `keas-payroll` and checks it against the Hub key pinned at
-  setup) plus the passphrase. A local password (16+ characters, scrypt) works only while the Hub can't be reached,
-  and only if the owner turned it on in the KeaS app. Wrong tries are limited per account and address.
+- **Sign-in:** the Kea account plus the passphrase. The KeaS app signs in to the KeaS server on this PC with a pass
+  (`desktop/keas.cjs`) and gets a 15-minute token for the audience `keas-payroll` from the server's owner console
+  (`/owner/payroll-token`, for that session), signed with the server's identity key and issued as `keas:<serverId>`;
+  the vault checks it against that key, read from the data folder on this PC (`serverIssuer`, `hubTrustKeys`). This is
+  safer than handing the vault a KeaC pass: the token lasts 15 minutes instead of 7 days, can't be used as a pass, is
+  only made on this PC with the owner key for a live (not revoked) session, and adds no new key the vault must trust.
+  "Ask for my sign-in every time" gets a fresh KeaC sign-in (password and code), a pass, a session just for that token,
+  then ends it. No password goes through the vault (`/v1/vault/setup` and `/v1/vault/signin` with `mode: 'hub'` answer
+  410 when `serverIssuer` is set). A local password still works only while the server can't be reached, if the owner
+  turned it on. While the PC is still a Kea Hub, payroll signs in at that Hub as before (`desktop/legacy-account.cjs`).
+- **Stubs to members:** finalizing a pay run publishes each linked person's stub to the org engine
+  (`POST /v1/orgs/:id/stubs`, `org/stubs.mjs`: sealed for that member with a key derived from the org data key and
+  their account id; they see their own in `GET /v1/orgs/:id/me/pay` `stubs` and `/me/stubs/:id`, nobody else ever does;
+  SSN- and bank-shaped values refused). `POST /v1/payrun/publish-stubs` sends them again.
 - **The workforce server** (`npm run dev`) runs the same payroll and HR code on its sample data with its vault opened
   by a passphrase kept next to the database (`<db>.vaultkey`, development only: `devKeyFile`), so every screen can be
   tried there. The KeaS app passes an organization server's passphrase in memory, kept with Windows DPAPI.

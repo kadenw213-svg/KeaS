@@ -39,7 +39,7 @@ const SERVICE_FOLDER_NAME = 'KeaS Hub Service';
 /** Well-known SIDs (the same in every Windows language). */
 const SID = Object.freeze({ SYSTEM: 'S-1-5-18', ADMINS: 'S-1-5-32-544' });
 /** Files in the Hub's data folder that hold secrets, re-protected one by one by the elevated script. */
-const SECRET_FILES = ['owner.key', 'hub-signing-key.pem', 'org-data.key', 'hub.db', 'hub.db-wal', 'hub.db-shm'];
+const SECRET_FILES = ['owner.key', 'server-identity.pem', 'setup.secret', 'hub-signing-key.pem', 'org-data.key', 'keas.db', 'keas.db-wal', 'keas.db-shm', 'hub.db', 'hub.db-wal', 'hub.db-shm'];
 /** Layout version of the installed service (2: Program Files with locked-down permissions). */
 const LAYOUT = 2;
 
@@ -154,6 +154,8 @@ function hubEnv(config, { port = 4860 } = {}) {
   // The parent sign-off page's Google button, and the public address its links use.
   if (config.googleWebClientId) env.KEA_GOOGLE_WEB_CLIENT_ID = String(config.googleWebClientId);
   if (config.publicUrl) env.KEA_HUB_PUBLIC_URL = String(config.publicUrl);
+  // The Kea account server (KeaC) the KeaS server checks passes with (also kept in its own database once confirmed).
+  if (config.keacUrl) env.KEAC_URL = String(config.keacUrl);
   return env;
 }
 
@@ -751,14 +753,14 @@ async function secureDataFolder(dir, { sid, onWasOpen = null, report = aclReport
 }
 
 /**
- * After a Hub data folder that was open to other accounts is locked down: its owner key and signing key may have been
- * read, so they're wiped and removed, and the Hub makes new ones when it starts (it creates both when they're
- * missing). Payroll vaults that trusted the old signing key then ask the owner to check and accept the new one.
+ * After a data folder that was open to other accounts is locked down: its owner key and identity key (a Kea Hub's
+ * signing key) may have been read, so they're wiped and removed, and the server makes new ones when it starts (its
+ * server id changes with the identity key, so Kea asks KeaC for passes for the new id by itself). Payroll vaults that trusted the old signing key then ask the owner to check and accept the new one.
  * Returns the names removed.
  */
 function rotateHubSecrets(dataDir) {
   const gone = [];
-  for (const name of ['owner.key', 'hub-signing-key.pem']) {
+  for (const name of ['owner.key', 'server-identity.pem', 'hub-signing-key.pem']) {
     const f = path.join(dataDir, name);
     try {
       const st = fs.lstatSync(f);
@@ -947,7 +949,7 @@ async function hubAnswering(port, { dataDir = null, timeoutMs = 1500, fetchFn = 
     const r = await fetchFn(`http://127.0.0.1:${port}/v1/health`, { signal: AbortSignal.timeout(timeoutMs) });
     if (!r.ok) return false;
     const j = await r.json();
-    if (j?.service !== 'kea-hub') return false;
+    if (j?.service !== 'keas' && j?.service !== 'kea-hub') return false;
   } catch { return false; }
   return require('./hubid.cjs').verifyHubIdentity(port, dataDir, { timeoutMs: Math.max(timeoutMs, 1500), fetchFn });
 }

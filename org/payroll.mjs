@@ -13,7 +13,7 @@
 // number next to an account number. The whole body is walked (no depth limit), and a body with more than MAX_NODES
 // keys and values is refused outright rather than half-checked.
 export const MAX_NODES = 20_000;
-export const PAYROLL_MESSAGE = "Payroll details (SSNs, bank accounts, pay runs) stay in the payroll vault on the payroll admin's PC. They are never stored on the Kea Hub.";
+export const PAYROLL_MESSAGE = "Payroll details (SSNs, bank accounts, pay runs) stay in the payroll vault on the payroll admin's PC. They are never stored on this server.";
 
 const SENSITIVE_WORDS = /\b(ssns?|itin|iban|swift|paychecks?|social security( numbers?)?|tax ids?|routing( numbers?)?|bank (accounts?|details|numbers?|info)|account numbers?|acct (no|num|numbers?)|w ?4s?|direct deposits?|pay runs?|payruns?)\b/;
 const RATE_WORDS = /\b(wages?|salary|salaries|pay ?rates?|hourly (rates?|wages?|pay))\b/;

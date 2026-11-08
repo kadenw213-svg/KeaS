@@ -1,37 +1,33 @@
-// The setup screens' only way to reach the app: a fixed list of calls, each returning { ok, value } or { ok, error }.
+// The KeaS window's only way to reach the app: a fixed list of calls, each returning { ok, value } or { ok, error }.
 const { contextBridge, ipcRenderer } = require('electron');
 
 const call = (name) => (arg) => ipcRenderer.invoke(name, arg);
+const on = (ch) => (cb) => { const fn = (_e, v) => cb(v); ipcRenderer.on(ch, fn); return () => ipcRenderer.removeListener(ch, fn); };
 contextBridge.exposeInMainWorld('keas', {
-  openPayroll: call('payroll:open'),
-  payrollStatus: call('payroll:status'),
-  payrollSetup: call('payroll:setup'),
-  payrollUnlock: call('payroll:unlock'),
-  payrollAskEveryTime: call('payroll:askEveryTime'),
-  payrollOpenExports: call('payroll:openExports'),
-  payrollSettings: call('payroll:settings'),
-  payrollLocalSignIn: call('payroll:localSignIn'),
-  payrollHubKey: call('payroll:hubKey'),
-  payrollRepinHub: call('payroll:repinHub'),
   state: call('state'),
+  // The Kea account (KeaC) and trusting its key.
   accountStatus: call('account:status'),
   accountLogin: call('account:login'),
-  accountRegister: call('account:register'),
-  accountTerms: call('account:terms'),
-  accountAcceptTerms: call('account:acceptTerms'),
+  accountGoogle: call('account:google'),
   accountLogout: call('account:logout'),
   accountSetUrl: call('account:setUrl'),
-  setStartWithWindows: call('settings:startWithWindows'),
-  checklist: call('checklist'),
+  keacOffer: call('keac:offer'),
+  keacPin: call('keac:pin'),
+  // This KeaS server.
+  serverClaim: call('server:claim'),
+  serverSignIn: call('server:signIn'),
   orgCreate: call('org:create'),
   orgJoin: call('org:join'),
   orgUpdate: call('org:update'),
   orgPeople: call('org:people'),
   orgApprove: call('org:approve'),
-  orgVerifyEmail: call('org:verifyEmail'),
-  accountBackupCodes: call('account:backupCodes'),
-  saveCodes: call('codes:save'),
-  codesDone: call('codes:done'),
+  orgApi: call('org:api'),
+  // A PC that is still a Kea Hub.
+  legacyLogin: call('legacy:login'),
+  legacyStatus: call('legacy:status'),
+  legacyMoved: call('legacy:moved'),
+  checklist: call('checklist'),
+  setStartWithWindows: call('settings:startWithWindows'),
   drives: call('drives'),
   pickFolder: call('pickFolder'),
   checkFolder: call('checkFolder'),
@@ -44,37 +40,29 @@ contextBridge.exposeInMainWorld('keas', {
   tsFunnelOff: call('ts:funnelOff'),
   reachSet: call('reach:set'),
   openLog: call('openLog'),
-  terms: call('terms'),
-  ownerCreate: call('owner:create'),
-  ownerState: call('owner:state'),
   setupStep: call('setupStep'),
-  ownerTotp: call('owner:totp'),
-  ownerBackupCodes: call('owner:backupCodes'),
-  ownerVerifyEmail: call('owner:verifyEmail'),
   finish: call('finish'),
   updateState: call('update:state'),
   checkUpdates: call('update:check'),
   installUpdate: call('update:install'),
   setNightlyUpdate: call('update:nightly'),
-  onUpdate: (cb) => {
-    const fn = (_e, s) => cb(s);
-    ipcRenderer.on('update', fn);
-    return () => ipcRenderer.removeListener('update', fn);
-  },
   setTheme: call('setTheme'),
   openExternal: call('openExternal'),
   openFolder: call('openFolder'),
   bootStatus: call('boot:status'),
   bootApply: call('boot:apply'),
   bootRemove: call('boot:remove'),
-  onNavigate: (cb) => {
-    const fn = (_e, view) => cb(view);
-    ipcRenderer.on('navigate', fn);
-    return () => ipcRenderer.removeListener('navigate', fn);
-  },
-  onProgress: (cb) => {
-    const fn = (_e, line) => cb(line);
-    ipcRenderer.on('progress', fn);
-    return () => ipcRenderer.removeListener('progress', fn);
-  },
+  openPayroll: call('payroll:open'),
+  payrollStatus: call('payroll:status'),
+  payrollSetup: call('payroll:setup'),
+  payrollUnlock: call('payroll:unlock'),
+  payrollAskEveryTime: call('payroll:askEveryTime'),
+  payrollOpenExports: call('payroll:openExports'),
+  payrollSettings: call('payroll:settings'),
+  payrollLocalSignIn: call('payroll:localSignIn'),
+  payrollHubKey: call('payroll:hubKey'),
+  payrollRepinHub: call('payroll:repinHub'),
+  onUpdate: on('update'),
+  onNavigate: on('navigate'),
+  onProgress: on('progress'),
 });

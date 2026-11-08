@@ -5,7 +5,7 @@
 <h1 align="center">KeaS</h1>
 
 <p align="center">
-  The server behind Kea: accounts, classes, study groups and sync, run on your own computer.
+  Your organization's own server for Kea: schedules, the time clock, pay codes and payroll prep, on your own computer.
 </p>
 
 <p align="center">
@@ -14,45 +14,33 @@
 
 ---
 
-KeaS turns a Windows computer into a Kea Hub, the server that [Kea](https://github.com/kadenw213-svg/kea) connects
-to. It gives everyone one Kea account, lets instructors run classes and study groups, keeps each person's devices in
-step through their own Kea storage, and lets people without a Claude account have their classes set up on the Hub
-owner's Claude. Everything runs on hardware you own, and a few clicks of setup make it reachable from anywhere.
+KeaS turns a Windows computer into your organization's server. Your people use it from
+[Kea](https://github.com/kadenw213-svg/kea) on their computers and phones: their shifts, swaps and availability,
+clocking in and out, their pay codes, hours and pay stubs. Everyone signs in with the Kea account they already have;
+KeaS never sees a password. Everything runs on hardware you own, and a few clicks make it reachable from anywhere.
 
 ## Setup
 
-The first time KeaS opens, it walks you through three steps. Choose the drive the Hub keeps its data on; a large
-drive is best, since every account gets its own storage. KeaS then installs Tailscale and turns on Funnel, which
-gives the Hub a public https address for free without changing router settings or revealing your home address.
-Finally, create the owner account with two-step sign-in. From then on KeaS runs in the tray, starts with Windows,
-and keeps the Hub running.
+The first time KeaS opens, it walks you through it: pick the drive for the data, check your Kea account server's key
+(its fingerprint, against the one it shows), sign in with your Kea account, set up the server with the one-time code
+KeaS shows on this computer, create your organization and say where people work, and turn on Tailscale Funnel, which
+gives the server a public https address for free without changing router settings or revealing your address. Then a
+"Get set up" list shows what's left, Payroll's steps included. From then on KeaS runs in the tray and starts with
+Windows.
 
-## Accounts
+## Sign-in
 
-One Kea account works in Kea and KeaS. Passwords are stored only as a slow one-way hash, never in a form anyone can
-read, and repeated wrong guesses lock an account for longer each time. Two-step sign-in works with any
-authenticator app, and **Verify with Google** proves an email address. Every account agrees to the Hub's terms
-section by section; when the terms change, people are shown exactly what changed and agree again before continuing.
+People sign in with their Kea accounts. Kea asks the Kea account server for a pass for your server (it lasts a week
+and renews by itself), and KeaS checks it with the account server's key, then keeps its own sign-in. If the account
+server can't be reached, everything already signed in keeps working. A suspended Kea account is signed out of your
+server within the hour.
 
-## Classes and studying
+## Your organization
 
-Instructors create classes, invite people with a code, and put sessions on a shared calendar with meeting links.
-Practice questions are graded by the Hub, so scores can't be edited, and each question comes back on a spaced
-schedule. XP, levels, streaks, and weekly and all-time leaderboards reward studying. Each person chooses whether
-they appear by name, by nickname, or not at all.
-
-## Storage and sync
-
-Kea syncs each person's computers through their Kea storage on the Hub instead of a cloud drive. Only changed files
-move, every file keeps a version so two devices never overwrite each other, and large downloads are paced so they
-never fill the owner's internet connection.
-
-## Kea's shared Claude
-
-People without their own Claude account can queue a scan of their classes on the Hub owner's Claude. Their school
-password never leaves their own computer: the scan reads their class site through their own Kea, and only page text
-reaches the Hub. Daily and weekly limits, one shared scan per course section, and batches of new questions in place
-of regenerating keep the queue fair and the owner's plan usable.
+Roles you make (or Owner, Admin, Manager and Member), for the whole organization or chosen departments. Pay codes for
+each job and its rate, with rate changes from a date: every hour is paid at the code it was worked at, at the rate in
+effect that day. Join codes, departments, positions, certifications, availability forms, schedules and the time clock.
+Each person also gets a files area on the server for what Kea keeps in sync there (1 GB unless you set more).
 
 ## Payroll
 
@@ -61,7 +49,8 @@ admin's own computer: pay runs from approved timecards, several pay rates per pe
 paid time off and holidays, raises with approvals and automatic retro pay, departments and cost centers with labor
 splits, onboarding with e-signed W-4 and state forms, the I-9 checklist, offboarding with each state's final-pay
 deadline, expenses, documents, reports, and W-2, 1099 and ACA data at year end. SSNs, bank details and documents
-are encrypted with a passphrase only you know and never leave that computer. Admins sign in with their Kea account
+are encrypted with a passphrase only you know and never leave that computer. When a pay run is finalized, each person
+gets their own pay stub in Kea, sealed for them. Admins sign in with their Kea account
 plus the passphrase. KeaS prepares the direct-deposit file for your own bank; it never holds or moves money. A pay
 run can be finalized only once that year's tax and labor tables have been checked against official sources.
 
@@ -73,8 +62,8 @@ yet, so Windows may show a warning; choose **More info → Run anyway**.
 
 ## Built with
 
-Electron and Node.js, with SQLite (`node:sqlite`) for the Hub's data, and electron-updater for KeaS's own updates. Accounts use
-Argon2id or scrypt password hashing, Ed25519-signed tokens and TOTP two-step sign-in, and public access goes through
+Electron and Node.js, with SQLite (`node:sqlite`) for the server's data, and electron-updater for KeaS's own updates.
+Sign-in uses Ed25519-signed passes from the Kea account server (`docs/protocol.md`), and public access goes through
 Tailscale Funnel. To build KeaS from source, see [docs/DEVELOPING.md](docs/DEVELOPING.md).
 
 ## Feedback
