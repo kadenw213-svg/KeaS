@@ -12,6 +12,7 @@ Needs Node 24.
 | Build the Windows installer | `npm run desktop:build` → `%LOCALAPPDATA%\KeaBuild\KeaS\release\KeaS Setup <version>.exe` |
 | All tests | `npm test` |
 | Hub tests only | `npm run test:hub` |
+| Org engine tests only | `npm run test:org` |
 | Workforce server with sample data | `node server/seed.mjs --reset`, then `npm run dev` and open http://127.0.0.1:5173 |
 | Type-check the web app | `npm run typecheck` |
 
@@ -35,17 +36,28 @@ Needs Node 24.
 - **Storage sizes:** `console POST owner/settings '{"storage":{"defaultGb":5,"supporterGb":25}}'`. The standard size is 5 GB and a supporter's 25 GB unless set here. A smaller size never deletes anything: people over it can't add files until they're under it again.
 - **Backups:** `node hub/backup.mjs create <folder>`, with `KEA_BACKUP_PASSPHRASE` set (sealed with AES-256-GCM).
 - **Never tunnel port 4861.** The owner console must only ever be reachable on the Hub's own computer.
+- **Bringing in an org server's people and time clock:** `node hub/import-org-server.mjs --server <org.db> --org <orgId> --dry-run` shows what would come in (people are matched to Kea accounts by the account their payroll sign-in is linked to, then by email); without `--dry-run` it imports. `KEAS_VAULT_PASSPHRASE` is that server's vault passphrase. Running it again only adds what's missing.
+
+## The org engine (`org/`)
+
+One module for organizations that any KeaS server mounts: `mountOrg({ R, h, now, audit, notify, identity })` (`org/index.mjs`). The Hub mounts it with its accounts as the identity (`hub/orgIdentity.mjs`).
+
+- **Roles** (`org/roles.mjs`): a role is a name and a list of abilities. Owner, Admin, Manager and Member are templates every org gets, with what the fixed roles of KeaS 0.5 could do. A role is given for the whole org or for chosen departments (and every team under them). Every check is `can(ability, department)`; to give a role, make a code for it, or change or remove someone, you must outrank them. Owners have every ability and the last owner can't go. `GET /v1/orgs/:id` tells each person their `me.abilities` and `me.scopes`; `role` is still there for older Kea (the highest template they have org-wide).
+- **Roles API:** `GET/POST /v1/orgs/:id/roles`, `POST /v1/orgs/:id/roles/:rid` (change), `POST /v1/orgs/:id/roles/:rid/delete`, `GET/POST /v1/orgs/:id/members/:aid/roles` (`{ roleId, scope: 'org' | [departmentIds] }`), `POST /v1/orgs/:id/members/:aid/roles/:rid/delete`.
+- **Time clock** (`org/clock.mjs`): `POST /v1/orgs/:id/clock` (`{ type: 'in' | 'out' }`), `GET .../clock`, `.../clock/today`, `.../clock/alerts`, `.../punch-requests` (and `/:rid/decide`), `.../timecards`, `.../timecards/period`, `.../timecards/approve`, `approve-many`, `unapprove`, `.../time-off` (and `/:tid/cancel`, `/:tid/decide`). Punches are append-only. Pay periods are the org's `settings.clock` (7 or 14 days from an anchor date).
+- **Upgrades:** `org/schema.mjs migrateOrg` upgrades a 0.5 database in place (each fixed role becomes its template). `test/fixtures/hub-0.5.0-orgs.sql` is a Hub database made by 0.5.0's code, for the upgrade test.
 
 ## Project layout
 
 ```
 hub/            the Kea Hub: accounts, terms, classes, study, storage, shared-Claude queue and relay
 hub/lib/        passwords, TOTP, tokens, limits, study scoring, Claude budget, Google sign-in
+org/            the org engine: members, roles and abilities, structure, forms, schedules, swaps, the time clock
 desktop/        the KeaS Windows app: setup wizard, Tailscale setup, tray
 server/         the workforce server: schedules, punches, timecards, certifications, pay runs
 shared/         labor-rule and tax tables (each records whether it's verified for the year)
 web/            the workforce web app (Vite + React), served by the workforce server
-test/           node:test suites for the Hub and the workforce server
+test/           node:test suites for the Hub, the org engine and the workforce server
 ```
 
 ## The payroll vault

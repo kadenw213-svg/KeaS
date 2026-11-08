@@ -833,7 +833,7 @@ export function createHub({
   const R = api.add;
 
   // features: what newer apps can use on this Hub (an older Hub has no list, so apps keep their old behavior there).
-  const FEATURES = ['orgJoinRequests', 'verifyEmailByManager', 'backupCodes'];
+  const FEATURES = ['orgJoinRequests', 'verifyEmailByManager', 'backupCodes', 'orgRoles', 'orgClock'];
   R('GET', '/v1/health', () => ({ ok: true, service: 'kea-hub', version: VERSION, features: FEATURES }), { auth: false });
   R('GET', '/v1/keys', () => ({ keys: [key.jwk] }), { auth: false });
   // Proves this is the Hub whose signing key is in its data folder: signs the caller's random nonce. KeaS checks it

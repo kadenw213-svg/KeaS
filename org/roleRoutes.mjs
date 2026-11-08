@@ -23,6 +23,13 @@ export function mountRoleRoutes(core, { R, deptRow }) {
   };
   const holders = (rid) => h.get('SELECT COUNT(*) AS n FROM org_role_assignments WHERE role_id = ?', rid).n;
   const catalog = () => ABILITY_LIST.map((a) => ({ id: a, label: ABILITIES[a], self: SELF_ABILITIES.has(a), orgOnly: ORG_ONLY.has(a) }));
+  /** Changing or deleting a role changes it for everyone who holds it: they must all be below me (or be me). */
+  const holdersBelow = (x, rid) => {
+    if (x.owner) return;
+    const all = core.effAll(x.o.id, x.tree);
+    for (const r of h.all('SELECT account_id FROM org_role_assignments WHERE role_id = ? AND account_id != ?', rid, x.who.id))
+      if (!outranks(x.eff, all.get(r.account_id) ?? core.NOBODY)) forbidden('That role is held by someone above you or level with you, so you can’t change it.');
+  };
   const capRoles = (oid) => { if (h.get('SELECT COUNT(*) AS n FROM org_roles WHERE org_id = ?', oid).n >= 200) bad('This organization has the most roles it can have (200). Remove some first.'); };
 
   R('GET', '/v1/orgs/:id/roles', ({ me, params }) => {
@@ -49,6 +56,7 @@ export function mountRoleRoutes(core, { R, deptRow }) {
     const x = asOrg(params.id, me, 'roles.manage', { dept: null });
     const r = core.roleRow(x.o.id, params.rid);
     if (!x.owner && !outranks(x.eff, core.effWith(x.o.id, r, null, x.tree))) forbidden('You can only change roles below your own.');
+    holdersBelow(x, r.id);
     let abilities = J(r.abilities, []);
     if ('abilities' in body) {
       if (r.template_key === 'owner') bad('The Owner role always has every ability.');
@@ -67,6 +75,7 @@ export function mountRoleRoutes(core, { R, deptRow }) {
     const r = core.roleRow(x.o.id, params.rid);
     if (r.template) bad('The Owner, Admin, Manager and Member roles can be changed but not deleted.');
     if (!x.owner && !outranks(x.eff, core.effWith(x.o.id, r, null, x.tree))) forbidden('You can only delete roles below your own.');
+    holdersBelow(x, r.id);
     const had = h.all('SELECT account_id FROM org_role_assignments WHERE role_id = ?', r.id).map((a) => a.account_id);
     tx(() => {
       h.run('DELETE FROM org_role_assignments WHERE role_id = ?', r.id);
