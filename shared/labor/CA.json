@@ -1,0 +1,82 @@
+{
+  "jurisdiction": "CA",
+  "name": "California (Labor Code 510, IWC wage orders, Healthy Workplaces Healthy Families Act)",
+  "status": "unverified",
+  "needsChecking": "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+  "overtime": {
+    "weeklyHours": 40,
+    "dailyHours": 8,
+    "consecutiveHours": null,
+    "multiplier": 1.5,
+    "combine": "union",
+    "seventhDay": {
+      "otFirstHours": 8
+    },
+    "doubleTime": {
+      "dailyHours": 12,
+      "seventhDayAfterHours": 8,
+      "multiplier": 2
+    },
+    "note": "Labor Code 510: 1.5x over 8 h in a workday, over 40 h in a workweek, and the first 8 h of the seventh consecutive day worked in a workweek; 2x over 12 h in a workday and over 8 h on that seventh day. Weekly overtime counts only hours that weren't already daily overtime. Alternative workweek schedules and exempt industries aren't handled. Needs checking."
+  },
+  "meal": {
+    "afterHours": 5,
+    "minutes": 30,
+    "paid": false,
+    "note": "A 30-minute meal period before the end of the fifth hour (a second after 10 h). The premium for a missed meal period (one extra hour of pay at the regular rate per workday) isn't worked out by KeaS yet. Needs checking."
+  },
+  "rest": {
+    "perHours": 4,
+    "minutes": 10,
+    "paid": true,
+    "missedPremium": false,
+    "note": "10 paid minutes per 4 hours or major fraction. California's premium for a missed rest break is one extra hour of pay per workday, not the 10 minutes; KeaS flags missed breaks but doesn't pay that premium yet. Needs checking."
+  },
+  "minors": null,
+  "minimumWage": {
+    "standard": null,
+    "tipped": null,
+    "youthDiscountPct": null,
+    "localOverrides": [],
+    "note": "The CA minimum wage isn't filled in yet: check this year's rate (and any city or county rate) and add it. Until then only the federal minimum is checked."
+  },
+  "sickLeave": {
+    "needsChecking": true,
+    "law": "CA Healthy Workplaces, Healthy Families Act",
+    "accrueHoursPer": 30,
+    "cap": 40,
+    "capKind": "hours an employer may limit use to each year",
+    "balanceCap": 80,
+    "carryoverCap": null,
+    "frontloadHours": 40,
+    "waitingDays": 90,
+    "note": "1 hour per 30 hours worked. As amended in 2024 (SB 616): an employer may cap use at 40 hours (5 days) a year and the balance at 80 hours (10 days), or front-load 40 hours. Use may wait until the 90th day of employment. Local ordinances (for example San Francisco, Los Angeles) can require more. Needs checking."
+  },
+  "notes": [
+    "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+    "Minor-labor rules here are the federal ones only; state child-labor limits aren't filled in."
+  ],
+  "source": [
+    {
+      "title": "California DIR: overtime",
+      "url": "https://www.dir.ca.gov/dlse/faq_overtime.htm",
+      "checked": null
+    },
+    {
+      "title": "California DIR: paid sick leave",
+      "url": "https://www.dir.ca.gov/dlse/paid_sick_leave.htm",
+      "checked": null
+    },
+    {
+      "title": "California DIR: meal periods",
+      "url": "https://www.dir.ca.gov/dlse/faq_mealperiods.htm",
+      "checked": null
+    },
+    {
+      "title": "California DIR: rest periods",
+      "url": "https://www.dir.ca.gov/dlse/faq_restperiods.htm",
+      "checked": null
+    }
+  ],
+  "verifiedFor": null
+}

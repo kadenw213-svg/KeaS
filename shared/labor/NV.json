@@ -1,0 +1,52 @@
+{
+  "jurisdiction": "NV",
+  "name": "Nevada (NRS 608)",
+  "status": "unverified",
+  "needsChecking": "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+  "overtime": {
+    "weeklyHours": 40,
+    "dailyHours": 8,
+    "consecutiveHours": null,
+    "multiplier": 1.5,
+    "note": "NRS 608.018: daily overtime over 8 h in a 24-hour period applies only to employees paid less than 1.5x the minimum wage; KeaS can't tell that yet and applies daily overtime to everyone in Nevada (which can overpay, never underpay). The 24-hour window isn't the calendar day KeaS uses. Needs checking."
+  },
+  "meal": null,
+  "rest": null,
+  "minors": null,
+  "minimumWage": {
+    "standard": null,
+    "tipped": null,
+    "youthDiscountPct": null,
+    "localOverrides": [],
+    "note": "The NV minimum wage isn't filled in yet: check this year's rate (and any city or county rate) and add it. Until then only the federal minimum is checked."
+  },
+  "sickLeave": {
+    "needsChecking": true,
+    "law": "Nevada paid leave (NRS 608.0197)",
+    "accrueHoursPer": 52,
+    "cap": 40,
+    "capKind": "hours an employer may limit use to each year",
+    "balanceCap": null,
+    "carryoverCap": 40,
+    "frontloadHours": null,
+    "waitingDays": 90,
+    "note": "Paid leave for any reason (not only sickness) at about 0.01923 h per hour worked (1 h per 52), for employers with 50 or more employees. Use may wait 90 days. Needs checking."
+  },
+  "notes": [
+    "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+    "Minor-labor rules here are the federal ones only; state child-labor limits aren't filled in."
+  ],
+  "source": [
+    {
+      "title": "Nevada Labor Commissioner",
+      "url": "https://labor.nv.gov/",
+      "checked": null
+    },
+    {
+      "title": "NRS 608 (Nevada Legislature)",
+      "url": "https://www.leg.state.nv.us/nrs/nrs-608.html",
+      "checked": null
+    }
+  ],
+  "verifiedFor": null
+}

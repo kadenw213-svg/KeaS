@@ -13,6 +13,7 @@ import { makeHubClient, checkHubUrl, keyFingerprint, KEY_CHANGE_REASONS, KEY_CHA
 import { makeTables } from './payroll/run.mjs';
 import { makeApprovals } from './payroll/approvals.mjs';
 import { registerPayroll } from './payroll/index.mjs';
+import { makeEngineSource, EngineUnavailable } from './payroll/engine.mjs';
 import { localDate, zonedToUtc, addDays, dayNum, iso, toMs, ageOn } from './lib/time.mjs';
 
 // KeaS's own version (package.json, or version.txt beside the before-sign-in copy), so a release can't leave it behind.
@@ -89,6 +90,11 @@ function sameOrigin(req, origins) {
  * function returning it, when the owner turned on local passwords in the KeaS app. devKeyFile: development and tests
  * only, keep a generated passphrase in a file next to the database (never for a real organization's data).
  *
+ * engineFeed: where the hours to pay come from (the org engine, server/payroll/engine.mjs): an async function
+ * ({ from, to }) -> the engine's pay feed for those dates. The KeaS app passes one that asks the organization's KeaS
+ * server with the signed-in Kea account. With it, a pay run's people, hours, pay codes and timecard approvals are the
+ * engine's; without it (development and tests), they're this database's own people, shifts and punches.
+ *
  * setupToken (vault): the one-time secret that setting up an empty vault needs. Left out, one is generated
  * (app.setupToken); the KeaS app gives it to its payroll window only. false: no token, and no fingerprint to confirm
  * for a Hub on another PC (tests only; a request or environment variable can't turn this off).
@@ -96,7 +102,7 @@ function sameOrigin(req, origins) {
 export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = process.env.KEAS_WEB_DIR || DEFAULT_WEB_DIR, log = true, now = () => Date.now(),
   vault: vaultMode = process.env.KEAS_VAULT === '1', hubUrl = process.env.KEAS_HUB_URL || null, sharedDir = SHARED, passphrase = process.env.KEAS_VAULT_PASSPHRASE || null, fetchImpl = globalThis.fetch,
   localSignIn = false, hubTrustKeys = null, devKeyFile = dbFile === DEFAULT_DB || dbFile === ':memory:' || process.env.KEAS_DEV_KEYFILE === '1',
-  demo = process.env.KEAS_DEV_DEMO === '1', publicHosts = [], setupToken = undefined, onVaultLock = null } = {}) {
+  demo = process.env.KEAS_DEV_DEMO === '1', publicHosts = [], setupToken = undefined, onVaultLock = null, engineFeed = null } = {}) {
   const demoOn = !!demo && !vaultMode;
   const vaultSetupToken = !vaultMode || setupToken === false ? null : setupToken || process.env.KEAS_VAULT_SETUP_TOKEN || randomBytes(32).toString('base64url');
   const extraHosts = (Array.isArray(publicHosts) ? publicHosts : [publicHosts]).filter(Boolean).map((x) => String(x).toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, ''));
@@ -165,7 +171,31 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     return h.all('SELECT * FROM punches WHERE person_id = ? AND at >= ? AND at < ? ORDER BY at', pid, iso(fromMs), iso(toMs_)).map(rowToPunch);
   }
 
+  // The org engine's hours, when this vault reads them (engineFeed); set up with the payroll routes below.
+  let engine = null;
+  /** A timecard from the engine's punches (with their pay codes) and approvals, under this vault's labor rules. */
+  function engineTimecard(org, person, period, m) {
+    const punches = m.punches.map((p) => ({ id: p.id, type: p.type, at: p.at, source: p.source, shiftId: p.shiftId, shift_id: p.shiftId, restAttested: p.restAttested, payCodeId: p.payCodeId }));
+    const shifts = m.shifts.map((s) => ({ id: s.id, start: s.start, end: s.end, positionId: s.positionId }));
+    const tc = timecard(punches, shifts, rulesFor(org), { workweekStart: org.workweekStart, tz: org.tz, lateThresholdMin: org.lateThresholdMin, now: now(), periodStart: period.start, periodEnd: period.end });
+    const byDate = new Map(tc.days.map((d) => [d.date, d]));
+    const days = [];
+    for (let d = period.start; d <= period.end; d = addDays(d, 1)) {
+      const r = byDate.get(d) || { workedMin: 0, regularMin: 0, overtimeMin: 0, doubleTimeMin: 0, restPremiumMin: 0, punches: [] };
+      days.push({ date: d, punches: r.punches.map((p) => ({ id: p.id, type: p.type, at: p.at, source: p.source, shiftId: p.shiftId })), workedMin: r.workedMin, regularMin: r.regularMin, overtimeMin: r.overtimeMin, doubleTimeMin: r.doubleTimeMin || 0, weeklyOvertimeMin: r.weeklyOvertimeMin || 0, restPremiumMin: r.restPremiumMin });
+    }
+    const inPeriod = punches.filter((p) => { const d = localDate(p.at, org.tz); return d >= period.start && d <= period.end; });
+    return {
+      person: { id: person.id, name: person.name }, period, days, weeks: tc.weeks, source: 'engine',
+      totals: { workedMin: tc.totals.workedMin, regularMin: tc.totals.regularMin, overtimeMin: tc.totals.overtimeMin, doubleTimeMin: tc.totals.doubleTimeMin, restPremiumMin: tc.totals.restPremiumMin },
+      flags: tc.flags, approved: m.approved ? { by: 'organization', at: null } : null,
+      editCount: inPeriod.filter((p) => String(p.source).startsWith('request:')).length,
+      lateCount: tc.lateCount, pendingRequests: m.pendingRequests || 0, openPunch: tc.open,
+    };
+  }
   function computeTimecard(org, person, period) {
+    const em = engine?.memberFor(person, period);
+    if (em) return engineTimecard(org, person, period, em);
     const from = zonedToUtc(addDays(period.start, -1), '00:00', org.tz), to = zonedToUtc(addDays(period.end, 2), '00:00', org.tz);
     const punches = punchesFor(person.id, from, to).map((p) => ({ ...p, shift_id: p.shiftId }));
     const shifts = h.all(`SELECT * FROM shifts WHERE person_id = ? AND status = 'published' AND start >= ? AND start < ?`, person.id, iso(from), iso(to)).map(rowToShift);
@@ -173,15 +203,15 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     const byDate = new Map(tc.days.map((d) => [d.date, d]));
     const days = [];
     for (let d = period.start; d <= period.end; d = addDays(d, 1)) {
-      const r = byDate.get(d) || { workedMin: 0, regularMin: 0, overtimeMin: 0, restPremiumMin: 0, punches: [] };
-      days.push({ date: d, punches: r.punches.map((p) => ({ id: p.id, type: p.type, at: p.at, source: p.source, shiftId: p.shiftId })), workedMin: r.workedMin, regularMin: r.regularMin, overtimeMin: r.overtimeMin, restPremiumMin: r.restPremiumMin });
+      const r = byDate.get(d) || { workedMin: 0, regularMin: 0, overtimeMin: 0, doubleTimeMin: 0, restPremiumMin: 0, punches: [] };
+      days.push({ date: d, punches: r.punches.map((p) => ({ id: p.id, type: p.type, at: p.at, source: p.source, shiftId: p.shiftId })), workedMin: r.workedMin, regularMin: r.regularMin, overtimeMin: r.overtimeMin, doubleTimeMin: r.doubleTimeMin || 0, weeklyOvertimeMin: r.weeklyOvertimeMin || 0, restPremiumMin: r.restPremiumMin });
     }
     const appr = h.get('SELECT approved_by, at FROM timecard_approvals WHERE person_id = ? AND period_start = ?', person.id, period.start);
     const inPeriod = punches.filter((p) => { const d = localDate(p.at, org.tz); return d >= period.start && d <= period.end; });
     const pending = h.all(`SELECT id FROM punch_requests WHERE person_id = ? AND status = 'pending' AND at >= ? AND at < ?`, person.id, iso(from), iso(to)).length;
     return {
       person: { id: person.id, name: person.name }, period, days, weeks: tc.weeks,
-      totals: { workedMin: tc.totals.workedMin, regularMin: tc.totals.regularMin, overtimeMin: tc.totals.overtimeMin, restPremiumMin: tc.totals.restPremiumMin },
+      totals: { workedMin: tc.totals.workedMin, regularMin: tc.totals.regularMin, overtimeMin: tc.totals.overtimeMin, doubleTimeMin: tc.totals.doubleTimeMin, restPremiumMin: tc.totals.restPremiumMin },
       flags: tc.flags, approved: appr ? { by: appr.approved_by, at: appr.at } : null,
       editCount: inPeriod.filter((p) => String(p.source).startsWith('request:')).length,
       lateCount: tc.lateCount, pendingRequests: pending, openPunch: tc.open,
@@ -196,7 +226,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     routes.push({ method, re, keys, handler, auth, maxBody, open });
   };
 
-  route('GET', '/v1/health', () => ({ ok: true, version: VERSION, minClient: '0.58.0', mode: vaultMode ? 'vault' : 'org' }), { auth: false, open: true });
+  route('GET', '/v1/health', () => ({ ok: true, version: VERSION, minClient: '0.58.0', mode: vaultMode ? 'vault' : 'org', hours: engineFeed ? 'engine' : 'local' }), { auth: false, open: true });
 
   const newSession = (personId, secure) => {
     const token = randomBytes(32).toString('hex');
@@ -549,6 +579,12 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     periodOf, currentPeriod, lastCompleted, parsePeriod, newSession, sessionCookie,
     saveOrgSettings(org, patch) { org.settings = { ...org.settings, ...patch }; h.run('UPDATE orgs SET settings = ? WHERE id = ?', JSON.stringify(org.settings), org.id); },
   };
+  if (typeof engineFeed === 'function') {
+    engine = makeEngineSource({ h, feed: engineFeed, uid: ctx.uid, now, iso });
+    ctx.engine = engine;
+  }
+  /** Before working out a pay period: the engine's hours for it (nothing to do when this vault keeps its own). */
+  ctx.loadEngine = async (org, period) => { if (engine) await engine.load(org, period); };
   registerPayroll(ctx);
   const payrollCtx = ctx;
 
@@ -633,6 +669,7 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     } catch (e) {
       if (e instanceof HttpError) { status = e.status; payload = { error: e.message, ...(e.extra || {}) }; }
       else if (e instanceof VaultLocked) { status = 423; payload = { error: e.message, locked: true }; }
+      else if (e instanceof EngineUnavailable) { status = 502; payload = { error: e.message, engine: true }; }
       else if (e instanceof SealError || e instanceof VaultDamaged) { status = 500; payload = { error: e.message, damaged: true }; console.error(e.message); }
       else { status = 500; payload = { error: 'internal error' }; console.error(e); }
     }

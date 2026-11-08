@@ -19,6 +19,8 @@ test('every ability belongs to the same lowest role that could do it in KeaS 0.5
     'certs.types': 'admin', 'classes.manage': 'manager', 'forms.manage': 'manager', 'schedule.view': 'manager', 'schedule.edit': 'manager', 'schedule.publish': 'manager',
     'swaps.decide': 'manager', 'policies.manage': 'manager', 'timecards.view': 'manager', 'timecards.approve': 'manager', 'timeoff.decide': 'manager',
     'clock.self': 'member', 'timeoff.request': 'member',
+    // (New since 0.5: pay codes, given to Admin.)
+    'paycodes.manage': 'admin', 'paycodes.assign': 'admin',
   };
   assert.deepEqual(Object.keys(min).sort(), [...ABILITY_LIST].sort(), 'every ability is listed here');
   for (const a of ABILITY_LIST) for (const k of KEYS) assert.equal(can(as(k), a, null), RANK[k] >= RANK[min[a]], `${k} ${a}`);

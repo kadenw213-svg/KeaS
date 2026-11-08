@@ -23,8 +23,10 @@ export const ABILITIES = {
   'codes.make': 'Make and revoke join codes',
   'structure.edit': 'Change departments, positions, locations and cost centers',
   'settings.edit': 'Change the organization’s settings',
-  'rates.view': 'See cost rates',
+  'rates.view': 'See cost rates, and other people’s pay codes and pay rates',
   'rates.assign': 'Set cost rates',
+  'paycodes.manage': 'Make and change pay codes (a job’s name and pay rate)',
+  'paycodes.assign': 'Give people pay codes, take them away, and set each person’s default code',
   'budgets.view': 'See budgets and scheduled hours',
   'budgets.costs': 'See labor cost against budgets',
   'budgets.edit': 'Set and remove budgets',
@@ -47,14 +49,14 @@ export const ABILITY_LIST = Object.keys(ABILITIES);
 /** Abilities about yourself only: a department scope means nothing for them. */
 export const SELF_ABILITIES = new Set(['clock.self', 'timeoff.request']);
 /** Abilities that only make sense for the whole organization (a department-scoped grant of one never counts). */
-export const ORG_ONLY = new Set(['roles.manage', 'structure.edit', 'settings.edit', 'certs.types']);
+export const ORG_ONLY = new Set(['roles.manage', 'structure.edit', 'settings.edit', 'certs.types', 'paycodes.manage']);
 
 const MEMBER = ['clock.self', 'timeoff.request'];
 const MANAGER = [...MEMBER, 'people.view', 'people.approve', 'people.verify', 'people.edit', 'people.remove', 'codes.make', 'budgets.view',
   'certs.manage', 'classes.manage', 'forms.manage', 'schedule.view', 'schedule.edit', 'schedule.publish', 'swaps.decide', 'policies.manage',
   'timecards.view', 'timecards.approve', 'timeoff.decide'];
 const ADMIN = [...MANAGER, 'people.birthdate', 'roles.assign', 'roles.manage', 'structure.edit', 'settings.edit', 'rates.view', 'rates.assign',
-  'budgets.costs', 'budgets.edit', 'certs.types'];
+  'paycodes.manage', 'paycodes.assign', 'budgets.costs', 'budgets.edit', 'certs.types'];
 /** The templates, highest first. `key` is how KeaS 0.5 named the role (Kea 0.70 still reads and sends it). */
 export const TEMPLATES = [
   { key: 'owner', name: 'Owner', abilities: ABILITY_LIST },

@@ -1,0 +1,41 @@
+{
+  "jurisdiction": "OR",
+  "name": "Oregon (sick time, ORS 653.601)",
+  "status": "unverified",
+  "needsChecking": "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+  "overtime": null,
+  "meal": null,
+  "rest": null,
+  "minors": null,
+  "minimumWage": {
+    "standard": null,
+    "tipped": null,
+    "youthDiscountPct": null,
+    "localOverrides": [],
+    "note": "The OR minimum wage isn't filled in yet: check this year's rate (and any city or county rate) and add it. Until then only the federal minimum is checked."
+  },
+  "sickLeave": {
+    "needsChecking": true,
+    "law": "Oregon sick time",
+    "accrueHoursPer": 30,
+    "cap": 40,
+    "capKind": "hours accrued each year",
+    "balanceCap": null,
+    "carryoverCap": 40,
+    "frontloadHours": 40,
+    "waitingDays": 91,
+    "note": "1 hour per 30 hours worked, up to 40 hours a year. Paid for employers with 10 or more employees (6 or more in Portland), unpaid for smaller ones. Up to 40 hours carry over. Needs checking."
+  },
+  "notes": [
+    "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+    "Minor-labor rules here are the federal ones only; state child-labor limits aren't filled in."
+  ],
+  "source": [
+    {
+      "title": "Oregon BOLI: sick time",
+      "url": "https://www.oregon.gov/boli/workers/pages/sick-time.aspx",
+      "checked": null
+    }
+  ],
+  "verifiedFor": null
+}

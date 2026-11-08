@@ -1,0 +1,41 @@
+{
+  "jurisdiction": "NJ",
+  "name": "New Jersey (Earned Sick Leave Law)",
+  "status": "unverified",
+  "needsChecking": "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+  "overtime": null,
+  "meal": null,
+  "rest": null,
+  "minors": null,
+  "minimumWage": {
+    "standard": null,
+    "tipped": null,
+    "youthDiscountPct": null,
+    "localOverrides": [],
+    "note": "The NJ minimum wage isn't filled in yet: check this year's rate (and any city or county rate) and add it. Until then only the federal minimum is checked."
+  },
+  "sickLeave": {
+    "needsChecking": true,
+    "law": "New Jersey earned sick leave",
+    "accrueHoursPer": 30,
+    "cap": 40,
+    "capKind": "hours accrued and used each benefit year",
+    "balanceCap": null,
+    "carryoverCap": 40,
+    "frontloadHours": 40,
+    "waitingDays": 120,
+    "note": "1 hour per 30 hours worked, up to 40 hours a benefit year; use may wait until the 120th day. Needs checking."
+  },
+  "notes": [
+    "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+    "Minor-labor rules here are the federal ones only; state child-labor limits aren't filled in."
+  ],
+  "source": [
+    {
+      "title": "New Jersey Department of Labor: earned sick leave",
+      "url": "https://www.nj.gov/labor/worker-protections/earnedsick/",
+      "checked": null
+    }
+  ],
+  "verifiedFor": null
+}

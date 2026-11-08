@@ -199,6 +199,8 @@ const ADD_COLUMNS = {
     ['grade_id', 'TEXT'], ['worker_type', "TEXT NOT NULL DEFAULT 'employee'"], ['employee_number', 'TEXT'],
     ['default_allocations', "TEXT NOT NULL DEFAULT '[]'"], ['pii_enc', 'TEXT'], ['holiday_calendar_id', 'TEXT'],
     ['ytd_year', 'INTEGER'], ['legal_name', 'TEXT'],
+    // The Kea account this person is in the org engine (server/payroll/engine.mjs): their hours come from there.
+    ['kea_account_id', 'TEXT'],
   ],
   // What an approval was given for (a pay run: a hash of its lines and totals); acting on something else is refused.
   approval_requests: [['bind_hash', 'TEXT']],

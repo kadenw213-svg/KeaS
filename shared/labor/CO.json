@@ -23,7 +23,7 @@
     "youthDiscountNote": "Unemancipated minors may be paid up to 15% below the state minimum, but not where a local minimum wage applies.",
     "localOverrides": [ { "place": "Denver", "standard": 19.29 } ]
   },
-  "sickLeave": { "accrueHoursPer": 30, "cap": 48, "note": "HFWA: 1 hour paid sick leave per 30 hours worked, up to 48 hours per year." },
+  "sickLeave": { "law": "Colorado Healthy Families and Workplaces Act", "accrueHoursPer": 30, "cap": 48, "capKind": "hours accrued each year", "balanceCap": null, "carryoverCap": 48, "frontloadHours": null, "waitingDays": null, "needsChecking": true, "note": "HFWA: 1 hour paid sick leave per 30 hours worked, up to 48 hours per year; up to 48 unused hours carry over. Not yet verified against the official source." },
   "finalPay": {
     "involuntary": { "rule": "immediate", "note": "C.R.S. 8-4-109: wages are due immediately when the employer ends the employment (with short extensions when the accounting unit is closed or offsite). Not yet verified against the official source." },
     "voluntary": { "rule": "next_payday", "note": "C.R.S. 8-4-109: when the employee quits, wages are due by the next regular payday. Not yet verified against the official source." }

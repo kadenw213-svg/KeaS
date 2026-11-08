@@ -6,6 +6,7 @@
 import { addDays } from '../lib/time.mjs';
 import { localMinimumWage } from '../lib/rules.mjs';
 import { depositAccounts } from './paystructure.mjs';
+import { suggestSickPolicy } from './leave.mjs';
 
 const step = (id, title, done, text, fix = null, extra = {}) => ({ id, title, done: !!done, text, fix, ...extra });
 
@@ -33,8 +34,12 @@ export function payrollChecklist(c, org) {
     ...have,
     { name: 'Minimum wage', have: rules?.minimumWage?.standard != null, verified: false, note: rules?.minimumWage?.standard != null ? `$${rules.minimumWage.standard.toFixed(2)} an hour${local ? ` (${local.place})` : ''}` : null },
     { name: 'Overtime', have: !!rules?.overtime, verified: false, note: rules?.overtime ? `over ${rules.overtime.weeklyHours} h a week${rules.overtime.dailyHours ? ` or ${rules.overtime.dailyHours} h a day` : ''}` : null },
-    { name: 'Paid sick leave', have: !!rules?.sickLeave, verified: false, note: rules?.sickLeave ? `1 h per ${rules.sickLeave.accrueHoursPer} h worked, up to ${rules.sickLeave.cap} h` : null },
+    { name: 'Double time', have: !!rules?.overtime?.doubleTime, verified: false, note: rules?.overtime?.doubleTime ? `over ${rules.overtime.doubleTime.dailyHours} h a day${rules.overtime.doubleTime.seventhDayAfterHours != null ? `, and over ${rules.overtime.doubleTime.seventhDayAfterHours} h on a seventh day in a row` : ''}` : null },
+    { name: 'Paid sick leave', have: !!rules?.sickLeave, verified: false, note: rules?.sickLeave ? `1 h per ${rules.sickLeave.accrueHoursPer} h worked${rules.sickLeave.cap != null ? `, up to ${rules.sickLeave.cap} h` : ''}` : null },
   ];
+  // Every labor file is a suggestion until checked against its sources (verifiedFor stays null in the code).
+  const laborFiles = T.list.filter((t) => t.key.startsWith('labor:') && !t.missing).map((t) => ({ name: t.name, verified: !!t.verified, note: t.verified ? `Checked for ${year}.` : 'Not verified: a suggestion until it’s checked against the official sources.' }));
+  for (const f of laborFiles) rulesList.push({ name: f.name, have: true, verified: f.verified, note: f.note, labor: true });
   const missing = have.filter((t) => !t.have).map((t) => t.name);
   const cityNote = s.workCity && !local ? ` KeaS has no ${s.workCity} rules${places.length ? ` (it knows ${places.join(', ')})` : ''}: check whether your city or county has its own minimum wage or leave rules.` : '';
   steps.push(step('rules', `Rules for ${T.state?.label || org.state || 'your state'}`, org.state && !missing.length,
@@ -43,10 +48,12 @@ export function payrollChecklist(c, org) {
 
   // 3. The tables checked for the pay year (never done by anyone in the app: see the text).
   const sources = [...(T.us?.source || []), ...(T.state?.source || [])].map((x) => ({ title: x.title, url: x.url }));
-  steps.push(step('verified', `Tax tables checked for ${year}`, T.verified,
+  const laborSources = [...(rules?.source || [])].map((x) => ({ title: x.title, url: x.url }));
+  const laborUnverified = laborFiles.filter((f) => !f.verified).map((f) => f.name);
+  steps.push(step('verified', `Tax tables and labor rules checked for ${year}`, T.verified,
     T.verified ? `The ${year} tables are checked against the official sources.`
-      : `A pay run can be reviewed but not finalized until the ${year} federal and ${org.state || 'state'} tables are checked line by line against the official sources (the IRS’s Publication 15-T, the state’s withholding guide). The KeaS maintainers do that check and send the checked tables in a KeaS update; nobody can mark a table checked inside KeaS. Keep KeaS updated.`,
-    null, { blocking: true, sources }));
+      : `A pay run can be reviewed but not finalized until the ${year} federal and ${org.state || 'state'} tables are checked line by line against the official sources (the IRS’s Publication 15-T, the state’s withholding guide)${laborUnverified.length ? `, and the labor rules (${laborUnverified.join(', ')}: overtime, double time, sick leave) against the labor department’s` : ''}. The KeaS maintainers do that check and send the checked tables in a KeaS update; nobody can mark a table checked inside KeaS. Keep KeaS updated.`,
+    null, { blocking: true, sources: [...sources, ...laborSources], laborUnverified }));
 
   // 4. The employer: legal name, EIN and the company bank account (the bank file needs it).
   const ent = h.get('SELECT * FROM legal_entities WHERE org_id = ? ORDER BY is_default DESC LIMIT 1', org.id);
@@ -78,6 +85,15 @@ export function payrollChecklist(c, org) {
     !paid.length ? 'Add people first.' : gaps.length ? `${gaps.length} ${gaps.length === 1 ? 'person needs' : 'people need'} details: ${gaps.slice(0, 3).map((g) => `${g.name} (${g.needs.join(', ')})`).join('; ')}${gaps.length > 3 ? '…' : ''}.` : `Pay rate, W-4 and SSN for everyone.${noDeposit ? ` ${noDeposit} paid by check (no direct deposit).` : ''}`,
     gaps.length ? { view: 'employees', personId: gaps[0].personId, edit: gaps[0].edit } : { view: 'employees' }, { people: gaps }));
 
+  // 6b. Paid sick leave: a policy, suggested from the law where people work (the owner checks and edits it).
+  const sickSuggestion = suggestSickPolicy(rules);
+  const sickPolicies = h.get("SELECT COUNT(*) AS n FROM pto_policies WHERE org_id = ? AND kind = 'sick' AND active = 1", org.id).n;
+  if (sickSuggestion) steps.push(step('sickLeave', 'Paid sick leave policy', sickPolicies > 0,
+    sickPolicies ? `${sickPolicies} sick leave polic${sickPolicies === 1 ? 'y' : 'ies'}. Check ${sickPolicies === 1 ? 'it' : 'them'} against the law: ${sickSuggestion.why}`
+      : `${org.state} law: ${sickSuggestion.why} KeaS suggests a policy from that; check it (the tables aren’t verified, and limits often depend on how many people you employ), then save it.`,
+    { view: 'timeoff', tab: 'policies', suggest: 'sick' }, { suggestion: sickSuggestion }));
+  else steps.push(step('sickLeave', 'Paid sick leave policy', true, `KeaS has no paid sick leave law for ${org.state || 'your state'}. You can add a policy of your own under Time off.`, { view: 'timeoff', tab: 'policies' }, { optional: true }));
+
   // 7. Who approves: timecards need someone other than the person (a manager, or the owner).
   const managers = people.filter((p) => (p.roles || []).includes('manager')).length;
   const chains = h.get('SELECT COUNT(*) AS n FROM approval_chains WHERE org_id = ? AND active = 1', org.id)?.n || 0;
@@ -96,8 +112,12 @@ export function payrollChecklist(c, org) {
 }
 
 export function registerChecklist(c) {
-  c.route('GET', '/v1/setup/checklist', ({ me, org }) => {
+  c.route('GET', '/v1/setup/checklist', async ({ me, org }) => {
     c.need(me, 'owner', 'payroll');
-    return payrollChecklist(c, org);
+    // (The engine's hours for the timecard step; the list still answers when the organization server can't.)
+    let engineError = null;
+    try { await c.loadEngine?.(org, c.lastCompleted(org)); } catch (e) { engineError = e.message; }
+    const out = payrollChecklist(c, org);
+    return engineError ? { ...out, engineError } : out;
   });
 }

@@ -9,7 +9,7 @@ const REASONS = ['forgot', 'device', 'early_late_fix', 'other'];
 const H = 3600_000;
 
 export function mountClock(core, { R, rulesFor, date, list }) {
-  const { h, now, audit, notify, V, bad, forbidden, notFound, tx, id, asOrg, memberRow, names } = core;
+  const { h, now, audit, notify, V, bad, forbidden, notFound, tx, id, asOrg, memberRow, names, pay } = core;
   const deptOf = (oid, aid) => memberRow(oid, aid)?.department_id ?? null;
 
   // ---------- pay periods ----------
@@ -32,12 +32,12 @@ export function mountClock(core, { R, rulesFor, date, list }) {
   };
 
   // ---------- punches ----------
-  const punchOut = (p) => ({ id: p.id, accountId: p.account_id, shiftId: p.shift_id, type: p.type, at: iso(p.at), source: p.source, restAttested: p.rest_attested == null ? null : !!p.rest_attested, createdAt: iso(p.created_at) });
+  const punchOut = (p, code = p.pay_code_id ?? null) => ({ id: p.id, accountId: p.account_id, shiftId: p.shift_id, type: p.type, at: iso(p.at), source: p.source, restAttested: p.rest_attested == null ? null : !!p.rest_attested, createdAt: iso(p.created_at), payCodeId: code });
   const lastPunch = (oid, aid) => h.get('SELECT * FROM org_punches WHERE org_id = ? AND account_id = ? ORDER BY at DESC, created_at DESC LIMIT 1', oid, aid);
   const openPunch = (oid, aid, t = now()) => { const l = lastPunch(oid, aid); return l && l.type === 'in' && t - l.at < 16 * H ? l : null; };
-  const addPunch = (o, aid, { shiftId = null, type, at, source, restAttested = null }) => {
+  const addPunch = (o, aid, { shiftId = null, type, at, source, restAttested = null, payCodeId = null }) => {
     const pid = id();
-    h.run('INSERT INTO org_punches (id,org_id,account_id,shift_id,type,at,source,rest_attested,created_at) VALUES (?,?,?,?,?,?,?,?,?)', pid, o.id, aid, shiftId, type, at, source, restAttested == null ? null : restAttested ? 1 : 0, now());
+    h.run('INSERT INTO org_punches (id,org_id,account_id,shift_id,type,at,source,rest_attested,created_at,pay_code_id) VALUES (?,?,?,?,?,?,?,?,?,?)', pid, o.id, aid, shiftId, type, at, source, restAttested == null ? null : restAttested ? 1 : 0, now(), payCodeId);
     return h.get('SELECT * FROM org_punches WHERE id = ?', pid);
   };
   const shiftBrief = (sh) => sh && ({ id: sh.id, positionId: sh.position_id, start: iso(sh.start_at), end: iso(sh.end_at), date: sh.date, status: sh.status });
@@ -59,7 +59,12 @@ export function mountClock(core, { R, rulesFor, date, list }) {
       shift = cands.sort((a, b) => Math.abs(a.start_at - t) - Math.abs(b.start_at - t))[0] ?? null;
       if (!shift && s.clock.needShift) bad('There’s no shift of yours around now. Ask a manager to add one, or to fix it with a missed-punch request.');
     }
-    const p = addPunch(o, me.id, { shiftId: shift?.id ?? null, type, at: t, source: V.enum(body.source ?? 'app', 'Source', ['app', 'kiosk', 'phone']), restAttested });
+    // The pay code: the one asked for (one of mine), else the shift's when I was given it, else my default. A
+    // clock-out carries its clock-in's code.
+    let payCodeId;
+    if (type === 'in') payCodeId = body.payCodeId != null ? pay.pickFor(o.id, me.id, body.payCodeId) : (shift?.pay_code_id && pay.granted(o.id, me.id, shift.pay_code_id) ? shift.pay_code_id : pay.defaultOf(o.id, me.id));
+    else payCodeId = pay.effectiveCodes(o.id, me.id, [open]).get(open.id) ?? null;
+    const p = addPunch(o, me.id, { shiftId: shift?.id ?? null, type, at: t, source: V.enum(body.source ?? 'app', 'Source', ['app', 'kiosk', 'phone']), restAttested, payCodeId });
     const minutesLate = type === 'in' && shift ? Math.max(0, Math.floor((t - shift.start_at) / 60000)) : 0;
     audit(me.id, `org.clock_${type}`, o.id, { shift: shift?.id ?? null }, ip);
     return { status: 201, body: { punch: punchOut(p), shift: shiftBrief(shift), minutesLate, late: minutesLate > s.clock.lateThresholdMin } };
@@ -67,7 +72,7 @@ export function mountClock(core, { R, rulesFor, date, list }) {
   R('GET', '/v1/orgs/:id/clock', ({ me, params }) => {
     const x = asOrg(params.id, me);
     const open = openPunch(x.o.id, me.id);
-    return { clockedIn: !!open, punch: open ? punchOut(open) : null, canClock: x.can('clock.self'), period: currentPeriod(x.o, x.s) };
+    return { clockedIn: !!open, punch: open ? punchOut(open, pay.effectiveCodes(x.o.id, me.id, [open]).get(open.id) ?? null) : null, canClock: x.can('clock.self'), period: currentPeriod(x.o, x.s), defaultPayCodeId: pay.defaultOf(x.o.id, me.id) };
   });
 
   /** Where a published shift stands right now: upcoming, late, clocked in or out, or a no-show. */
@@ -165,16 +170,18 @@ export function mountClock(core, { R, rulesFor, date, list }) {
   // ---------- timecards ----------
   function computeTimecard(o, s, aid, period, nm = names(o.id)) {
     const from = zonedToUtc(addDays(period.start, -1), '00:00', o.tz), to = zonedToUtc(addDays(period.end, 2), '00:00', o.tz);
-    const punches = h.all('SELECT * FROM org_punches WHERE org_id = ? AND account_id = ? AND at >= ? AND at < ? ORDER BY at', o.id, aid, from, to)
-      .map((p) => ({ id: p.id, type: p.type, at: iso(p.at), source: p.source, shiftId: p.shift_id, shift_id: p.shift_id, restAttested: p.rest_attested == null ? null : !!p.rest_attested }));
+    const raw = h.all('SELECT * FROM org_punches WHERE org_id = ? AND account_id = ? AND at >= ? AND at < ? ORDER BY at', o.id, aid, from, to);
+    const eff = pay.effectiveCodes(o.id, aid, raw);
+    const punches = raw.map((p) => ({ id: p.id, type: p.type, at: iso(p.at), source: p.source, shiftId: p.shift_id, shift_id: p.shift_id, restAttested: p.rest_attested == null ? null : !!p.rest_attested, payCodeId: eff.get(p.id) ?? null }));
     const shifts = h.all("SELECT * FROM org_shifts WHERE org_id = ? AND account_id = ? AND status = 'published' AND start_at >= ? AND start_at < ?", o.id, aid, from, to)
       .map((sh) => ({ id: sh.id, start: iso(sh.start_at), end: iso(sh.end_at), positionId: sh.position_id }));
     const tc = timecard(punches, shifts, rulesFor(o, s), { workweekStart: o.workweek_start, tz: o.tz, lateThresholdMin: s.clock.lateThresholdMin, now: now(), periodStart: period.start, periodEnd: period.end });
     const byDate = new Map(tc.days.map((d) => [d.date, d]));
     const days = [];
     for (let d = period.start; d <= period.end; d = addDays(d, 1)) {
-      const r = byDate.get(d) || { workedMin: 0, regularMin: 0, overtimeMin: 0, restPremiumMin: 0, punches: [] };
-      days.push({ date: d, punches: r.punches, workedMin: r.workedMin, regularMin: r.regularMin, overtimeMin: r.overtimeMin, restPremiumMin: r.restPremiumMin });
+      const r = byDate.get(d) || { workedMin: 0, regularMin: 0, overtimeMin: 0, doubleTimeMin: 0, restPremiumMin: 0, punches: [] };
+      const codeOf = new Map(punches.map((p) => [p.id, p.payCodeId]));
+      days.push({ date: d, punches: r.punches.map((p) => ({ ...p, payCodeId: codeOf.get(p.id) ?? null })), workedMin: r.workedMin, regularMin: r.regularMin, overtimeMin: r.overtimeMin, doubleTimeMin: r.doubleTimeMin || 0, restPremiumMin: r.restPremiumMin });
     }
     const appr = h.get('SELECT approved_by, at FROM org_timecard_approvals WHERE org_id = ? AND account_id = ? AND period_start = ?', o.id, aid, period.start);
     const inPeriod = punches.filter((p) => { const d = localDate(p.at, o.tz); return d >= period.start && d <= period.end; });

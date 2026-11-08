@@ -31,7 +31,7 @@ test('the tables are upgraded in place, once, with a record of it', () => {
   assert.equal(h.db.prepare('PRAGMA table_info(org_codes)').all().some((c) => c.name === 'role'), false);
   const up = JSON.parse(h.get("SELECT value FROM org_meta WHERE key = 'upgraded'").value);
   assert.deepEqual([up.from, up.members, up.codes], [1, 6, 3]);
-  assert.equal(h.get("SELECT value FROM org_meta WHERE key = 'schema'").value, '2');
+  assert.equal(h.get("SELECT value FROM org_meta WHERE key = 'schema'").value, '3');
   assert.equal(h.get('SELECT COUNT(*) AS n FROM org_member_positions').n, 2, 'positions survive the rebuild');
   assert.equal(h.get('SELECT COUNT(*) AS n FROM org_roles WHERE org_id = ? AND template = 1', ORG).n, 4);
   assert.deepEqual(h.db.prepare('PRAGMA foreign_key_check').all().filter((r) => String(r.table).startsWith('org_')), []);

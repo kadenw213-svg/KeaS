@@ -83,6 +83,8 @@ export function createBackup(dataDir, outDir, pass, { payrollDb = null } = {}) {
   if (!existsSync(join(dataDir, 'hub.db'))) throw new Error(`${dataDir} has no hub.db.`);
   if (payrollDb && !existsSync(payrollDb)) throw new Error(`There is no payroll vault at ${payrollDb}.`);
   const files = { 'hub.db': snapshot(join(dataDir, 'hub.db')), 'hub-signing-key.pem': readFileSync(join(dataDir, 'hub-signing-key.pem')) };
+  // (Pay code rates in hub.db only open with the org data key.)
+  if (existsSync(join(dataDir, 'org-data.key'))) files['org-data.key'] = readFileSync(join(dataDir, 'org-data.key'));
   if (payrollDb) files['payroll-vault.db'] = snapshot(payrollDb);
   mkdirSync(outDir, { recursive: true });
   const file = join(outDir, `kea-hub-${new Date().toISOString().replace(/[:.]/g, '-')}.keabak`);

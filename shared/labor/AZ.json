@@ -1,0 +1,41 @@
+{
+  "jurisdiction": "AZ",
+  "name": "Arizona (earned paid sick time, A.R.S. 23-371)",
+  "status": "unverified",
+  "needsChecking": "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+  "overtime": null,
+  "meal": null,
+  "rest": null,
+  "minors": null,
+  "minimumWage": {
+    "standard": null,
+    "tipped": null,
+    "youthDiscountPct": null,
+    "localOverrides": [],
+    "note": "The AZ minimum wage isn't filled in yet: check this year's rate (and any city or county rate) and add it. Until then only the federal minimum is checked."
+  },
+  "sickLeave": {
+    "needsChecking": true,
+    "law": "Arizona earned paid sick time",
+    "accrueHoursPer": 30,
+    "cap": 40,
+    "capKind": "hours an employer may limit accrual and use to each year",
+    "balanceCap": null,
+    "carryoverCap": null,
+    "frontloadHours": null,
+    "waitingDays": 90,
+    "note": "1 hour per 30 hours worked. Employers with 15 or more employees may cap at 40 hours a year; with fewer than 15, at 24 hours. Needs checking."
+  },
+  "notes": [
+    "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+    "Minor-labor rules here are the federal ones only; state child-labor limits aren't filled in."
+  ],
+  "source": [
+    {
+      "title": "Industrial Commission of Arizona: earned paid sick time",
+      "url": "https://www.azica.gov/labor-earned-paid-sick-time",
+      "checked": null
+    }
+  ],
+  "verifiedFor": null
+}

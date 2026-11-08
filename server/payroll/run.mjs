@@ -1,6 +1,7 @@
-// Pay runs: earnings from punches (rates by position and date, differentials, overtime at the blended regular rate,
-// paid time off, holidays, retro pay, reimbursements), taxes, labor allocation, finalizing, the NACHA file, pay stubs
-// and the GL journal. A run is finalized only when that year's tax and labor tables are verified.
+// Pay runs: earnings from punches (pay codes or rates by position and date, differentials, overtime and double time at
+// the weighted-average regular rate, paid time off, sick pay, holidays, bonuses, retro pay, reimbursements), taxes,
+// labor allocation, finalizing, the NACHA file, pay stubs and the GL journal. A run is finalized only when that year's
+// tax and labor tables are verified. With the org engine (engine.mjs), hours and pay codes come from there.
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { payLine } from '../lib/pay.mjs';
@@ -79,26 +80,34 @@ export function registerRun(c) {
   const differentials = (orgId) => h.all('SELECT * FROM differentials WHERE org_id = ? AND active = 1', orgId).map(rowToDiff);
   const defaultEntity = (orgId) => h.get('SELECT id FROM legal_entities WHERE org_id = ? ORDER BY is_default DESC, name LIMIT 1', orgId)?.id ?? null;
 
-  /** Worked time split into segments by date, shift and position, with rates and differential pay. */
+  /**
+   * Worked time split into segments by date, shift, position and pay code, with rates and differential pay. From the
+   * org engine (each stretch at its clock-in's pay code, rated by that code) when it has this person, otherwise from
+   * this database's punches (rated by position and date).
+   */
   function segmentsFor(org, person, period) {
     const tz = org.tz;
     const from = zonedToUtc(addDays(period.start, -1), '00:00', tz), to = zonedToUtc(addDays(period.end, 2), '00:00', tz);
-    const punches = h.all('SELECT * FROM punches WHERE person_id = ? AND at >= ? AND at < ? ORDER BY at', person.id, iso(from), iso(to)).map((p) => ({ id: p.id, type: p.type, at: p.at, shiftId: p.shift_id }));
+    const em = c.engine?.memberFor(person, period) ?? null;
+    const punches = em ? em.punches.map((p) => ({ id: p.id, type: p.type, at: p.at, shiftId: p.shiftId, payCodeId: p.payCodeId ?? null }))
+      : h.all('SELECT * FROM punches WHERE person_id = ? AND at >= ? AND at < ? ORDER BY at', person.id, iso(from), iso(to)).map((p) => ({ id: p.id, type: p.type, at: p.at, shiftId: p.shift_id }));
     const { pairs } = pairPunches(punches, { now: now() });
-    const shiftPos = new Map(h.all('SELECT id, position_id FROM shifts WHERE person_id = ? AND start >= ? AND start < ?', person.id, iso(from - 86400000), iso(to)).map((s) => [s.id, s.position_id]));
+    const shiftPos = em ? new Map(em.shifts.map((s) => [s.id, s.positionId]))
+      : new Map(h.all('SELECT id, position_id FROM shifts WHERE person_id = ? AND start >= ? AND start < ?', person.id, iso(from - 86400000), iso(to)).map((s) => [s.id, s.position_id]));
     const diffs = differentials(org.id);
     const map = new Map();
     for (const pr of pairs) {
       const shiftId = pr.in.shiftId ?? pr.out.shiftId ?? null;
       const positionId = (shiftId && shiftPos.get(shiftId)) || person.positions[0] || null;
+      const payCodeId = em ? pr.in.payCodeId ?? null : null;
       const n = Math.max(0, Math.round((pr.end - pr.start) / 60000));
       for (let i = 0; i < n; i++) {
         const ms = pr.start + i * 60000;
         const date = localDate(ms, tz);
         if (date < period.start || date > period.end) continue;
-        const key = `${date}|${shiftId}|${positionId}`;
+        const key = `${date}|${shiftId}|${positionId}|${payCodeId}`;
         let s = map.get(key);
-        if (!s) map.set(key, (s = { date, shiftId, positionId, minutes: 0, diffMin: {} }));
+        if (!s) map.set(key, (s = { date, shiftId, positionId, payCodeId, fromEngine: !!em, minutes: 0, diffMin: {} }));
         s.minutes++;
         if (diffs.length) {
           const dow = weekday(date), mod = localMinuteOfDay(ms, tz);
@@ -108,7 +117,9 @@ export function registerRun(c) {
     }
     const segs = [...map.values()].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
     for (const s of segs) {
-      const r = rateFor(h, person, s.positionId, s.date);
+      const code = s.payCodeId ? c.engine.codeOf(s.payCodeId) : null;
+      const r = code ? { cents: code.rateCents, kind: 'hourly' } : rateFor(h, person, s.positionId, s.date);
+      s.payCodeName = code?.name ?? null;
       s.rateCents = r?.cents ?? 0;
       s.rateKind = r?.kind ?? 'hourly';
       s.positionRate = !!r?.positionRate;
@@ -135,23 +146,44 @@ export function registerRun(c) {
   }
   c.ytdFor = ytdFor;
 
+  /**
+   * One person's pay for a period. Pay types (each its own earnings line, with hours and rate): regular (one line per
+   * pay code), overtime and double time (straight time at each code's rate plus the premium at the regular rate, with
+   * the working shown), shift differentials, missed rest-break pay, holiday, worked-holiday premium, paid time off,
+   * sick pay, bonus, and the other extra earnings (retro pay, payouts, reimbursements).
+   *
+   * Overtime follows the location's rules (labor files merged by rulesFor: federal 40 h a week, plus a state's daily
+   * overtime, seventh day and double time). The regular rate is the federal weighted average: every hour at its own
+   * code's rate, plus differentials and non-discretionary bonuses, divided by all hours worked.
+   */
   function lineFor(org, person, period, ctx) {
     const tc = c.computeTimecard(org, person, period);
-    const rules = ctx.rules, mult = rules.overtime?.multiplier ?? 1.5;
+    const rules = ctx.rules, otRule = rules.overtime || {}, mult = otRule.multiplier ?? 1.5, dtMult = otRule.doubleTime?.multiplier ?? 2;
     const segs = segmentsFor(org, person, period);
     const totalMin = segs.reduce((a, s) => a + s.minutes, 0);
-    // Overtime minutes per day, spread over that day's segments.
-    const otByDate = new Map(tc.days.map((d) => [d.date, d.overtimeMin]));
-    for (const [date, ot] of otByDate) {
-      const ds = segs.filter((s) => s.date === date);
-      apportion(Math.min(ot, ds.reduce((a, s) => a + s.minutes, 0)), ds.map((s) => s.minutes)).forEach((v, i) => (ds[i].otMin = v));
+    // Double time, then overtime, minutes per day (from the timecard), spread over that day's segments.
+    for (const d of tc.days) {
+      const ds = segs.filter((s) => s.date === d.date);
+      if (!ds.length) continue;
+      const dayMin = ds.reduce((a, s) => a + s.minutes, 0);
+      const dtDay = Math.min(d.doubleTimeMin || 0, dayMin);
+      apportion(dtDay, ds.map((s) => s.minutes)).forEach((v, i) => (ds[i].dtMin = v));
+      apportion(Math.min(d.overtimeMin || 0, dayMin - dtDay), ds.map((s) => s.minutes - s.dtMin)).forEach((v, i) => (ds[i].otMin = v));
     }
-    for (const s of segs) s.otMin ??= 0;
-    const otMin = segs.reduce((a, s) => a + s.otMin, 0);
-    const base = rateFor(h, person, null, period.end);
+    for (const s of segs) { s.otMin ??= 0; s.dtMin ??= 0; }
+    const otMin = segs.reduce((a, s) => a + s.otMin, 0), dtMin = segs.reduce((a, s) => a + s.dtMin, 0);
+    // A person paid only by pay codes (the engine) has no rate in the vault: holidays and time off use their default code.
+    const codeRate = c.engine?.defaultRateOf(person, period) ?? null;
+    const baseRate = (date) => rateFor(h, person, null, date) ?? (codeRate != null ? { cents: codeRate, kind: 'hourly', payCode: true } : null);
+    const base = baseRate(period.end);
     const salaried = base?.kind === 'salary';
     const earnings = [];
     let regularRate = 0;
+    const extras = h.all(`SELECT * FROM extra_earnings WHERE person_id = ? AND status = 'pending' ORDER BY created_at`, person.id);
+    const extraDetail = (e) => { const d = J(e.detail, null); return d && typeof d === 'object' && !Array.isArray(d) ? d : {}; };
+    // Non-discretionary bonuses paid this period count in the regular rate (FLSA); discretionary ones don't.
+    const bonusInRate = extras.filter((e) => e.code === 'bonus' && extraDetail(e).discretionary === false).reduce((a, e) => a + e.cents, 0);
+    const byCode = [];
     if (salaried) {
       const ppy = PERIODS_PER_YEAR[org.payFrequency] || 26;
       let cents = Math.round(base.cents / ppy);
@@ -162,49 +194,95 @@ export function registerRun(c) {
       if (days < all) { const was = cents; cents = Math.round((cents * days) / all); ex.push(`Employed ${days} of ${all} days this period: ${$(was)} x ${days}/${all} = ${$(cents)}`); }
       earnings.push({ code: 'salary', label: 'Salary', cents, hours: hrs(totalMin), explain: ex });
     } else if (totalMin > 0) {
-      const byRate = new Map();
-      for (const s of segs) byRate.set(s.rateCents, (byRate.get(s.rateCents) || 0) + s.minutes);
-      const straight = [...byRate].reduce((a, [r, m]) => a + Math.round((m * r) / 60), 0);
-      earnings.push({ code: 'regular', label: 'Hours worked', cents: straight, hours: hrs(totalMin), explain: [...byRate].map(([r, m]) => `Hours worked: ${hrs(m)} h x ${$(r)} = ${$(Math.round((m * r) / 60))}`) });
+      // Hours by pay code (and rate): the straight time for every hour is at its own code's rate.
+      const groups = new Map();
+      for (const s of segs) {
+        const k = `${s.payCodeId ?? ''}|${s.rateCents}`;
+        const g = groups.get(k) || { payCodeId: s.payCodeId ?? null, name: s.payCodeName ?? null, rateCents: s.rateCents, min: 0, regMin: 0, otMin: 0, dtMin: 0 };
+        g.min += s.minutes; g.otMin += s.otMin; g.dtMin += s.dtMin; g.regMin += s.minutes - s.otMin - s.dtMin;
+        groups.set(k, g);
+      }
+      const codes = [...groups.values()].sort((a, b) => b.min - a.min);
+      const at = (min, r) => Math.round((min * r) / 60);
+      const label = (g) => g.name || 'Hours worked';
+      let straight = 0;
+      for (const g of codes) {
+        const cents = at(g.regMin, g.rateCents);
+        straight += cents + at(g.otMin, g.rateCents) + at(g.dtMin, g.rateCents);
+        byCode.push({ payCodeId: g.payCodeId, name: g.name, rateCents: g.rateCents, hours: hrs(g.min), regular: hrs(g.regMin), overtime: hrs(g.otMin), doubleTime: hrs(g.dtMin) });
+        if (g.regMin) earnings.push({ code: 'regular', label: g.name ? `Regular: ${g.name}` : 'Regular', payCodeId: g.payCodeId, payCodeName: g.name, cents, hours: hrs(g.regMin), rateCents: g.rateCents, explain: [`${label(g)}: ${hrs(g.regMin)} h x ${$(g.rateCents)} = ${$(cents)}`] });
+      }
       const diff = segs.reduce((a, s) => a + s.diffCents, 0);
       if (diff) {
         const byDiff = new Map();
         for (const s of segs) for (const d of s.diffs) { const x = byDiff.get(d.name) || { min: 0, cents: 0 }; x.min += d.minutes; x.cents += d.cents; byDiff.set(d.name, x); }
         earnings.push({ code: 'differential', label: 'Shift differentials', cents: diff, hours: hrs([...byDiff.values()].reduce((a, x) => a + x.min, 0)), explain: [...byDiff].map(([n, x]) => `${n}: ${hrs(x.min)} h = ${$(x.cents)}`) });
       }
-      regularRate = (straight + diff) / (totalMin / 60);
-      if (otMin) {
-        const prem = Math.round((otMin / 60) * regularRate * (mult - 1));
-        earnings.push({ code: 'overtime', label: `Overtime premium (x${mult})`, cents: prem, hours: hrs(otMin), explain: [`Regular rate = (${$(straight)} + ${$(diff)}) / ${hrs(totalMin)} h = ${$(Math.round(regularRate))}/h`, `Overtime: ${hrs(otMin)} h x ${$(Math.round(regularRate))} x ${(mult - 1).toFixed(2)} premium = ${$(prem)} (straight time already counted above)`] });
-      }
+      regularRate = (straight + diff + bonusInRate) / (totalMin / 60);
+      const rr = Math.round(regularRate);
+      const rrLine = `Regular rate ${$(rr)} = ${$(straight + diff + bonusInRate)} ÷ ${hrs(totalMin)} h (every hour at its pay code’s rate${diff ? ', plus shift differentials' : ''}${bonusInRate ? ', plus non-discretionary bonuses' : ''}${codes.length > 1 ? `: ${codes.map((g) => `${label(g)} ${hrs(g.min)} h x ${$(g.rateCents)}`).join(' + ')}` : ''})`;
+      const basis = otRule.basis || rules.jurisdiction || 'federal';
+      const why = (kind) => tc.weeks.filter((w) => (kind === 'dt' ? w.doubleTimeMin : w.overtimeMin) > 0).map((w) => {
+        if (kind === 'dt') return `week of ${w.weekStart}: ${hrs(w.doubleTimeMin)} h${otRule.doubleTime?.dailyHours != null ? ` over ${otRule.doubleTime.dailyHours} h in a day` : ''}${otRule.doubleTime?.seventhDayAfterHours != null ? ` or over ${otRule.doubleTime.seventhDayAfterHours} h on a seventh day in a row` : ''}`;
+        const parts = [];
+        if (w.dailyOvertimeMin) parts.push(`${hrs(w.dailyOvertimeMin)} h over ${otRule.dailyHours} h in a day`);
+        if (w.consecutiveOvertimeMin && !w.dailyOvertimeMin) parts.push(`${hrs(w.consecutiveOvertimeMin)} h over ${otRule.consecutiveHours} h in a row`);
+        if (w.seventhDayOvertimeMin) parts.push(`${hrs(w.seventhDayOvertimeMin)} h on a seventh day in a row`);
+        if (w.method === 'weekly' || w.method === 'daily+weekly' || !parts.length) parts.push(`${hrs(w.weeklyOvertimeMin)} h over ${otRule.weeklyHours} h in the week`);
+        return `week of ${w.weekStart}: ${hrs(w.overtimeMin)} h (${parts.join(', ')}${w.method === 'daily/consecutive' || w.method === 'weekly' ? `; the ${w.method} count gives more` : ''})`;
+      }).join('; ');
+      const premiumLine = (kind, min, m, parts) => {
+        const prem = Math.round((min / 60) * regularRate * (m - 1));
+        const straightPart = parts.reduce((a, g) => a + at(kind === 'dt' ? g.dtMin : g.otMin, g.rateCents), 0);
+        const name = kind === 'dt' ? 'Double time' : 'Overtime';
+        return {
+          code: kind === 'dt' ? 'double_time' : 'overtime', label: `${name} (x${m})`, cents: straightPart + prem, hours: hrs(min), rateCents: Math.round((straightPart + prem) / (min / 60)),
+          premiumCents: prem, straightCents: straightPart, regularRateCents: rr, multiplier: m,
+          byCode: parts.map((g) => ({ payCodeId: g.payCodeId, name: g.name, hours: hrs(kind === 'dt' ? g.dtMin : g.otMin), rateCents: g.rateCents, cents: at(kind === 'dt' ? g.dtMin : g.otMin, g.rateCents) })),
+          explain: [
+            rrLine,
+            `${name} ${hrs(min)} h x ${+(m - 1).toFixed(2)} x ${$(rr)} premium = ${$(prem)}`,
+            `Straight time for those hours: ${parts.map((g) => `${label(g)} ${hrs(kind === 'dt' ? g.dtMin : g.otMin)} h x ${$(g.rateCents)}`).join(' + ')} = ${$(straightPart)}`,
+            `${name} total ${$(straightPart)} + ${$(prem)} = ${$(straightPart + prem)}`,
+            `Why (${basis} rules): ${why(kind)}`,
+          ],
+        };
+      };
+      if (otMin) earnings.push(premiumLine('ot', otMin, mult, codes.filter((g) => g.otMin)));
+      if (dtMin) earnings.push(premiumLine('dt', dtMin, dtMult, codes.filter((g) => g.dtMin)));
       if (tc.totals.restPremiumMin) {
         const rp = Math.round((tc.totals.restPremiumMin / 60) * regularRate);
-        earnings.push({ code: 'rest_premium', label: 'Missed rest-break pay', cents: rp, hours: hrs(tc.totals.restPremiumMin), explain: [`${tc.totals.restPremiumMin} min x ${$(Math.round(regularRate))}/h = ${$(rp)}`] });
+        earnings.push({ code: 'rest_premium', label: 'Missed rest-break pay', cents: rp, hours: hrs(tc.totals.restPremiumMin), rateCents: rr, explain: [`${tc.totals.restPremiumMin} min x ${$(rr)}/h = ${$(rp)}`] });
       }
     }
     // Holidays: paid hours for hourly people employed that day; worked-holiday premium.
+    let holidayHours = 0;
     for (const hd of holidaysFor(h, person, org.id, period.start, period.end)) {
       if (person.hireDate && person.hireDate > hd.date) continue;
       if (!salaried && hd.paidHours > 0) {
-        const r = rateFor(h, person, null, hd.date)?.cents ?? 0;
-        if (r) earnings.push({ code: 'holiday', label: `Holiday: ${hd.name}`, cents: Math.round(hd.paidHours * r), hours: hd.paidHours, explain: [`${hd.name} (${hd.date}): ${hd.paidHours} h x ${$(r)} = ${$(Math.round(hd.paidHours * r))}`] });
+        const r = baseRate(hd.date)?.cents ?? 0;
+        if (r) { holidayHours += hd.paidHours; earnings.push({ code: 'holiday', label: `Holiday: ${hd.name}`, cents: Math.round(hd.paidHours * r), hours: hd.paidHours, rateCents: r, explain: [`${hd.name} (${hd.date}): ${hd.paidHours} h x ${$(r)} = ${$(Math.round(hd.paidHours * r))}`] }); }
       }
       if (hd.premiumMultiplier > 1) {
         const worked = segs.filter((s) => s.date === hd.date);
         const cents = Math.round(worked.reduce((a, s) => a + (s.minutes / 60) * s.rateCents * (hd.premiumMultiplier - 1), 0));
-        if (cents) earnings.push({ code: 'holiday_premium', label: `Worked holiday premium: ${hd.name}`, cents, hours: hrs(worked.reduce((a, s) => a + s.minutes, 0)), explain: [`Worked ${hd.name}: x${hd.premiumMultiplier} = ${$(cents)} extra`] });
+        if (cents) earnings.push({ code: 'holiday_premium', label: `Worked holiday premium: ${hd.name}`, cents, hours: hrs(worked.reduce((a, s) => a + s.minutes, 0)), multiplier: hd.premiumMultiplier, explain: [`Worked ${hd.name}: x${hd.premiumMultiplier} = ${$(cents)} extra`] });
       }
     }
-    // Paid time off taken this period.
+    // Paid time off and sick pay taken this period (each its own pay type).
     const pto = ptoInPeriod(h, person.id, period);
     for (const t of pto) {
       if (!t.paid || salaried) continue;
-      const r = rateFor(h, person, null, period.start)?.cents ?? 0;
-      earnings.push({ code: 'pto', label: `Paid time off: ${t.policyName}`, cents: Math.round(t.hours * r), hours: t.hours, explain: [`${t.policyName}: ${t.hours} h x ${$(r)} = ${$(Math.round(t.hours * r))}`] });
+      const r = baseRate(period.start)?.cents ?? 0;
+      const sick = t.kind === 'sick';
+      earnings.push({ code: sick ? 'sick' : 'pto', label: `${sick ? 'Sick pay' : 'Paid time off'}: ${t.policyName}`, cents: Math.round(t.hours * r), hours: t.hours, rateCents: r, explain: [`${t.policyName}: ${t.hours} h x ${$(r)} = ${$(Math.round(t.hours * r))}`] });
     }
-    // Retro pay, payouts, bonuses and reimbursements waiting for the next run.
-    const extras = h.all(`SELECT * FROM extra_earnings WHERE person_id = ? AND status = 'pending' ORDER BY created_at`, person.id);
-    for (const e of extras) earnings.push({ code: e.code, label: e.label, cents: e.cents, hours: e.hours ?? undefined, taxable: !!e.taxable, extraId: e.id, explain: [`${e.label}: ${$(e.cents)}${e.taxable ? '' : ' (not taxed)'}`] });
+    // Bonuses, retro pay, payouts and reimbursements waiting for the next run.
+    for (const e of extras) {
+      const bonus = e.code === 'bonus', disc = extraDetail(e).discretionary !== false;
+      earnings.push({ code: e.code, label: e.label, cents: e.cents, hours: e.hours ?? undefined, taxable: !!e.taxable, extraId: e.id, ...(bonus ? { discretionary: disc } : {}),
+        explain: [`${e.label}: ${$(e.cents)}${e.taxable ? '' : ' (not taxed)'}${bonus ? (disc ? ' (discretionary: not part of the regular rate)' : ' (non-discretionary: counted in the regular rate for overtime)') : ''}`] });
+    }
 
     if (!earnings.some((e) => e.cents) && totalMin === 0) return null;
 
@@ -212,12 +290,17 @@ export function registerRun(c) {
     const ytd = ytdFor(person, year, period.start);
     const line = payLine({ person, earnings, periodsPerYear: PERIODS_PER_YEAR[org.payFrequency] || 26, ytdWagesCents: ytd, org: { employeeCount: ctx.employeeCount, futaExempt: org.futaExempt, sutaRate: org.sutaRate }, tables: { us: ctx.T.us, state: ctx.T.state } });
     line.unverified = !ctx.T.verified;
-    line.hours = { regular: hrs(totalMin - otMin), overtime: hrs(otMin), restPremium: hrs(tc.totals.restPremiumMin), pto: +pto.reduce((a, t) => a + t.hours, 0).toFixed(2) };
+    const typeHours = (code) => +pto.filter((t) => (code === 'sick' ? t.kind === 'sick' : t.kind !== 'sick')).reduce((a, t) => a + t.hours, 0).toFixed(2);
+    line.hours = { regular: hrs(totalMin - otMin - dtMin), overtime: hrs(otMin), doubleTime: hrs(dtMin), restPremium: hrs(tc.totals.restPremiumMin), pto: typeHours('pto'), sick: typeHours('sick'), holiday: holidayHours, byCode };
     line.rateCents = base?.cents ?? null;
+    line.regularRateCents = regularRate ? Math.round(regularRate) : null;
     line.salaried = salaried;
     line.otMultiplier = mult;
-    line.earnings = earnings.map(({ explain, ...e }) => e);
-    line.segments = segs.map((s) => ({ date: s.date, shiftId: s.shiftId, positionId: s.positionId, minutes: s.minutes, otMin: s.otMin, rateCents: s.rateCents, positionRate: s.positionRate, diffCents: s.diffCents }));
+    line.dtMultiplier = dtMult;
+    // (How overtime and double time were worked out stays with those lines, for the stub.)
+    line.earnings = earnings.map(({ explain, ...e }) => (e.code === 'overtime' || e.code === 'double_time' ? { ...e, working: explain } : e));
+    line.segments = segs.map((s) => ({ date: s.date, shiftId: s.shiftId, positionId: s.positionId, payCodeId: s.payCodeId ?? null, minutes: s.minutes, otMin: s.otMin, dtMin: s.dtMin, rateCents: s.rateCents, positionRate: s.positionRate, diffCents: s.diffCents }));
+    line.hoursFrom = segs.some((s) => s.fromEngine) || tc.source === 'engine' ? 'engine' : 'local';
     line.entityId = person.entityId || defaultEntity(org.id);
     line.departmentId = person.departmentId;
     line.ytdBefore = ytd;
@@ -229,7 +312,7 @@ export function registerRun(c) {
       const posted = h.get('SELECT 1 FROM pto_ledger WHERE person_id = ? AND policy_id = ? AND ref = ?', person.id, pol.id, `accrual:${period.start}`);
       const acc = posted ? null : accrualFor(h, pol, person, period, tc.totals.workedMin);
       const bal = balance(h, person.id, pol.id);
-      return { policyId: pol.id, name: pol.name, hours: +(bal + (acc?.hours || 0)).toFixed(2), accrued: acc ? acc.hours : null };
+      return { policyId: pol.id, name: pol.name, kind: pol.kind, hours: +(bal + (acc?.hours || 0)).toFixed(2), accrued: acc ? acc.hours : null };
     });
     return line;
   }
@@ -237,10 +320,10 @@ export function registerRun(c) {
   /** Gross (taxable) split across departments / cost centers / programs. */
   function distribute(person, line, segs, regularRate) {
     const parts = [];
-    const segCodes = new Set(['regular', 'differential', 'overtime', 'rest_premium', 'holiday_premium']);
+    const segCodes = new Set(['regular', 'differential', 'overtime', 'double_time', 'rest_premium', 'holiday_premium']);
     const segCost = line.earnings.filter((e) => segCodes.has(e.code) || (e.code === 'salary' && segs.length)).reduce((a, e) => a + e.cents, 0);
     const other = line.gross - segCost;
-    const weights = segs.map((s) => s.minutes * (s.rateCents || regularRate || 1) + s.diffCents * 60 + s.otMin * (regularRate || s.rateCents) * 0.5);
+    const weights = segs.map((s) => s.minutes * (s.rateCents || regularRate || 1) + s.diffCents * 60 + s.otMin * (regularRate || s.rateCents) * 0.5 + (s.dtMin || 0) * (regularRate || s.rateCents));
     const segCents = apportion(segCost, weights);
     segs.forEach((s, i) => {
       const alloc = allocationFor(h, person, s.shiftId, s.minutes);
@@ -282,6 +365,7 @@ export function registerRun(c) {
       if (!tc.approved && tc.totals.workedMin > 0) warnings.push({ code: 'timecard_not_approved', personId: p.id, message: `${p.name}: timecard not approved` });
       if (tc.flags.some((f) => f.code === 'missed_punch')) warnings.push({ code: 'missed_punch', personId: p.id, message: `${p.name}: missed punch in this period (hours may be short)` });
       if (tc.pendingRequests) warnings.push({ code: 'pending_requests', personId: p.id, message: `${p.name}: ${tc.pendingRequests} punch request(s) still pending` });
+      if (line.hoursFrom === 'engine' && line.segments.some((s) => !s.payCodeId)) warnings.push({ code: 'no_pay_code', personId: p.id, message: `${p.name}: some hours have no pay code (they have no codes yet), so they're paid at their payroll rate${line.segments.some((s) => !s.payCodeId && !s.rateCents) ? ', and there isn’t one: $0' : ''}` });
       const accts = depositAccounts(vault.openJson(p.depositRaw));
       deposits.set(p.id, depositSplit(line.net, accts));
       if (!accts.length) warnings.push({ code: 'no_deposit', personId: p.id, message: `${p.name}: no direct deposit account (pay by check)` });
@@ -296,13 +380,13 @@ export function registerRun(c) {
       }
     }
     const sum = (f) => lines.reduce((s, l) => s + f(l), 0);
-    const totals = { gross: sum((l) => l.gross), withheld: sum((l) => l.withheld), net: sum((l) => l.net), employer: sum((l) => l.employerTotal), nonTaxable: sum((l) => l.nonTaxable || 0), regularHours: +sum((l) => l.hours.regular).toFixed(2), overtimeHours: +sum((l) => l.hours.overtime).toFixed(2), people: lines.length };
+    const totals = { gross: sum((l) => l.gross), withheld: sum((l) => l.withheld), net: sum((l) => l.net), employer: sum((l) => l.employerTotal), nonTaxable: sum((l) => l.nonTaxable || 0), regularHours: +sum((l) => l.hours.regular).toFixed(2), overtimeHours: +sum((l) => l.hours.overtime).toFixed(2), doubleTimeHours: +sum((l) => l.hours.doubleTime || 0).toFixed(2), people: lines.length };
     const finalized = h.get(`SELECT * FROM payruns WHERE org_id = ? AND period_start = ? AND status = 'finalized'`, org.id, period.start);
     const needsApproval = approvals.configured(org.id, 'payrun');
     const ap = needsApproval ? approvals.find(org.id, 'payrun', `${org.id}:${period.start}`) : null;
     const blockers = [];
     if (!T.verified) blockers.push(`The ${year} tax and labor tables aren’t verified.`);
-    const unapproved = lines.filter((l) => !l.approved && l.hours.regular + l.hours.overtime > 0);
+    const unapproved = lines.filter((l) => !l.approved && l.hours.regular + l.hours.overtime + (l.hours.doubleTime || 0) > 0);
     if (unapproved.length) blockers.push(`${unapproved.length} timecard(s) aren’t approved.`);
     if (needsApproval && ap?.status !== 'approved') blockers.push(ap ? 'The pay run approval isn’t finished.' : 'The pay run needs approval first.');
     const hash = payrunHash({ period, payDate: addDays(period.end, 6), totals, lines, deposits });
@@ -333,15 +417,17 @@ export function registerRun(c) {
   }
   c.runLines = runLines;
 
-  route('GET', '/v1/payrun/preview', ({ me, org, query }) => {
+  route('GET', '/v1/payrun/preview', async ({ me, org, query }) => {
     need(me, 'payroll');
-    const pr = payrun(org, c.parsePeriod(org, query.periodStart, c.lastCompleted(org)), { entityId: query.entityId || null });
-    return pr;
+    const period = c.parsePeriod(org, query.periodStart, c.lastCompleted(org));
+    await c.loadEngine?.(org, period);
+    return { ...payrun(org, period, { entityId: query.entityId || null }), hoursFrom: c.engine ? 'engine' : 'local' };
   });
 
-  route('POST', '/v1/payrun/submit', ({ me, org, body }) => {
+  route('POST', '/v1/payrun/submit', async ({ me, org, body }) => {
     need(me, 'payroll');
     const period = c.parsePeriod(org, V.date(body.periodStart, 'periodStart'), null);
+    await c.loadEngine?.(org, period);
     const existing = approvals.find(org.id, 'payrun', `${org.id}:${period.start}`);
     const pr = payrun(org, period);
     // An approval for a run that has changed since is set aside; the run as it is now is submitted instead.
@@ -351,9 +437,10 @@ export function registerRun(c) {
     return { status: 201, body: { approval: ap } };
   });
 
-  route('POST', '/v1/payrun/finalize', ({ me, org, body }) => {
+  route('POST', '/v1/payrun/finalize', async ({ me, org, body }) => {
     need(me, 'payroll');
     const period = c.parsePeriod(org, V.date(body.periodStart, 'periodStart'), null);
+    await c.loadEngine?.(org, period);
     const pr = payrun(org, period);
     // The payroll safety rule: never finalize on tables that aren't verified for the year.
     if (!pr.tablesVerified) throw new HttpError(409, `The tax and labor tables for ${pr.year} aren’t verified, so this pay run can’t be finalized.`, { blockers: pr.blockers, tables: pr.tables });
@@ -369,7 +456,7 @@ export function registerRun(c) {
         for (const e of l.earnings) if (e.extraId) h.run(`UPDATE extra_earnings SET status = 'paid', paid_run_id = ? WHERE id = ?`, id, e.extraId);
       }
       h.run(`UPDATE expenses SET status = 'reimbursed' WHERE earning_id IN (SELECT id FROM extra_earnings WHERE paid_run_id = ?)`, id);
-      const worked = new Map(pr.lines.map((l) => [l.personId, Math.round((l.hours.regular + l.hours.overtime) * 60)]));
+      const worked = new Map(pr.lines.map((l) => [l.personId, Math.round((l.hours.regular + l.hours.overtime + (l.hours.doubleTime || 0)) * 60)]));
       postAccruals(h, people, period, worked, isoNow(now()));
     });
     audit(org.id, me.id, 'payrun_finalize', id, { period: period.start, totals: pr.totals });
@@ -381,10 +468,31 @@ export function registerRun(c) {
     return { runs: h.all('SELECT * FROM payruns WHERE org_id = ? ORDER BY period_start DESC', org.id).map((r) => ({ id: r.id, periodStart: r.period_start, periodEnd: r.period_end, payDate: r.pay_date, status: r.status, finalizedAt: r.finalized_at, finalizedBy: r.finalized_by, totals: J(r.totals, {}) })) };
   });
 
+  // ---------- bonuses ----------
+  /**
+   * A bonus for the next pay run. discretionary (the default): the employer decided it freely, so it isn't part of the
+   * regular rate. false: promised or earned by a formula (attendance, production), so it raises the regular rate for
+   * overtime in the period it's paid.
+   */
+  route('POST', '/v1/earnings/bonus', ({ me, org, body }) => {
+    need(me, 'payroll');
+    const person = c.getPerson(V.id(body.personId, 'personId'), org.id);
+    const amount = Number(body.amount);
+    if (!Number.isFinite(amount) || amount <= 0 || amount > 1e6) bad('amount must be dollars above 0');
+    const cents = Math.round(amount * 100);
+    const discretionary = V.bool(body.discretionary ?? true, 'discretionary');
+    const label = V.str(body.label ?? 'Bonus', 'label', { min: 1, max: 80 });
+    const id = uid('ee');
+    h.run(`INSERT INTO extra_earnings (id,org_id,person_id,code,label,cents,hours,taxable,source,detail,status,created_at) VALUES (?,?,?,?,?,?,NULL,1,?,?,'pending',?)`, id, org.id, person.id, 'bonus', label, cents, 'bonus', JSON.stringify({ discretionary }), isoNow(now()));
+    audit(org.id, me.id, 'bonus_add', id, { personId: person.id, discretionary });
+    return { status: 201, body: { earning: { id, personId: person.id, code: 'bonus', label, cents, discretionary } } };
+  });
+
   // ---------- NACHA (for the org's own bank; KeaS never sends payments) ----------
-  route('GET', '/v1/payrun/nacha', ({ me, org, query }) => {
+  route('GET', '/v1/payrun/nacha', async ({ me, org, query }) => {
     need(me, 'payroll');
     const period = c.parsePeriod(org, query.periodStart, c.lastCompleted(org));
+    if (!h.get(`SELECT 1 FROM payruns WHERE org_id = ? AND period_start = ? AND status = 'finalized'`, org.id, period.start)) await c.loadEngine?.(org, period);
     const { lines, deposits, payDate, finalized } = runLines(org, period);
     // With a pay-run approval set up, a bank file only comes from the finalized run that approval covered.
     if (!finalized && approvals.configured(org.id, 'payrun')) throw new HttpError(409, 'Pay runs here need approval, so the bank file is available once this run is approved and finalized.');
@@ -429,9 +537,10 @@ export function registerRun(c) {
     const person = c.getPerson(personId, org.id);
     return { org: { name: org.name }, person: { id: person.id, name: person.name, employeeNumber: person.employeeNumber }, period, payDate, finalized, line: l, ytd, balances: l.balances || [] };
   }
-  route('GET', '/v1/payrun/stub', ({ me, org, query }) => {
+  route('GET', '/v1/payrun/stub', async ({ me, org, query }) => {
     const personId = V.id(query.personId ?? me.id, 'personId');
     const period = c.parsePeriod(org, query.periodStart, c.lastCompleted(org));
+    if (c.has(me, 'payroll') && !h.get(`SELECT 1 FROM payruns WHERE org_id = ? AND period_start = ? AND status = 'finalized'`, org.id, period.start)) await c.loadEngine?.(org, period);
     if (personId !== me.id) need(me, 'payroll');
     else if (!c.has(me, 'payroll') && !h.get(`SELECT 1 FROM payruns WHERE org_id = ? AND period_start = ? AND status = 'finalized'`, org.id, period.start)) throw new HttpError(404, 'no finalized pay for that period');
     const s = stub(org, period, personId);
@@ -464,9 +573,10 @@ export function registerRun(c) {
     return [...acc.values()].filter((r) => r.debit || r.credit);
   }
   c.glRows = glRows;
-  route('GET', '/v1/payrun/gl', ({ me, org, query }) => {
+  route('GET', '/v1/payrun/gl', async ({ me, org, query }) => {
     need(me, 'payroll');
     const period = c.parsePeriod(org, query.periodStart, c.lastCompleted(org));
+    if (!h.get(`SELECT 1 FROM payruns WHERE org_id = ? AND period_start = ? AND status = 'finalized'`, org.id, period.start)) await c.loadEngine?.(org, period);
     const rows = glRows(org, period);
     const debit = rows.reduce((a, r) => a + r.debit, 0), credit = rows.reduce((a, r) => a + r.credit, 0);
     if (query.format === 'csv') {
@@ -484,12 +594,20 @@ function stubPdf(s) {
   L.push({ text: `Pay statement for ${s.person.name}${s.person.employeeNumber ? ` (#${s.person.employeeNumber})` : ''}`, size: 11 });
   L.push({ text: `Period ${s.period.start} to ${s.period.end} - pay date ${s.payDate}${s.finalized ? '' : ' - preview, not final'}`, size: 9, gap: 2 });
   L.push({ text: 'Earnings', bold: true, gap: 8, rule: true, right: 'Amount' });
-  for (const e of s.line.earnings) L.push({ text: `${e.label}${e.hours ? `   ${e.hours} h` : ''}`, right: m(e.cents) });
+  for (const e of s.line.earnings) {
+    L.push({ text: `${e.label}${e.hours ? `   ${e.hours} h${e.rateCents ? ` x ${m(e.rateCents)}` : ''}` : ''}`, right: m(e.cents) });
+    for (const p of e.byCode || []) if (p.name) L.push({ text: `      ${p.name}: ${p.hours} h x ${m(p.rateCents)} straight time`, size: 8 });
+    for (const w of e.working || []) L.push({ text: `      ${String(w).replace(/÷/g, '/').replace(/×/g, 'x')}`, size: 8 });
+  }
   L.push({ text: 'Gross pay', bold: true, right: m(s.line.gross) });
   L.push({ text: 'Taxes withheld', bold: true, gap: 8, rule: true, right: 'This period / Year to date' });
   for (const t of s.line.taxes) L.push({ text: t.label, right: `${m(t.cents)} / ${m(s.ytd[t.code] || 0)}` });
   L.push({ text: 'Net pay', bold: true, size: 12, gap: 6, right: m(s.line.net) });
   L.push({ text: `Year to date: gross ${m(s.ytd.gross || 0)}, net ${m(s.ytd.net || 0)}`, size: 9 });
+  if (s.line.hours?.byCode?.length) {
+    L.push({ text: 'Hours by pay code', bold: true, gap: 8, rule: true, right: 'Hours' });
+    for (const p of s.line.hours.byCode) L.push({ text: `${p.name || 'Hours worked'} at ${m(p.rateCents)}${p.overtime ? ` (${p.overtime} h overtime)` : ''}${p.doubleTime ? ` (${p.doubleTime} h double time)` : ''}`, right: String(p.hours) });
+  }
   if (s.balances.length) {
     L.push({ text: 'Time off balances', bold: true, gap: 8, rule: true, right: 'Hours' });
     for (const b of s.balances) L.push({ text: `${b.name}${b.accrued ? ` (+${b.accrued} this period)` : ''}`, right: String(b.hours) });

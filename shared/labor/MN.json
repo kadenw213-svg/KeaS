@@ -1,0 +1,41 @@
+{
+  "jurisdiction": "MN",
+  "name": "Minnesota (Earned Sick and Safe Time)",
+  "status": "unverified",
+  "needsChecking": "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+  "overtime": null,
+  "meal": null,
+  "rest": null,
+  "minors": null,
+  "minimumWage": {
+    "standard": null,
+    "tipped": null,
+    "youthDiscountPct": null,
+    "localOverrides": [],
+    "note": "The MN minimum wage isn't filled in yet: check this year's rate (and any city or county rate) and add it. Until then only the federal minimum is checked."
+  },
+  "sickLeave": {
+    "needsChecking": true,
+    "law": "Minnesota earned sick and safe time",
+    "accrueHoursPer": 30,
+    "cap": 48,
+    "capKind": "hours accrued each year",
+    "balanceCap": 80,
+    "carryoverCap": 80,
+    "frontloadHours": null,
+    "waitingDays": null,
+    "note": "1 hour per 30 hours worked, up to 48 hours a year, with a balance of up to 80 hours. Minneapolis and Saint Paul have their own ordinances. Needs checking."
+  },
+  "notes": [
+    "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+    "Minor-labor rules here are the federal ones only; state child-labor limits aren't filled in."
+  ],
+  "source": [
+    {
+      "title": "Minnesota DLI: sick leave",
+      "url": "https://www.dli.mn.gov/sick-leave",
+      "checked": null
+    }
+  ],
+  "verifiedFor": null
+}

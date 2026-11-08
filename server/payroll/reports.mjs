@@ -32,8 +32,9 @@ export function registerReports(c) {
   };
   const csvOut = (name, headers, rows) => ({ raw: { type: 'text/csv; charset=utf-8', filename: `${name}.csv`, body: toCsv(headers, rows) } });
 
-  route('GET', '/v1/reports/register', ({ me, org, query }) => {
+  route('GET', '/v1/reports/register', async ({ me, org, query }) => {
     need(me, 'payroll');
+    if (query.periodStart) await c.loadEngine?.(org, c.parsePeriod(org, query.periodStart, null));
     const { finalized, lines: ls } = lines(org, rangeOf(org, query));
     const codes = [...new Set(ls.flatMap((l) => (l.taxes || []).map((t) => t.code)))];
     const ercodes = [...new Set(ls.flatMap((l) => (l.employer || []).map((t) => t.code)))];
@@ -52,8 +53,9 @@ export function registerReports(c) {
     return { finalized, rows, totals, taxCodes: codes, employerCodes: ercodes };
   });
 
-  route('GET', '/v1/reports/tax-liability', ({ me, org, query }) => {
+  route('GET', '/v1/reports/tax-liability', async ({ me, org, query }) => {
     need(me, 'payroll');
+    if (query.periodStart) await c.loadEngine?.(org, c.parsePeriod(org, query.periodStart, null));
     const range = rangeOf(org, query);
     const { finalized, lines: ls } = lines(org, range);
     const by = new Map();
@@ -71,8 +73,9 @@ export function registerReports(c) {
     return { finalized, range, rows, byPayDate: [...byDate.values()], total: rows.reduce((a, r) => a + r.total, 0), note: 'Deposit schedules and due dates depend on your deposit schedule and state; KeaS shows the amounts.' };
   });
 
-  route('GET', '/v1/reports/labor-distribution', ({ me, org, query }) => {
+  route('GET', '/v1/reports/labor-distribution', async ({ me, org, query }) => {
     need(me, 'manager', 'payroll');
+    if (query.periodStart) await c.loadEngine?.(org, c.parsePeriod(org, query.periodStart, null));
     const range = rangeOf(org, query);
     const { finalized, lines: ls } = lines(org, range);
     const n = names(org.id);

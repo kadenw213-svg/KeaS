@@ -1,0 +1,41 @@
+{
+  "jurisdiction": "MA",
+  "name": "Massachusetts (Earned Sick Time Law)",
+  "status": "unverified",
+  "needsChecking": "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+  "overtime": null,
+  "meal": null,
+  "rest": null,
+  "minors": null,
+  "minimumWage": {
+    "standard": null,
+    "tipped": null,
+    "youthDiscountPct": null,
+    "localOverrides": [],
+    "note": "The MA minimum wage isn't filled in yet: check this year's rate (and any city or county rate) and add it. Until then only the federal minimum is checked."
+  },
+  "sickLeave": {
+    "needsChecking": true,
+    "law": "Massachusetts earned sick time",
+    "accrueHoursPer": 30,
+    "cap": 40,
+    "capKind": "hours accrued and used each year",
+    "balanceCap": null,
+    "carryoverCap": 40,
+    "frontloadHours": null,
+    "waitingDays": 90,
+    "note": "1 hour per 30 hours worked, up to 40 hours a year; paid for employers with 11 or more employees, unpaid for smaller ones. Needs checking."
+  },
+  "notes": [
+    "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+    "Minor-labor rules here are the federal ones only; state child-labor limits aren't filled in."
+  ],
+  "source": [
+    {
+      "title": "Mass.gov: earned sick time",
+      "url": "https://www.mass.gov/info-details/earned-sick-time",
+      "checked": null
+    }
+  ],
+  "verifiedFor": null
+}

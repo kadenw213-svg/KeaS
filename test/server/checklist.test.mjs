@@ -36,7 +36,7 @@ test('the checklist: each step, re-checked as things are fixed; never the tables
   const pay = await login('p03');
   assert.equal((await call('GET', '/v1/setup/checklist', await login('p04'))).status, 403, 'staff can’t see it');
   let r = (await call('GET', '/v1/setup/checklist', pay)).body;
-  assert.deepEqual(r.steps.map((s) => s.id), ['org', 'rules', 'verified', 'employer', 'suta', 'people', 'employeeInfo', 'approvers', 'timecards']);
+  assert.deepEqual(r.steps.map((s) => s.id), ['org', 'rules', 'verified', 'employer', 'suta', 'people', 'employeeInfo', 'sickLeave', 'approvers', 'timecards']);
   for (const s of r.steps) { assert.equal(typeof s.text, 'string'); assert.ok(s.text.length > 0 && s.text.length < 600, s.id); }
 
   // Where people work: not given yet.

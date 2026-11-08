@@ -176,6 +176,7 @@ export function rowToPerson(r) {
     hireDate: r.hire_date ?? null, termDate: r.term_date ?? null, departmentId: r.department_id ?? null, entityId: r.entity_id ?? null,
     managerId: r.manager_id ?? null, gradeId: r.grade_id ?? null, workerType: r.worker_type || 'employee', employeeNumber: r.employee_number ?? null,
     defaultAllocations: J(r.default_allocations, []), holidayCalendarId: r.holiday_calendar_id ?? null, ytdYear: r.ytd_year ?? null, legalName: r.legal_name ?? null,
+    keaAccountId: r.kea_account_id ?? null,
   };
 }
 export function rowToOrg(r) {

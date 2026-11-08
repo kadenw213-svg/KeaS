@@ -1,0 +1,41 @@
+{
+  "jurisdiction": "MD",
+  "name": "Maryland (Healthy Working Families Act)",
+  "status": "unverified",
+  "needsChecking": "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+  "overtime": null,
+  "meal": null,
+  "rest": null,
+  "minors": null,
+  "minimumWage": {
+    "standard": null,
+    "tipped": null,
+    "youthDiscountPct": null,
+    "localOverrides": [],
+    "note": "The MD minimum wage isn't filled in yet: check this year's rate (and any city or county rate) and add it. Until then only the federal minimum is checked."
+  },
+  "sickLeave": {
+    "needsChecking": true,
+    "law": "Maryland earned sick and safe leave",
+    "accrueHoursPer": 30,
+    "cap": 40,
+    "capKind": "hours an employer may limit accrual and use to each year",
+    "balanceCap": 64,
+    "carryoverCap": 40,
+    "frontloadHours": null,
+    "waitingDays": 106,
+    "note": "1 hour per 30 hours worked; an employer may cap accrual at 40 hours a year, use at 64 hours a year and the balance at 64 hours. Paid for employers with 15 or more employees, unpaid below that. Needs checking."
+  },
+  "notes": [
+    "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+    "Minor-labor rules here are the federal ones only; state child-labor limits aren't filled in."
+  ],
+  "source": [
+    {
+      "title": "Maryland Department of Labor: sick and safe leave",
+      "url": "https://www.labor.maryland.gov/labor/wages/paidleave.shtml",
+      "checked": null
+    }
+  ],
+  "verifiedFor": null
+}

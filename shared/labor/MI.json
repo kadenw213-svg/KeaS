@@ -1,0 +1,41 @@
+{
+  "jurisdiction": "MI",
+  "name": "Michigan (Earned Sick Time Act)",
+  "status": "unverified",
+  "needsChecking": "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+  "overtime": null,
+  "meal": null,
+  "rest": null,
+  "minors": null,
+  "minimumWage": {
+    "standard": null,
+    "tipped": null,
+    "youthDiscountPct": null,
+    "localOverrides": [],
+    "note": "The MI minimum wage isn't filled in yet: check this year's rate (and any city or county rate) and add it. Until then only the federal minimum is checked."
+  },
+  "sickLeave": {
+    "needsChecking": true,
+    "law": "Michigan earned sick time",
+    "accrueHoursPer": 30,
+    "cap": 72,
+    "capKind": "hours used each year (large employers)",
+    "balanceCap": null,
+    "carryoverCap": null,
+    "frontloadHours": null,
+    "waitingDays": 120,
+    "note": "Effective 2025: 1 hour per 30 hours worked; employers with 11 or more employees may cap use at 72 hours a year; small employers have different limits (40 paid hours, and a later start). Needs checking."
+  },
+  "notes": [
+    "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+    "Minor-labor rules here are the federal ones only; state child-labor limits aren't filled in."
+  ],
+  "source": [
+    {
+      "title": "Michigan LEO: earned sick time",
+      "url": "https://www.michigan.gov/leo/bureaus-agencies/ber/wage-and-hour/earned-sick-time",
+      "checked": null
+    }
+  ],
+  "verifiedFor": null
+}

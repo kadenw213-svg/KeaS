@@ -1,0 +1,37 @@
+{
+  "jurisdiction": "AK",
+  "name": "Alaska (Alaska Wage and Hour Act, AS 23.10)",
+  "status": "unverified",
+  "needsChecking": "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+  "overtime": {
+    "weeklyHours": 40,
+    "dailyHours": 8,
+    "consecutiveHours": null,
+    "multiplier": 1.5,
+    "note": "AS 23.10.060: 1.5x over 8 h in a day and over 40 h in a week, for employers with 4 or more employees. Whether daily and weekly overtime are combined or the greater one is paid isn't confirmed here (KeaS pays whichever gives more each week). Voluntary flexible work hour plans aren't handled. Needs checking."
+  },
+  "meal": null,
+  "rest": null,
+  "minors": null,
+  "minimumWage": {
+    "standard": null,
+    "tipped": null,
+    "youthDiscountPct": null,
+    "localOverrides": [],
+    "note": "The AK minimum wage isn't filled in yet: check this year's rate (and any city or county rate) and add it. Until then only the federal minimum is checked."
+  },
+  "sickLeave": null,
+  "notes": [
+    "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+    "Minor-labor rules here are the federal ones only; state child-labor limits aren't filled in.",
+    "Alaska has no statewide paid sick leave law in this file. A 2024 ballot measure on paid sick leave needs checking."
+  ],
+  "source": [
+    {
+      "title": "Alaska Department of Labor: Wage and Hour",
+      "url": "https://labor.alaska.gov/lss/whact.htm",
+      "checked": null
+    }
+  ],
+  "verifiedFor": null
+}

@@ -1,0 +1,41 @@
+{
+  "jurisdiction": "NM",
+  "name": "New Mexico (Healthy Workplaces Act)",
+  "status": "unverified",
+  "needsChecking": "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+  "overtime": null,
+  "meal": null,
+  "rest": null,
+  "minors": null,
+  "minimumWage": {
+    "standard": null,
+    "tipped": null,
+    "youthDiscountPct": null,
+    "localOverrides": [],
+    "note": "The NM minimum wage isn't filled in yet: check this year's rate (and any city or county rate) and add it. Until then only the federal minimum is checked."
+  },
+  "sickLeave": {
+    "needsChecking": true,
+    "law": "New Mexico Healthy Workplaces Act",
+    "accrueHoursPer": 30,
+    "cap": null,
+    "capKind": null,
+    "balanceCap": null,
+    "carryoverCap": 64,
+    "frontloadHours": 64,
+    "waitingDays": null,
+    "note": "1 hour per 30 hours worked, with no yearly accrual cap; an employer may limit use and carryover to 64 hours a year, or front-load 64 hours. Needs checking."
+  },
+  "notes": [
+    "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+    "Minor-labor rules here are the federal ones only; state child-labor limits aren't filled in."
+  ],
+  "source": [
+    {
+      "title": "New Mexico Workforce Solutions: Healthy Workplaces",
+      "url": "https://www.dws.state.nm.us/Healthy-Workplaces",
+      "checked": null
+    }
+  ],
+  "verifiedFor": null
+}

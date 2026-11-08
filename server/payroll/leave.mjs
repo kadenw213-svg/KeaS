@@ -16,6 +16,27 @@ const rowToCase = (r) => ({ id: r.id, personId: r.person_id, law: r.law, reason:
 const r2 = (x) => Math.round(x * 100) / 100;
 export const METHODS = ['per_hour_worked', 'per_period', 'annual_grant', 'none'];
 
+/**
+ * A sick-leave policy suggested from the location's law (the merged labor rules' sickLeave): accrual per hours worked,
+ * the yearly cap, balance cap, carryover and waiting period the law allows. Only a starting point: the labor files
+ * aren't verified, and the law often depends on the employer's size, so the owner checks and edits it before saving.
+ * null when KeaS knows no sick-leave law for the place.
+ */
+export function suggestSickPolicy(rules) {
+  const s = rules?.sickLeave;
+  if (!s || !(s.accrueHoursPer > 0)) return null;
+  const notes = [s.note, 'A suggestion from KeaS’s labor tables, which aren’t verified: check it against the law (and any city or county rule) before you save it.'].filter(Boolean);
+  return {
+    name: s.law ? `Paid sick leave (${s.law})` : 'Paid sick leave', kind: 'sick', method: 'per_hour_worked', accrueHours: 1, perHours: s.accrueHoursPer,
+    annualMaxHours: s.cap ?? null, capHours: s.balanceCap ?? null, carryoverMax: s.carryoverCap ?? null, waitingDays: 0,
+    // (A waiting period limits when sick time can be used, not when it accrues, so it's noted rather than set.)
+    useWaitingDays: s.waitingDays ?? null, frontloadHours: s.frontloadHours ?? null,
+    protected: true, payoutOnTerm: 'never', paid: true, autoEnroll: true, active: true,
+    why: `1 hour per ${s.accrueHoursPer} hours worked${s.cap != null ? `, up to ${s.cap} hours (${s.capKind || 'a year'})` : ''}${s.balanceCap != null ? `, balance up to ${s.balanceCap} hours` : ''}${s.carryoverCap != null ? `, ${s.carryoverCap} hours carry over` : ''}.`,
+    notes, employerSize: s.employerSize ?? null, from: s.from ?? null, needsChecking: true,
+  };
+}
+
 export function balance(h, personId, policyId, asOf = '9999-12-31') {
   return r2(h.get('SELECT COALESCE(SUM(hours),0) AS b FROM pto_ledger WHERE person_id = ? AND policy_id = ? AND date <= ?', personId, policyId, asOf).b);
 }
@@ -92,13 +113,13 @@ export function holidaysFor(h, person, orgId, from, to) {
 
 /** Approved paid time off falling in a period, spread evenly over the request's days. */
 export function ptoInPeriod(h, personId, period) {
-  const rows = h.all(`SELECT r.*, p.name AS policy_name, p.paid FROM time_off_requests r JOIN pto_policies p ON p.id = r.policy_id WHERE r.person_id = ? AND r.status = 'approved' AND r.start_date <= ? AND r.end_date >= ?`, personId, period.end, period.start);
+  const rows = h.all(`SELECT r.*, p.name AS policy_name, p.paid, p.kind AS policy_kind FROM time_off_requests r JOIN pto_policies p ON p.id = r.policy_id WHERE r.person_id = ? AND r.status = 'approved' AND r.start_date <= ? AND r.end_date >= ?`, personId, period.end, period.start);
   const out = [];
   for (const r of rows) {
     const days = dayNum(r.end_date) - dayNum(r.start_date) + 1;
     let inside = 0;
     for (let d = r.start_date; d <= r.end_date; d = addDays(d, 1)) if (d >= period.start && d <= period.end) inside++;
-    if (inside) out.push({ requestId: r.id, policyId: r.policy_id, policyName: r.policy_name, paid: !!r.paid, hours: r2((r.hours * inside) / days) });
+    if (inside) out.push({ requestId: r.id, policyId: r.policy_id, policyName: r.policy_name, kind: r.policy_kind, paid: !!r.paid, hours: r2((r.hours * inside) / days) });
   }
   return out;
 }
@@ -111,7 +132,14 @@ export function registerLeave(c) {
   route('GET', '/v1/pto/policies', ({ me, org }) => {
     need(me, 'manager', 'payroll');
     const rules = c.rulesFor(org);
-    return { policies: h.all('SELECT * FROM pto_policies WHERE org_id = ? ORDER BY name', org.id).map(rowToPolicy).map((p) => ({ ...p, enrolled: h.get('SELECT COUNT(*) AS n FROM pto_enrollments WHERE policy_id = ?', p.id).n })), stateSickLeave: rules.sickLeave ?? null };
+    return { policies: h.all('SELECT * FROM pto_policies WHERE org_id = ? ORDER BY name', org.id).map(rowToPolicy).map((p) => ({ ...p, enrolled: h.get('SELECT COUNT(*) AS n FROM pto_enrollments WHERE policy_id = ?', p.id).n })), stateSickLeave: rules.sickLeave ?? null, suggested: suggestSickPolicy(rules) };
+  });
+  /** What the law where people work suggests (sick leave), for the policy editor and the setup list. */
+  route('GET', '/v1/pto/suggestions', ({ me, org }) => {
+    need(me, 'manager', 'payroll');
+    const rules = c.rulesFor(org);
+    const sick = suggestSickPolicy(rules);
+    return { state: org.state, suggestions: sick ? [sick] : [], rule: rules.sickLeave ?? null, verified: false, note: sick ? null : `KeaS has no paid sick leave law for ${org.state || 'your state'}. You can still add a policy of your own.` };
   });
   route('POST', '/v1/pto/policies', ({ me, org, body }) => {
     need(me, 'payroll');
@@ -176,9 +204,10 @@ export function registerLeave(c) {
     c.getPerson(pid, org.id);
     return { entries: h.all('SELECT l.*, p.name AS policy FROM pto_ledger l JOIN pto_policies p ON p.id = l.policy_id WHERE l.person_id = ? ORDER BY l.date DESC, l.id DESC LIMIT 500', pid).map((x) => ({ date: x.date, policy: x.policy, policyId: x.policy_id, hours: x.hours, kind: x.kind, note: x.note })) };
   });
-  route('POST', '/v1/pto/accrue', ({ me, org, body }) => {
+  route('POST', '/v1/pto/accrue', async ({ me, org, body }) => {
     need(me, 'payroll');
     const period = c.parsePeriod(org, V.date(body.periodStart, 'periodStart'), null);
+    await c.loadEngine?.(org, period);
     const people = h.all(`SELECT id FROM people WHERE org_id = ? AND status IN ('active','leave')`, org.id).map((r) => c.getPerson(r.id, org.id));
     const worked = new Map(people.map((p) => [p.id, c.computeTimecard(org, p, period).totals.workedMin]));
     const posted = postAccruals(h, people, period, worked, iso(now()));

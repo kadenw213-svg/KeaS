@@ -4,6 +4,7 @@
 //
 // Who may do what comes from roles (./roles.mjs): every check is an ability, for the department the action is about.
 // Payroll data is refused here on purpose: SSNs, bank details and pay runs stay in the payroll vault (see noPayroll).
+// Pay codes carry rates, sealed with the server's org data key (./paycodes.mjs); their routes allow rate words.
 import { randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -34,9 +35,9 @@ export function mountRoutes(core, { R, O = null, classes = false, operator = nul
   const { limit, normCode, rawOut } = core.kit;
 
   /** Refuse payroll details anywhere in a request body (./payroll.mjs). */
-  const noPayroll = (v) => checkNoPayroll(v, () => bad(PAYROLL_MESSAGE), () => { throw new HttpError(413, 'That request is too big to check. Send less at a time.'); });
-  // Every org route goes through here: payroll guard first.
-  const OR = (method, path, fn, opts) => R(method, path, (ctx) => { noPayroll(ctx.body); return fn(ctx); }, opts);
+  const noPayroll = (v, rates) => checkNoPayroll(v, () => bad(PAYROLL_MESSAGE), () => { throw new HttpError(413, 'That request is too big to check. Send less at a time.'); }, { rates });
+  // Every org route goes through here: payroll guard first. { rates: true }: the pay code routes, which carry rates.
+  const OR = (method, path, fn, opts) => { const { rates = false, ...rest } = opts || {}; return R(method, path, (ctx) => { noPayroll(ctx.body, rates); return fn(ctx); }, opts ? rest : opts); };
   // Org classes made before classes.org_id existed.
   if (classes) h.run('UPDATE classes SET org_id = (SELECT org_id FROM org_classes WHERE class_id = classes.id) WHERE org_id IS NULL AND id IN (SELECT class_id FROM org_classes)');
 
@@ -1144,6 +1145,7 @@ export function mountRoutes(core, { R, O = null, classes = false, operator = nul
     id: s.id, scheduleId: s.schedule_id, accountId: s.account_id, name: s.account_id ? nm.get(s.account_id) ?? null : null, positionId: s.position_id, positionName: pn.get(s.position_id) ?? null,
     departmentId: s.department_id, locationId: s.location_id, date: s.date, blockId: s.block_id, slotKey: s.block_id ? `${s.date}|${s.block_id}` : null,
     start: new Date(s.start_at).toISOString(), end: new Date(s.end_at).toISOString(), startAt: s.start_at, endAt: s.end_at, status: s.status, source: s.source, note: s.note, forced: !!s.forced,
+    payCodeId: s.pay_code_id ?? null,
   });
   const schedOut = (r) => ({ id: r.id, formId: r.form_id, title: r.title, periodStart: r.period_start, periodEnd: r.period_end, status: r.status, needOverrides: J(r.need_overrides, {}), createdAt: r.created_at, publishedAt: r.published_at,
     drafts: h.get("SELECT COUNT(*) AS n FROM org_shifts WHERE schedule_id = ? AND status = 'draft'", r.id).n,
@@ -1263,6 +1265,8 @@ export function mountRoutes(core, { R, O = null, classes = false, operator = nul
       shid, o.id, sc?.id ?? null, aid, pos.id, body.departmentId ? deptRow(o.id, body.departmentId).id : pos.department_id, body.locationId ? locRow(o.id, body.locationId).id : null,
       pl.date, pl.blockId, pl.startAt, pl.endAt, 'draft', 'manual', V.str(body.note, 'Note', { optional: true, max: 300 }), forced, now());
     if (forced) audit(me.id, 'org.shift_forced', o.id, { shift: shid }, ip);
+    // The code: one of theirs (by default their default code, set as the shift is made).
+    if (body.payCodeId != null) h.run('UPDATE org_shifts SET pay_code_id = ? WHERE id = ?', core.pay.pickFor(o.id, aid, body.payCodeId), shid);
     const sh = shiftRow(o.id, shid);
     return { status: 201, body: { shift: shiftOut(sh, names(o.id), posNames(o.id)), ...(aid ? verdict(problemsFor(o, checkCtx(o, s), aid, pos.id, sh.start_at, sh.end_at, sh.id)) : {}) } };
   });
@@ -1284,6 +1288,8 @@ export function mountRoutes(core, { R, O = null, classes = false, operator = nul
     h.run("UPDATE org_shifts SET account_id = ?, position_id = ?, date = ?, block_id = ?, start_at = ?, end_at = ?, note = ?, forced = ?, status = CASE WHEN status = 'published' AND (? IS NOT account_id OR ? != start_at OR ? != end_at OR ? != position_id) THEN 'draft' ELSE status END WHERE id = ?",
       aid, pos, pl.date, pl.blockId, pl.startAt, pl.endAt, 'note' in body ? V.str(body.note, 'Note', { optional: true, max: 300 }) : sh.note, forced, aid, pl.startAt, pl.endAt, pos, sh.id);
     if (forced) audit(me.id, 'org.shift_forced', o.id, { shift: sh.id }, ip);
+    // (A shift that changed hands already has the new person's code or default; schema.mjs triggers.)
+    if (body.payCodeId != null) h.run('UPDATE org_shifts SET pay_code_id = ? WHERE id = ?', core.pay.pickFor(o.id, aid, body.payCodeId), sh.id);
     return { shift: shiftOut(shiftRow(o.id, sh.id), names(o.id), posNames(o.id)) };
   });
   OR('POST', '/v1/orgs/:id/shifts/:shid/delete', ({ me, params }) => {

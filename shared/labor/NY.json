@@ -1,0 +1,58 @@
+{
+  "jurisdiction": "NY",
+  "name": "New York (Paid Sick Leave, Labor Law 196-b)",
+  "status": "unverified",
+  "needsChecking": "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+  "overtime": null,
+  "meal": null,
+  "rest": null,
+  "minors": null,
+  "minimumWage": {
+    "standard": null,
+    "tipped": null,
+    "youthDiscountPct": null,
+    "localOverrides": [],
+    "note": "The NY minimum wage isn't filled in yet: check this year's rate (and any city or county rate) and add it. Until then only the federal minimum is checked."
+  },
+  "sickLeave": {
+    "needsChecking": true,
+    "law": "New York paid sick leave",
+    "accrueHoursPer": 30,
+    "cap": 40,
+    "capKind": "hours used each year (depends on employer size)",
+    "balanceCap": null,
+    "carryoverCap": null,
+    "frontloadHours": null,
+    "waitingDays": null,
+    "employerSize": [
+      {
+        "employees": "0-4",
+        "hours": 40,
+        "paid": "unpaid unless net income over $1 million"
+      },
+      {
+        "employees": "5-99",
+        "hours": 40,
+        "paid": true
+      },
+      {
+        "employees": "100+",
+        "hours": 56,
+        "paid": true
+      }
+    ],
+    "note": "1 hour per 30 hours worked. The yearly limit depends on the number of employees (40 or 56 hours); set the cap for your size. New York City has its own Earned Safe and Sick Time Act. Needs checking."
+  },
+  "notes": [
+    "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+    "Minor-labor rules here are the federal ones only; state child-labor limits aren't filled in."
+  ],
+  "source": [
+    {
+      "title": "New York State: paid sick leave",
+      "url": "https://www.ny.gov/new-york-state-paid-sick-leave/new-york-state-paid-sick-leave",
+      "checked": null
+    }
+  ],
+  "verifiedFor": null
+}

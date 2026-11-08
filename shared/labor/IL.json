@@ -1,0 +1,41 @@
+{
+  "jurisdiction": "IL",
+  "name": "Illinois (Paid Leave for All Workers Act)",
+  "status": "unverified",
+  "needsChecking": "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+  "overtime": null,
+  "meal": null,
+  "rest": null,
+  "minors": null,
+  "minimumWage": {
+    "standard": null,
+    "tipped": null,
+    "youthDiscountPct": null,
+    "localOverrides": [],
+    "note": "The IL minimum wage isn't filled in yet: check this year's rate (and any city or county rate) and add it. Until then only the federal minimum is checked."
+  },
+  "sickLeave": {
+    "needsChecking": true,
+    "law": "Illinois paid leave for all workers",
+    "accrueHoursPer": 40,
+    "cap": 40,
+    "capKind": "hours accrued and used each year",
+    "balanceCap": null,
+    "carryoverCap": null,
+    "frontloadHours": 40,
+    "waitingDays": 90,
+    "note": "Effective 2024: paid leave for any reason, 1 hour per 40 hours worked, up to 40 hours a year (or front-loaded). Chicago and Cook County have their own ordinances. Needs checking."
+  },
+  "notes": [
+    "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+    "Minor-labor rules here are the federal ones only; state child-labor limits aren't filled in."
+  ],
+  "source": [
+    {
+      "title": "Illinois Department of Labor: Paid Leave for All Workers Act",
+      "url": "https://labor.illinois.gov/laws-rules/fls/paid-leave-for-all-workers-act.html",
+      "checked": null
+    }
+  ],
+  "verifiedFor": null
+}

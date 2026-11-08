@@ -1,0 +1,41 @@
+{
+  "jurisdiction": "WA",
+  "name": "Washington (paid sick leave, RCW 49.46.210)",
+  "status": "unverified",
+  "needsChecking": "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+  "overtime": null,
+  "meal": null,
+  "rest": null,
+  "minors": null,
+  "minimumWage": {
+    "standard": null,
+    "tipped": null,
+    "youthDiscountPct": null,
+    "localOverrides": [],
+    "note": "The WA minimum wage isn't filled in yet: check this year's rate (and any city or county rate) and add it. Until then only the federal minimum is checked."
+  },
+  "sickLeave": {
+    "needsChecking": true,
+    "law": "Washington paid sick leave",
+    "accrueHoursPer": 40,
+    "cap": null,
+    "capKind": null,
+    "balanceCap": null,
+    "carryoverCap": 40,
+    "frontloadHours": null,
+    "waitingDays": 90,
+    "note": "1 hour per 40 hours worked, no yearly cap on accrual; up to 40 unused hours carry over. Use may wait until the 90th day. Seattle and Tacoma have their own rules. Needs checking."
+  },
+  "notes": [
+    "Not verified. Every value here was written from general knowledge of the law and must be checked against the official sources below before anyone relies on it; KeaS shows it as a suggestion until then.",
+    "Minor-labor rules here are the federal ones only; state child-labor limits aren't filled in."
+  ],
+  "source": [
+    {
+      "title": "Washington L&I: paid sick leave",
+      "url": "https://lni.wa.gov/workers-rights/leave/paid-sick-leave/",
+      "checked": null
+    }
+  ],
+  "verifiedFor": null
+}

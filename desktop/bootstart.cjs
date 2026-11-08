@@ -39,7 +39,7 @@ const SERVICE_FOLDER_NAME = 'KeaS Hub Service';
 /** Well-known SIDs (the same in every Windows language). */
 const SID = Object.freeze({ SYSTEM: 'S-1-5-18', ADMINS: 'S-1-5-32-544' });
 /** Files in the Hub's data folder that hold secrets, re-protected one by one by the elevated script. */
-const SECRET_FILES = ['owner.key', 'hub-signing-key.pem', 'hub.db', 'hub.db-wal', 'hub.db-shm'];
+const SECRET_FILES = ['owner.key', 'hub-signing-key.pem', 'org-data.key', 'hub.db', 'hub.db-wal', 'hub.db-shm'];
 /** Layout version of the installed service (2: Program Files with locked-down permissions). */
 const LAYOUT = 2;
 

@@ -243,6 +243,13 @@ export function createHub({
   const key = loadOrCreateKey(join(dataDir, 'hub-signing-key.pem'));
   const ownerKeyFile = join(dataDir, 'owner.key');
   if (!existsSync(ownerKeyFile)) writeSecretFile(ownerKeyFile, randomBytes(32).toString('hex'));
+  // The org data key: seals pay code rates in the org engine (org/paycodes.mjs). Random, made on first start, readable
+  // by this Windows account only (and locked down with the data folder). It's never replaced: rates sealed with it
+  // open only with it, so backups carry it (hub/backup.mjs). It isn't the payroll vault's key; payroll's passphrase
+  // never comes near it.
+  const orgDataKeyFile = join(dataDir, 'org-data.key');
+  if (!existsSync(orgDataKeyFile)) writeSecretFile(orgDataKeyFile, randomBytes(32).toString('hex'));
+  const orgDataKey = readFileSync(orgDataKeyFile, 'utf8').trim();
   // The owner key is read again whenever the file changes, so `node hub/owner.mjs rotate-key` works without a restart.
   let ownerKeyCache = { stamp: null, key: '' };
   const ownerKeyNow = () => {
@@ -2514,7 +2521,7 @@ export function createHub({
   // Organizations (the org engine, org/): members, roles and codes, structure, budgets, certs, availability,
   // schedules, the time clock, the to-do box. People are Hub accounts (hub/orgIdentity.mjs).
   orgEngine = mountOrg({
-    R, O, h, now, audit, notify, classes: true,
+    R, O, h, now, audit, notify, classes: true, dataKey: orgDataKey,
     identity: hubIdentity({ h, now, extrasFor, getSetting }),
     operator: { autoApprove: () => getSetting('orgs', {}).autoApprove === true, setAutoApprove: (v) => setSetting('orgs', { ...getSetting('orgs', {}), autoApprove: v }) },
     kit: { HttpError, V, limit, normCode, rawOut },
@@ -3000,6 +3007,8 @@ main{background:var(--card);border:1px solid var(--line);border-radius:14px;padd
 
   return {
     h, key,
+    /** The org engine (org/index.mjs): payroll on this PC reads hours and pay codes from it (payFeed). */
+    get org() { return orgEngine; },
     /** The owner key now (it can be rotated: `node hub/owner.mjs rotate-key`). */
     get ownerKey() { return ownerKeyNow(); },
     async listen({ port = Number(process.env.KEA_HUB_PORT) || 4860, ownerPort = Number(process.env.KEA_HUB_OWNER_PORT) || 4861 } = {}) {

@@ -135,12 +135,17 @@ function Policies() {
         <button className="btn primary" onClick={() => setEdit({ method: 'per_hour_worked', kind: 'pto', payoutOnTerm: 'state_rule', paid: true, autoEnroll: true, active: true })}>
           <Plus size={15} /> Add a policy
         </button>
-        {data?.stateSickLeave && (
-          <button className="btn" onClick={() => setEdit({ name: 'Paid sick leave', kind: 'sick', method: 'per_hour_worked', accrueHours: 1, perHours: data.stateSickLeave.accrueHoursPer, annualMaxHours: data.stateSickLeave.cap, carryoverMax: data.stateSickLeave.cap, protected: true, payoutOnTerm: 'never', paid: true, autoEnroll: true, active: true })}>
+        {data?.suggested && (
+          <button className="btn" title={data.suggested.why} onClick={() => setEdit({ ...data.suggested })}>
             Start from the state sick-leave rule
           </button>
         )}
       </div>
+      {edit?.needsChecking && (
+        <p className="muted small">
+          Suggested from the law where people work: {edit.why} {(edit.notes || []).join(' ')}
+        </p>
+      )}
       <Table
         cols={[
           { key: 'name', label: 'Policy' },

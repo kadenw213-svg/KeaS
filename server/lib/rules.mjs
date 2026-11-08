@@ -18,6 +18,18 @@ function mergeTwo(a, b) {
     dailyHours: minN(oa?.dailyHours, ob?.dailyHours),
     consecutiveHours: minN(oa?.consecutiveHours, ob?.consecutiveHours),
     multiplier: maxN(oa?.multiplier, ob?.multiplier) ?? 1.5,
+    // How daily and weekly overtime go together: 'greater' (the default: whichever gives more overtime that week) or
+    // 'union' (daily overtime first, then weekly overtime on the hours that weren't already overtime, as California).
+    combine: oa?.combine === 'union' || ob?.combine === 'union' ? 'union' : 'greater',
+    // The seventh day worked in a row in one workweek: its first otFirstHours are overtime (California).
+    seventhDay: oa?.seventhDay || ob?.seventhDay ? { otFirstHours: minN(oa?.seventhDay?.otFirstHours, ob?.seventhDay?.otFirstHours) ?? 0 } : null,
+    // Double time: over dailyHours in a workday, and over seventhDayAfterHours on the seventh day in a row.
+    doubleTime: oa?.doubleTime || ob?.doubleTime ? {
+      dailyHours: minN(oa?.doubleTime?.dailyHours, ob?.doubleTime?.dailyHours),
+      seventhDayAfterHours: minN(oa?.doubleTime?.seventhDayAfterHours, ob?.doubleTime?.seventhDayAfterHours),
+      multiplier: maxN(oa?.doubleTime?.multiplier, ob?.doubleTime?.multiplier) ?? 2,
+    } : null,
+    basis: [oa?.basis || a.jurisdiction, ob?.basis || b.jurisdiction].filter(Boolean).join(' + '),
   } : null;
   const ma = a.meal, mb = b.meal;
   out.meal = (ma || mb) ? { afterHours: minN(ma?.afterHours, mb?.afterHours), minutes: maxN(ma?.minutes, mb?.minutes), paid: anyTrue(ma?.paid, mb?.paid) } : null;
@@ -38,7 +50,8 @@ function mergeTwo(a, b) {
     localOverrides: [...(wa?.localOverrides || []), ...(wb?.localOverrides || [])],
   } : null;
   const sa = a.sickLeave, sb = b.sickLeave;
-  out.sickLeave = (sa || sb) ? { accrueHoursPer: minN(sa?.accrueHoursPer, sb?.accrueHoursPer), cap: maxN(sa?.cap, sb?.cap) } : null;
+  // (The state's description and limits, with the most generous accrual and the highest cap of the two.)
+  out.sickLeave = (sa || sb) ? { ...(sa || {}), ...(sb || {}), accrueHoursPer: minN(sa?.accrueHoursPer, sb?.accrueHoursPer), cap: maxN(sa?.cap, sb?.cap), from: [sa && a.jurisdiction, sb && b.jurisdiction].filter(Boolean).join('+') } : null;
   // Payroll and HR rules: leave laws add up; a state's final-pay and payout rules replace the federal default;
   // the earliest new-hire report deadline wins; retention keeps the longest period per category.
   out.leave = [...(a.leave || []), ...(b.leave || [])];
@@ -147,31 +160,72 @@ export function timecard(punches, shifts, rules, opts = {}) {
   }
   const counted = minutes.filter((m) => inPeriod(m.day));
 
-  // Per workweek: weekly-40 vs daily/consecutive (union, each minute once); pay whichever is greater.
+  // Double time and the seventh day in a row (California-style rules; none in the federal rules).
+  const dt = ot.doubleTime || null, seventh = ot.seventhDay || null;
+  const dayCountOf = new Map();
+  for (const m of minutes) { const c = (dayCountOf.get(m.day) || 0) + 1; dayCountOf.set(m.day, c); m.dc = c; if (dt?.dailyHours != null && c > dt.dailyHours * 60) m.dt = true; }
+  if (seventh || dt?.seventhDayAfterHours != null) {
+    const daysByWeek = new Map();
+    for (const m of minutes) { if (!daysByWeek.has(m.week)) daysByWeek.set(m.week, new Set()); daysByWeek.get(m.week).add(m.day); }
+    for (const [ws, days] of daysByWeek) {
+      if (days.size < 7) continue;
+      const d7 = addDays(ws, 6);
+      for (const m of minutes) {
+        if (m.day !== d7) continue;
+        m.seventh = true;
+        if (dt?.seventhDayAfterHours != null && m.dc > dt.seventhDayAfterHours * 60) m.dt = true;
+        else if (seventh && m.dc <= (seventh.otFirstHours ?? 0) * 60) m.seventhOt = true;
+        else if (seventh && dt?.seventhDayAfterHours == null) m.seventhOt = true;
+      }
+    }
+  }
+
+  // Per workweek. 'greater': weekly-40 vs daily/consecutive (each minute once), whichever gives more. 'union': daily
+  // (and seventh-day) overtime first, then weekly overtime on the hours left regular. Double time is never also overtime.
   const weeks = new Map();
   for (const m of counted) { if (!weeks.has(m.week)) weeks.set(m.week, []); weeks.get(m.week).push(m); }
   const weekOut = [];
+  const union = ot.combine === 'union';
   for (const [ws, mins] of [...weeks.entries()].sort()) {
     const weeklyOt = ot.weeklyHours != null ? Math.max(0, mins.length - ot.weeklyHours * 60) : 0;
-    const dailyFlagged = mins.filter((m) => m.dailyOt || m.consecOt);
-    let method = 'none';
-    if (dailyFlagged.length >= weeklyOt && dailyFlagged.length > 0) { method = 'daily/consecutive'; dailyFlagged.forEach((m) => (m.ot = true)); }
-    else if (weeklyOt > 0) { method = 'weekly'; mins.slice(mins.length - weeklyOt).forEach((m) => (m.ot = true)); }
+    const dailyFlagged = mins.filter((m) => !m.dt && (m.dailyOt || m.consecOt || m.seventhOt));
+    let method = 'none', weeklyApplied = 0;
+    if (union) {
+      dailyFlagged.forEach((m) => (m.ot = true));
+      // (The minutes of the week, including any before the pay period, count toward the weekly limit.)
+      const all = minutes.filter((m) => m.week === ws);
+      let regular = 0;
+      for (const m of all) {
+        // (Minutes before the period that were daily overtime aren't regular either.)
+        if (m.ot || m.dt || m.dailyOt || m.consecOt || m.seventhOt) continue;
+        regular++;
+        if (ot.weeklyHours != null && regular > ot.weeklyHours * 60 && inPeriod(m.day)) { m.ot = true; m.weeklyOt = true; weeklyApplied++; }
+      }
+      method = dailyFlagged.length && weeklyApplied ? 'daily+weekly' : dailyFlagged.length ? 'daily' : weeklyApplied ? 'weekly' : 'none';
+    } else if (dailyFlagged.length >= weeklyOt && dailyFlagged.length > 0) { method = 'daily/consecutive'; dailyFlagged.forEach((m) => (m.ot = true)); }
+    else if (weeklyOt > 0) {
+      method = 'weekly';
+      let left = weeklyOt;
+      for (let i = mins.length - 1; i >= 0 && left > 0; i--) if (!mins[i].dt) { mins[i].ot = true; mins[i].weeklyOt = true; left--; }
+    }
     const otMin = mins.filter((m) => m.ot).length;
+    const dtMin = mins.filter((m) => m.dt).length;
     weekOut.push({
-      weekStart: ws, workedMin: mins.length, overtimeMin: otMin, method,
-      weeklyOvertimeMin: weeklyOt,
-      dailyOvertimeMin: mins.filter((m) => m.dailyOt).length,
-      consecutiveOvertimeMin: mins.filter((m) => m.consecOt).length,
+      weekStart: ws, workedMin: mins.length, overtimeMin: otMin, doubleTimeMin: dtMin, method,
+      weeklyOvertimeMin: union ? weeklyApplied : weeklyOt,
+      dailyOvertimeMin: mins.filter((m) => m.dailyOt && !m.dt).length,
+      consecutiveOvertimeMin: mins.filter((m) => m.consecOt && !m.dt).length,
+      seventhDayOvertimeMin: mins.filter((m) => m.seventhOt && m.ot).length,
       dailyOrConsecutiveMin: dailyFlagged.length,
     });
-    if (otMin > 0) flags.push({ code: 'overtime', date: ws, minutes: otMin, message: `${(otMin / 60).toFixed(2)} h overtime in week of ${ws} (${method} method gives the most)` });
+    if (otMin > 0) flags.push({ code: 'overtime', date: ws, minutes: otMin, message: `${(otMin / 60).toFixed(2)} h overtime in week of ${ws} (${union ? method : `${method} method gives the most`})` });
+    if (dtMin > 0) flags.push({ code: 'double_time', date: ws, minutes: dtMin, message: `${(dtMin / 60).toFixed(2)} h double time in week of ${ws}` });
   }
 
   // Days.
   const days = new Map();
-  const dayRow = (d) => { if (!days.has(d)) days.set(d, { date: d, workedMin: 0, regularMin: 0, overtimeMin: 0, restPremiumMin: 0, punches: [] }); return days.get(d); };
-  for (const m of counted) { const r = dayRow(m.day); r.workedMin++; if (m.ot) r.overtimeMin++; else r.regularMin++; }
+  const dayRow = (d) => { if (!days.has(d)) days.set(d, { date: d, workedMin: 0, regularMin: 0, overtimeMin: 0, doubleTimeMin: 0, weeklyOvertimeMin: 0, restPremiumMin: 0, punches: [] }); return days.get(d); };
+  for (const m of counted) { const r = dayRow(m.day); r.workedMin++; if (m.dt) r.doubleTimeMin++; else if (m.ot) { r.overtimeMin++; if (m.weeklyOt) r.weeklyOvertimeMin++; } else r.regularMin++; }
   for (const p of punches) { const d = localDate(p.at, tz); if (inPeriod(d)) dayRow(d).punches.push({ id: p.id, type: p.type, at: p.at, source: p.source || null, shiftId: p.shift_id ?? p.shiftId ?? null }); }
 
   // Rest breaks and meal periods per shift (pairs grouped by shift; unlinked pairs stand alone).
@@ -236,8 +290,9 @@ export function timecard(punches, shifts, rules, opts = {}) {
   const dayList = [...days.values()].sort((a, b) => (a.date < b.date ? -1 : 1));
   const totals = {
     workedMin: counted.length,
-    regularMin: counted.filter((m) => !m.ot).length,
-    overtimeMin: counted.filter((m) => m.ot).length,
+    regularMin: counted.filter((m) => !m.ot && !m.dt).length,
+    overtimeMin: counted.filter((m) => m.ot && !m.dt).length,
+    doubleTimeMin: counted.filter((m) => m.dt).length,
     restPremiumMin,
   };
   flags.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));

@@ -1,6 +1,8 @@
 // The org engine's tables, and the upgrade of databases made by earlier KeaS versions (migrateOrg).
 //
-// Never here: payroll data. No SSNs, bank details, tax forms, pay rates or pay runs. Those stay in the payroll vault.
+// Never here: payroll details. No SSNs, bank details, tax forms or pay runs. Those stay in the payroll vault.
+// Pay codes (a job's name and pay rate) are here, because people see and switch them on their own shifts and
+// punches: each rate is sealed with the server's org data key (./paycodes.mjs), never stored in plain text.
 // Cost rates are kept only to estimate labor cost against budgets. Time off keeps only its dates, kind and status
 // (balances, reasons and pay stay in the vault).
 //
@@ -9,7 +11,7 @@
 import { randomUUID } from 'node:crypto';
 import { TEMPLATES, roleAbilities } from './roles.mjs';
 
-export const ORG_SCHEMA_VERSION = 2;
+export const ORG_SCHEMA_VERSION = 3;
 
 export const ORG_SCHEMA = `
 CREATE TABLE IF NOT EXISTS org_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -140,7 +142,8 @@ CREATE TABLE IF NOT EXISTS org_shifts (
   account_id TEXT, position_id TEXT NOT NULL, department_id TEXT, location_id TEXT,
   date TEXT NOT NULL, block_id TEXT, start_at INTEGER NOT NULL, end_at INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','published')),
-  source TEXT NOT NULL DEFAULT 'manual', note TEXT, forced INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL
+  source TEXT NOT NULL DEFAULT 'manual', note TEXT, forced INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+  pay_code_id TEXT
 );
 CREATE INDEX IF NOT EXISTS org_shifts_sched ON org_shifts(schedule_id);
 CREATE INDEX IF NOT EXISTS org_shifts_person ON org_shifts(org_id, account_id, start_at);
@@ -171,7 +174,7 @@ CREATE TABLE IF NOT EXISTS org_todo_snoozes (
 CREATE TABLE IF NOT EXISTS org_punches (
   id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE, account_id TEXT NOT NULL,
   shift_id TEXT, type TEXT NOT NULL CHECK (type IN ('in','out')), at INTEGER NOT NULL, source TEXT NOT NULL,
-  rest_attested INTEGER, created_at INTEGER NOT NULL
+  rest_attested INTEGER, created_at INTEGER NOT NULL, pay_code_id TEXT
 );
 CREATE INDEX IF NOT EXISTS org_punches_person ON org_punches(org_id, account_id, at);
 CREATE INDEX IF NOT EXISTS org_punches_shift ON org_punches(shift_id);
@@ -201,6 +204,39 @@ CREATE TABLE IF NOT EXISTS org_time_off (
   created_at INTEGER NOT NULL, decided_by TEXT, decided_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS org_time_off_org ON org_time_off(org_id, start_date);
+-- Pay codes: a job's pay rate (Lifeguard $15, Swim instructor $18). rate is sealed (AES-256-GCM with the server's
+-- org data key, bound to the code's id), never plain text. department_id and position_id say where the code belongs
+-- (optional). A code that was ever used is turned off (active = 0) rather than deleted.
+CREATE TABLE IF NOT EXISTS org_pay_codes (
+  id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+  name TEXT NOT NULL, rate TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'hourly' CHECK (kind IN ('hourly')),
+  color TEXT, active INTEGER NOT NULL DEFAULT 1, department_id TEXT, position_id TEXT,
+  created_by TEXT, created_at INTEGER NOT NULL, updated_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS org_pay_codes_org ON org_pay_codes(org_id);
+-- Who was given which code; each person has at most one default.
+CREATE TABLE IF NOT EXISTS org_member_pay_codes (
+  org_id TEXT NOT NULL, account_id TEXT NOT NULL, code_id TEXT NOT NULL REFERENCES org_pay_codes(id) ON DELETE CASCADE,
+  is_default INTEGER NOT NULL DEFAULT 0, granted_by TEXT, granted_at INTEGER NOT NULL,
+  PRIMARY KEY (org_id, account_id, code_id),
+  FOREIGN KEY (org_id, account_id) REFERENCES org_members(org_id, account_id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS org_member_pay_codes_default ON org_member_pay_codes(org_id, account_id) WHERE is_default = 1;
+-- A punch keeps the code it was made with (punches never change); switching it later is recorded here.
+CREATE TABLE IF NOT EXISTS org_punch_codes (
+  punch_id TEXT PRIMARY KEY REFERENCES org_punches(id) ON DELETE CASCADE, pay_code_id TEXT NOT NULL, set_by TEXT NOT NULL, set_at INTEGER NOT NULL
+);
+-- A shift given to someone gets their default code; a shift that changes hands keeps its code only when the new
+-- person was given it too (otherwise their default). Shifts and punches from before pay codes have none: they're
+-- paid at the person's default code (paycodes.mjs effective codes).
+CREATE TRIGGER IF NOT EXISTS org_shifts_code_ins AFTER INSERT ON org_shifts WHEN NEW.account_id IS NOT NULL AND NEW.pay_code_id IS NULL
+  BEGIN UPDATE org_shifts SET pay_code_id = (SELECT code_id FROM org_member_pay_codes WHERE org_id = NEW.org_id AND account_id = NEW.account_id AND is_default = 1) WHERE id = NEW.id; END;
+CREATE TRIGGER IF NOT EXISTS org_shifts_code_acct AFTER UPDATE OF account_id ON org_shifts WHEN NEW.account_id IS NOT OLD.account_id
+  BEGIN UPDATE org_shifts SET pay_code_id = CASE
+    WHEN NEW.account_id IS NULL THEN NULL
+    WHEN EXISTS (SELECT 1 FROM org_member_pay_codes WHERE org_id = NEW.org_id AND account_id = NEW.account_id AND code_id = NEW.pay_code_id) THEN NEW.pay_code_id
+    ELSE (SELECT code_id FROM org_member_pay_codes WHERE org_id = NEW.org_id AND account_id = NEW.account_id AND is_default = 1) END
+  WHERE id = NEW.id; END;
 -- What a one-time import brought in (import.mjs), so running it again doesn't bring anything twice.
 CREATE TABLE IF NOT EXISTS org_import_map (
   org_id TEXT NOT NULL, source TEXT NOT NULL, kind TEXT NOT NULL, src_id TEXT NOT NULL, dst_id TEXT NOT NULL,
@@ -234,6 +270,9 @@ export function migrateOrg(db, { now = Date.now() } = {}) {
   const report = { from: null, to: ORG_SCHEMA_VERSION, members: 0, codes: 0 };
   const legacy = hasTable(db, 'org_members') && cols(db, 'org_members').includes('role');
   const legacyCodes = hasTable(db, 'org_codes') && cols(db, 'org_codes').includes('role') && !cols(db, 'org_codes').includes('role_id');
+  // Version 3: shifts and punches carry a pay code. (Added before the schema runs: its triggers name the column.)
+  for (const t of ['org_shifts', 'org_punches']) if (hasTable(db, t) && !cols(db, t).includes('pay_code_id')) db.exec(`ALTER TABLE ${t} ADD COLUMN pay_code_id TEXT`);
+  const verBefore = hasTable(db, 'org_meta') ? Number(db.prepare("SELECT value FROM org_meta WHERE key = 'schema'").get()?.value || 0) : 0;
   db.exec(ORG_SCHEMA);
   const ver = Number(db.prepare("SELECT value FROM org_meta WHERE key = 'schema'").get()?.value || 0);
   report.from = legacy ? 1 : ver || ORG_SCHEMA_VERSION;
@@ -296,6 +335,17 @@ export function migrateOrg(db, { now = Date.now() } = {}) {
     }
   } else {
     db.prepare("INSERT INTO org_meta (key,value) VALUES ('schema',?) ON CONFLICT(key) DO NOTHING").run(String(ORG_SCHEMA_VERSION));
+  }
+  // From version 2: the Admin template gains the pay code abilities (the Owner template has every ability anyway).
+  if ((verBefore && verBefore < 3) || legacy) {
+    const add = ['paycodes.manage', 'paycodes.assign'];
+    for (const r of db.prepare("SELECT id, abilities FROM org_roles WHERE template_key = 'admin'").all()) {
+      let have; try { have = JSON.parse(r.abilities); } catch { have = []; }
+      if (!Array.isArray(have)) have = [];
+      const next = [...new Set([...have, ...add])];
+      if (next.length !== have.length) db.prepare('UPDATE org_roles SET abilities = ? WHERE id = ?').run(JSON.stringify(next), r.id);
+    }
+    db.prepare("UPDATE org_meta SET value = ? WHERE key = 'schema'").run(String(ORG_SCHEMA_VERSION));
   }
   // Organizations made before roles existed elsewhere (or added by hand) get their templates.
   for (const o of db.prepare('SELECT id FROM orgs WHERE id NOT IN (SELECT org_id FROM org_roles WHERE template_key = ?)').all('owner')) seedTemplates(db, o.id, now);
