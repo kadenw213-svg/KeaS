@@ -156,3 +156,17 @@ test('a department-scoped approver sees and decides only requests for their depa
   assert.equal((await H.call('POST', O(`/members/${p.id}/approve`), cy.token, {})).status, 403);
   H.ok(await H.call('POST', O(`/members/${f.id}/approve`), cy.token, {}));
 });
+
+test('deleting a department: roles given for it keep only the teams that were under it, never more', async () => {
+  const deep = H.ok(await H.call('POST', O('/departments'), boss.token, { name: 'Deep' }), 201).department;
+  const deeper = H.ok(await H.call('POST', O('/departments'), boss.token, { name: 'Deeper', parentId: deep.id }), 201).department;
+  const solo = H.ok(await H.call('POST', O('/departments'), boss.token, { name: 'Solo' }), 201).department;
+  const r = H.ok(await H.call('POST', O('/roles'), boss.token, { name: 'Deep lead', abilities: ['people.edit'] }), 201).role;
+  H.ok(await H.call('POST', O(`/members/${ben.id}/roles`), boss.token, { roleId: r.id, scope: [deep.id] }));
+  H.ok(await H.call('POST', O(`/members/${cy.id}/roles`), boss.token, { roleId: r.id, scope: [solo.id] }));
+  H.ok(await H.call('POST', O(`/departments/${deep.id}/delete`), boss.token, {}));
+  H.ok(await H.call('POST', O(`/departments/${solo.id}/delete`), boss.token, {}));
+  const b = await meIn(ben);
+  assert.deepEqual(b.roles.find((x) => x.roleId === r.id).scope, [deeper.id]);
+  assert.equal((await meIn(cy)).roles.some((x) => x.roleId === r.id), false, 'a scope left with nothing goes');
+});

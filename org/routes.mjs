@@ -455,7 +455,20 @@ export function mountRoutes(core, { R, O = null, classes = false, operator = nul
   OR('POST', '/v1/orgs/:id/departments/:did/delete', ({ me, params }) => {
     const { o } = asOrg(params.id, me, 'structure.edit', { dept: null });
     const d = deptRow(o.id, params.did);
-    h.tx(() => {
+    tx(() => {
+      // Roles given for it now cover just the teams that were under it (never the department above, which would be
+      // more than anyone gave); one left covering nothing goes, and its holder keeps at least Member.
+      const teams = h.all('SELECT id FROM org_departments WHERE parent_id = ? AND org_id = ?', d.id, o.id).map((r) => r.id);
+      for (const a of h.all('SELECT a.account_id, a.role_id, a.scope FROM org_role_assignments a, json_each(a.scope) j WHERE a.org_id = ? AND a.scope IS NOT NULL AND j.value = ?', o.id, d.id)) {
+        const next = [...new Set([...J(a.scope, []).filter((x) => x !== d.id), ...teams])];
+        if (next.length) h.run('UPDATE org_role_assignments SET scope = ? WHERE org_id = ? AND account_id = ? AND role_id = ?', JSON.stringify(next), o.id, a.account_id, a.role_id);
+        else { h.run('DELETE FROM org_role_assignments WHERE org_id = ? AND account_id = ? AND role_id = ?', o.id, a.account_id, a.role_id); core.keepARole(o.id, a.account_id, me.id); }
+      }
+      for (const cd of h.all('SELECT code, role_scope FROM org_codes c, json_each(c.role_scope) j WHERE c.org_id = ? AND c.role_scope IS NOT NULL AND j.value = ?', o.id, d.id)) {
+        const next = [...new Set([...J(cd.role_scope, []).filter((x) => x !== d.id), ...teams])];
+        if (next.length) h.run('UPDATE org_codes SET role_scope = ? WHERE code = ?', JSON.stringify(next), cd.code);
+        else h.run('UPDATE org_codes SET revoked = 1 WHERE code = ?', cd.code);
+      }
       // Teams under it move up a level; people and positions in it keep working, with no department.
       h.run('UPDATE org_departments SET parent_id = ? WHERE parent_id = ? AND org_id = ?', d.parent_id, d.id, o.id);
       h.run('UPDATE org_members SET department_id = ? WHERE department_id = ? AND org_id = ?', d.parent_id, d.id, o.id);
@@ -1780,7 +1793,7 @@ export function mountRoutes(core, { R, O = null, classes = false, operator = nul
     });
   }
 
-  return { todoFor, removeMember, deptRow, positionRow, capRows, memberOut, orgOut, rulesFor, date, num, list, cents };
+  return { OR, todoFor, removeMember, deptRow, positionRow, capRows, memberOut, orgOut, rulesFor, date, num, list, cents };
 }
 
 export { DAY_NAMES, fmtRange, datesIn, daysUntil };

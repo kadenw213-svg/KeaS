@@ -36,8 +36,9 @@ export function mountOrg({ R, h, now = () => Date.now(), audit = () => {}, notif
   const upgrade = migrateOrg(h.db, { now: now() });
   const core = makeCore({ h, now, audit, notify, identity, kit: fullKit });
   const main = mountRoutes(core, { R, O, classes, operator });
-  mountRoleRoutes(core, { R, deptRow: main.deptRow });
-  const clock = mountClock(core, { R, rulesFor: main.rulesFor, date: main.date, list: main.list });
+  // (Through the same payroll guard as every org route.)
+  mountRoleRoutes(core, { R: main.OR, deptRow: main.deptRow });
+  const clock = mountClock(core, { R: main.OR, rulesFor: main.rulesFor, date: main.date, list: main.list });
 
   /** Organizations where this account is the only owner and others are still members (it can't go yet). */
   const soleOwnerOrgs = (aid) => h.all('SELECT DISTINCT o.id, o.name FROM org_role_assignments a JOIN org_roles r ON r.id = a.role_id JOIN orgs o ON o.id = a.org_id WHERE a.account_id = ? AND r.template_key = ?', aid, 'owner')
