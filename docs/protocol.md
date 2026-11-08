@@ -48,7 +48,8 @@ How a Kea account signs in to a KeaS server without KeaS ever seeing a password.
    `{ serverId, publicKey (JWK), name, sig }` where `sig` signs `kea-server-identity:<serverId>:<nonce>`.
    Kea checks the signature and that `serverId` matches the key. A KeaS is **never registered** with KeaC.
 2. **Pass request.** Kea (signed in to KeaC) calls `POST <keac>/v1/pass { serverId }` with its session. Needs a
-   two-step session if the account has two-step on. KeaC answers `{ pass, exp }`.
+   two-step session if the account has two-step on, and a verified email (403 `{ needsVerify: true }` otherwise: only an
+   account moved from the old Hub can lack one, until it verifies with Google or Microsoft). KeaC answers `{ pass, exp }`.
 3. **Pass format.** JWT-shaped, `alg: EdDSA`, header `kid`. Payload:
    `{ iss: 'kea', aud: 'keas:<serverId>', sub: <account id>, email, name, ev: true, iat, exp }`.
    Lifetime **7 days**. Kea renews it silently once a day while online, so users never see expiry.
