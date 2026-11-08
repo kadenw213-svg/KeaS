@@ -1,7 +1,9 @@
 // The Kea account in KeaS: the same account as in the Kea app, on KeaC (the Kea account server). KeaS signs in there
-// (email + password + two-step code, or Google in the browser: oauth.cjs), keeps that session encrypted with Windows
-// (Electron safeStorage), and asks KeaC for passes for its own KeaS server (POST /v1/pass { serverId }). Passwords and
-// two-step codes go to KeaC only, never to the KeaS server.
+// with Google or Microsoft in the system browser (oauth.cjs: loopback + PKCE), the same way the Kea app does, keeps
+// that session encrypted with Windows (Electron safeStorage), and asks KeaC for passes for its own KeaS server
+// (POST /v1/pass { serverId }). Kea accounts have no passwords. (Only the Kea account server owner's own account still
+// has a two-step code: KeaC asks for it after the Google or Microsoft sign-in, and the same sign-in goes again with it.)
+// The ID token goes to KeaC only, never to the KeaS server.
 //
 // No Electron here (protect/fetch are passed in), so it can be tested against a fake KeaC.
 'use strict';
@@ -26,9 +28,10 @@ function checkUrl(url) {
 
 /**
  * dir: where the encrypted session and the account summary are kept. protect: { available(), encrypt(s) -> Buffer,
- * decrypt(Buffer) -> s }. getUrl(): KeaC's address (KeaS's settings), setUrl(u).
+ * decrypt(Buffer) -> s }. getUrl(): KeaC's address (KeaS's settings), setUrl(u). idTokenFor(provider, loginHint):
+ * a Google or Microsoft ID token from the browser (oauth.cjs).
  */
-function createAccount({ dir, protect, getUrl, setUrl = () => {}, fetchImpl = fetch, client = 'KeaS', timeoutMs = 10_000 }) {
+function createAccount({ dir, protect, getUrl, setUrl = () => {}, fetchImpl = fetch, client = 'KeaS', timeoutMs = 10_000, idTokenFor = null }) {
   const tokenFile = () => path.join(dir, 'keac-session.bin');
   const cacheFile = () => path.join(dir, 'account.json');
   let memToken = null;
@@ -89,16 +92,45 @@ function createAccount({ dir, protect, getUrl, setUrl = () => {}, fetchImpl = fe
       throw e;
     }
   }
-  /** Email + password, then (when KeaC asks: data.totpRequired) the same again with the code. */
-  async function login({ email, password, code }) {
-    const r = await req('POST', '/v1/auth/login', { email: String(email || '').trim(), password: String(password || ''), ...(code ? { code: String(code).trim() } : {}) }, { auth: false });
+  // A sign-in waiting for the owner's two-step code: its ID token, kept in memory for a few minutes and sent again with
+  // the code (KeaC uses a token up only when it signs in). purpose: 'signin' (KeaS's own) or 'fresh' (one payroll open).
+  let pending = null;
+  const PENDING_MS = 10 * 60_000;
+  const LABEL = { google: 'Google', microsoft: 'Microsoft' };
+  const emailOf = (tok) => { try { return String(JSON.parse(Buffer.from(String(tok).split('.')[1], 'base64url').toString('utf8')).email || '').trim().toLowerCase(); } catch { return ''; } };
+  async function getIdToken(provider, loginHint) {
+    if (!LABEL[provider]) throw new AccountError('Choose Google or Microsoft.', 400);
+    if (!idTokenFor) throw new AccountError(`Signing in with ${LABEL[provider]} isn’t set up in this KeaS.`, 503, { notSetUp: true });
+    return idTokenFor(provider, loginHint || null);
+  }
+  /** One sign-in at KeaC with a provider's token; a code asked for keeps the token for continueSignIn. */
+  async function oauthCall(p, code) {
+    try {
+      return await req('POST', '/v1/auth/oauth', { provider: p.provider, idToken: p.idToken, ...(code ? { code: String(code).trim() } : {}) }, { auth: false });
+    } catch (e) {
+      if (e.data?.totpRequired) { pending = { ...p, at: Date.now() }; throw e; }
+      pending = null;
+      // (No Kea account for that email: made in the Kea app, which shows the terms.)
+      if (e.status === 404 && e.data?.needsAccount) throw new AccountError(`There’s no Kea account for ${e.data.email || emailOf(p.idToken)} yet. Make it in the Kea app (Continue with ${LABEL[p.provider]}), then sign in here.`, 404, { needsAccount: true });
+      throw e;
+    }
+  }
+  /** Continue with Google or Microsoft (the browser opens). `idToken`: one already got (the tests). */
+  async function oauth({ provider, idToken } = {}) {
+    pending = null;
+    const p = { provider, idToken: idToken || (await getIdToken(provider, cached()?.email)), purpose: 'signin' };
+    const r = await oauthCall(p);
+    pending = null;
     writeToken(r.token);
     saveCache(r);
     return status();
   }
-  /** Signing in with a Google or Microsoft ID token from the browser (oauth.cjs). */
-  async function oauth({ provider, idToken }) {
-    const r = await req('POST', '/v1/auth/oauth', { provider, idToken }, { auth: false });
+  /** The sign-in waiting for the owner's two-step code, finished with it. */
+  async function continueSignIn({ code }) {
+    const p = pending;
+    if (!p || p.purpose !== 'signin' || Date.now() - p.at > PENDING_MS) { pending = null; throw new AccountError('That sign-in timed out. Continue with Google or Microsoft again.', 408, { expired: true }); }
+    const r = await oauthCall(p, code);
+    pending = null;
     writeToken(r.token);
     saveCache(r);
     return status();
@@ -123,18 +155,28 @@ function createAccount({ dir, protect, getUrl, setUrl = () => {}, fetchImpl = fe
     return { pass: r.pass, exp: r.exp };
   }
   /**
-   * A pass from a fresh sign-in (password and two-step code), for "Ask for my sign-in every time". That KeaC session
+   * A pass from a fresh Google or Microsoft sign-in with the signed-in account's email, for "Ask for my sign-in every
+   * time" (`code`: the owner's two-step code, when KeaC asked for it: the same sign-in goes again). That KeaC session
    * ends right after; the remembered one stays as it is.
    */
-  async function freshPass(serverId, { password, code }) {
+  async function freshPass(serverId, { provider = 'google', code, idToken } = {}) {
     const me = cached();
     if (!me?.email) throw new AccountError('Sign in to your Kea account first.', 401);
-    const r = await req('POST', '/v1/auth/login', { email: me.email, password: String(password || ''), ...(code ? { code: String(code).trim() } : {}) }, { auth: false });
+    let p;
+    if (code && pending?.purpose === 'fresh' && Date.now() - pending.at < PENDING_MS) p = pending;
+    else {
+      pending = null;
+      p = { provider, idToken: idToken || (await getIdToken(provider, me.email)), purpose: 'fresh' };
+      const got = emailOf(p.idToken);
+      if (got && got !== String(me.email).toLowerCase()) throw new AccountError(`That ${LABEL[provider] || ''} account is ${got}, but KeaS is signed in as ${me.email}. Use ${me.email}.`, 409, { mismatch: true });
+    }
+    const r = await oauthCall(p, code);
+    pending = null;
     try { return await pass(serverId, { token: r.token }); }
     finally { req('POST', '/v1/auth/logout', {}, { token: r.token }).catch(() => {}); }
   }
 
-  return { url, status, login, oauth, logout, changeUrl, pass, freshPass, cached, signedIn: () => !!readToken(), forget: signOutHere };
+  return { url, status, oauth, continueSignIn, logout, changeUrl, pass, freshPass, cached, signedIn: () => !!readToken(), forget: signOutHere };
 }
 
 module.exports = { createAccount, checkUrl, AccountError };

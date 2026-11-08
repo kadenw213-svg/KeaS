@@ -127,18 +127,25 @@ function keac() {
   ];
 }
 
-// ---------- setup: signing in with the Kea account (at KeaC) ----------
+// ---------- setup: signing in with the Kea account (Google or Microsoft, in the browser) ----------
+const PROVIDER_LABEL = { google: 'Google', microsoft: 'Microsoft' };
+/** The providers this KeaS has a client id for: Google, and Microsoft when it's set up. */
+const providerList = () => ['google', 'microsoft'].filter((p) => S.providers && S.providers[p]);
+const NOT_SET_UP = 'Google and Microsoft sign-in aren’t set up in this KeaS yet. Add googleClientId (or microsoftClientId) to keas-config.json, then start KeaS again.';
 function accountForm(after) {
-  const f = S.sf || (S.sf = { email: (S.acct && S.acct.email) || '', password: '', code: '' });
-  const done = async (p) => { S.busy = true; S.error = ''; render(); try { S.acctStatus = await p; S.acct = S.acctStatus.account; S.sf = null; S.needCode = false; S.busy = false; await after(); } catch (e) { S.busy = false; if (e.data && e.data.totpRequired) { S.needCode = true; S.error = f.code ? e.message : ''; } else S.error = e.message; render(); } };
+  const f = S.sf || (S.sf = { code: '' });
+  const done = async (p) => { S.busy = true; S.error = ''; render(); try { S.acctStatus = await p; S.acct = S.acctStatus.account; S.sf = null; S.needCode = false; S.busy = false; await after(); } catch (e) { S.busy = false; if (e.data && e.data.totpRequired) { S.needCode = true; S.error = f.code ? e.message : ''; } else { S.needCode = false; S.error = e.message; } render(); } };
+  if (S.needCode)
+    return h('div', null,
+      form(() => done(call(k.accountContinue, { code: f.code })),
+        h('p', { class: 'muted small' }, 'This is the owner’s account: it also asks for its two-step code.'),
+        h('label', { class: 'field' }, 'Two-step code or backup code', h('input', { type: 'text', autocomplete: 'one-time-code', value: f.code, oninput: (e) => (f.code = e.target.value) })),
+        h('div', { class: 'actions' }, h('button', { class: 'btn', type: 'button', disabled: S.busy, onclick: () => { S.needCode = false; S.sf = null; render(); } }, 'Cancel'), h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, S.busy ? 'Signing in…' : 'Sign in'))));
+  const list = providerList();
+  if (!list.length) return h('p', { class: 'muted small' }, NOT_SET_UP);
   return h('div', null,
-    form(() => done(call(k.accountLogin, { email: f.email, password: f.password, code: S.needCode ? f.code : undefined })),
-      h('label', { class: 'field' }, 'Email', h('input', { type: 'email', value: f.email, autocomplete: 'username', oninput: (e) => (f.email = e.target.value) })),
-      h('label', { class: 'field' }, 'Password', h('input', { type: 'password', value: f.password, autocomplete: 'current-password', oninput: (e) => (f.password = e.target.value) })),
-      S.needCode && h('label', { class: 'field' }, 'Code from your authenticator app, or a backup code', h('input', { type: 'text', inputmode: 'numeric', autocomplete: 'one-time-code', value: f.code, oninput: (e) => (f.code = e.target.value) })),
-      h('div', { class: 'actions' }, h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, S.busy ? 'Signing in…' : 'Sign in'))),
-    S.google && h('p', null, h('button', { class: 'btn', disabled: S.busy, onclick: () => done(call(k.accountGoogle)) }, 'Sign in with Google in the browser')),
-    h('p', { class: 'muted small' }, 'Your password and code go to your Kea account server only, never to this KeaS server. No Kea account yet? Make one in the Kea app.'));
+    h('div', { class: 'actions' }, list.map((p) => h('button', { class: 'btn primary', disabled: S.busy, onclick: () => done(call(k.accountOauth, { provider: p })) }, S.busy ? 'Waiting for the browser…' : `Continue with ${PROVIDER_LABEL[p]}`))),
+    h('p', { class: 'muted small' }, 'Your browser opens to sign in. There’s no Kea password. No Kea account yet? Make one in the Kea app.'));
 }
 function account() {
   const a = S.acctStatus || {};
@@ -492,7 +499,7 @@ async function load() {
   const st = await call(k.state);
   S.config = st.config; S.defaults = st.defaults || {}; S.folderProblem = st.folderProblem || null; S.folderWarning = st.folderWarning || S.folderWarning || null;
   S.running = !!st.running; S.lastStartError = st.lastStartError || null; S.hubExternal = !!st.external;
-  S.version = st.version; S.legacy = !!st.legacy; S.legacyMessage = st.legacyMessage; S.server = st.server; S.setupCode = st.setupCode; S.google = !!st.google;
+  S.version = st.version; S.legacy = !!st.legacy; S.legacyMessage = st.legacyMessage; S.server = st.server; S.setupCode = st.setupCode; S.google = !!st.google; S.providers = st.providers || { google: !!st.google, microsoft: false };
   S.startWithWindows = !!st.startWithWindows;
   if (st.account) S.acct = st.account;
   S.update = await call(k.updateState).catch(() => null);
@@ -805,7 +812,7 @@ function payrollPanel() {
   const sendUnlock = async () => {
     S.busy = true; S.payError = ''; render();
     try {
-      const r = await call(k.payrollUnlock, { passphrase: d.passphrase, password: d.password, code: f.need === 'code' ? d.code : undefined });
+      const r = await call(k.payrollUnlock, { passphrase: d.passphrase, password: S.legacy ? d.password : undefined, provider: S.legacy ? undefined : d.provider || providerList()[0] || 'google', code: f.need === 'code' ? d.code : undefined });
       if (r.need === 'code') { S.payForm = { ...f, need: 'code' }; d.code = ''; S.busy = false; render(); return; }
       payOpened();
     } catch (e) {
@@ -867,24 +874,26 @@ function payrollPanel() {
   } else if (f.need === 'code') {
     body = form(sendUnlock,
       h('h3', null, 'Two-step sign-in'),
-      h('p', { class: 'muted small' }, S.useBackup ? 'The passphrase is right. Now one of your backup codes.' : 'The passphrase is right. Now the 6-digit code from your authenticator app.'),
+      h('p', { class: 'muted small' }, S.useBackup ? 'The passphrase is right. Now one of the owner account’s backup codes.' : 'The passphrase is right. Now the owner account’s 6-digit code from its authenticator app.'),
       codeInput(() => d.code, (v) => (d.code = v), { label: 'Code' }),
       err,
       h('div', { class: 'actions' }, cancel, h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, S.busy ? 'Opening…' : 'Open Payroll')));
   } else {
     body = form(sendUnlock,
       h('h3', null, f.askEveryTime ? 'Sign in to Payroll' : 'Unlock Payroll'),
-      h('p', { class: 'muted small' }, f.askEveryTime ? `${f.org ? `${f.org}. ` : ''}Your Kea password and the vault passphrase. A two-step code comes next if your account uses one.` : `${f.org ? `${f.org}. ` : ''}The vault passphrase. KeaS remembers it until you close KeaS or payroll locks.`),
-      f.askEveryTime && field('Kea password', 'password', 'password', { autocomplete: 'current-password' }),
+      h('p', { class: 'muted small' }, f.askEveryTime ? `${f.org ? `${f.org}. ` : ''}${S.legacy ? 'Your Kea Hub password and the vault passphrase.' : 'The vault passphrase, then your browser opens to sign in with your Kea account.'}` : `${f.org ? `${f.org}. ` : ''}The vault passphrase. KeaS remembers it until you close KeaS or payroll locks.`),
+      f.askEveryTime && S.legacy && field('Kea Hub password', 'password', 'password', { autocomplete: 'current-password' }),
       field('Vault passphrase', 'passphrase', 'password'),
+      f.askEveryTime && !S.legacy && providerList().length > 1 && h('label', { class: 'field' }, 'Sign in with', h('select', { onchange: (e) => (d.provider = e.target.value) }, providerList().map((p) => h('option', { value: p, selected: (d.provider || 'google') === p }, PROVIDER_LABEL[p])))),
+      f.askEveryTime && !S.legacy && !providerList().length && h('p', { class: 'err' }, NOT_SET_UP),
       err,
-      h('div', { class: 'actions' }, cancel, h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, S.busy ? 'Opening…' : 'Open Payroll')));
+      h('div', { class: 'actions' }, cancel, h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, S.busy ? 'Opening…' : f.askEveryTime && !S.legacy ? `Continue with ${PROVIDER_LABEL[d.provider || providerList()[0] || 'google']}` : 'Open Payroll')));
   }
   return h('div', { class: 'panel', id: 'payroll' }, intro, body,
     !f && err,
     h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !!p.askEveryTime, onchange: async (e) => {
       try { await call(k.payrollAskEveryTime, { on: e.target.checked }); S.pay = null; S.payForm = null; render(); } catch (er) { fail(er); }
-    } }), h('span', null, 'Ask for my sign-in every time I open Payroll', h('span', { class: 'muted small' }, ' Your Kea password, the passphrase and the two-step code, at every open. Off: KeaS uses your Kea sign-in and asks for the passphrase once each time KeaS starts.'))),
+    } }), h('span', null, 'Ask for my sign-in every time I open Payroll', h('span', { class: 'muted small' }, ' A fresh Google or Microsoft sign-in and the passphrase, at every open. Off: KeaS uses your Kea sign-in and asks for the passphrase once each time KeaS starts.'))),
     payrollAdvanced());
 }
 

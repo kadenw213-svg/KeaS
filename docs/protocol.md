@@ -8,22 +8,32 @@ Version 1. This document is the contract between the three apps (the public part
 |---|---|---|
 | **Kea** | everyone | the user's own data; works fully offline |
 | **KeaS** | an organization (school, employer) on its own PC | that org's people, roles, classes, schedules, time clock, payroll |
-| **KeaC** | the Kea owner only | every Kea account, verification, two-step, personal cloud, shared Claude, hosted orgs, approvals |
+| **KeaC** | the Kea owner only | every Kea account, Google/Microsoft verification, personal cloud, shared Claude, hosted orgs, approvals |
 
 Users never see the name KeaC. In Kea and KeaS it is "your Kea account"; its address shows only under Advanced.
 
 ## 1. Kea accounts (public)
 
-- **Offline account** (in Kea only): email + password, stored on the device (scrypt verifier). No storage, no sync,
-  no joining anything hosted. Never leaves the device.
-- **Online account** (on KeaC): created only with a verified email from **Google** or **Microsoft**: the client sends
-  the provider's ID token; KeaC checks it (signature against the provider's keys, issuer, audience = Kea's client id,
-  expiry, `email_verified` for Google) and that its email is the account email. Microsoft: the `email` claim of a
-  personal account, or of a work/school account only with `xms_edov: true`; never `preferred_username`. A display
-  name is optional.
+There are no Kea passwords. Online, a Kea account signs in with **Google** or **Microsoft** only.
+
+- **Offline account** (in Kea only): just an email, kept on the device. Typing the email opens Kea at once, with no
+  connection; the same email opens that device's things again after signing out. No storage, no sync, no joining
+  anything hosted. Never leaves the device. (Kea 0.80 kept a password verifier with it; Kea drops it on first read and
+  keeps the account and its email.)
+- **Online account** (on KeaC): made by the first Google or Microsoft sign-in for an email, with the terms agreed. The
+  client sends the provider's ID token; KeaC checks it (signature against the provider's keys, issuer, audience =
+  Kea's client id, expiry, `email_verified` for Google) and takes the account email from it. Microsoft: the `email`
+  claim of a personal account, or of a work/school account only with `xms_edov: true`; never `preferred_username`.
+  A display name is optional (else the token's name, else the email's first part).
+- **Signing in**: the same, for an existing account with that email. It also marks the email verified, so an account
+  moved from the old Hub (`ev` false, a password nobody types any more) is verified by its first Google or Microsoft
+  sign-in with that email. After an online sign-in, Kea stays signed in on the device (offline too).
 - **Linking**: an offline account becomes online when the same email signs in with Google/Microsoft. A different
-  email never links; the offline account and its data stay as they are.
-- Sign-in: email + password (+ two-step code or backup code when two-step is on), or Google/Microsoft.
+  email never links; the offline account and its data stay as they are, and the client doesn't send the token.
+- **Passwords and two-step codes are retired.** Stored password hashes (and old two-step secrets) stay in KeaC's
+  database, unused. The one exception is **the KeaC owner's account**: it keeps its password and two-step code for the
+  KeaC desktop app (which works before any Google client id exists), and its Google or Microsoft sign-in also asks for
+  the two-step code.
 - Sessions: opaque 32-byte tokens, stored hashed; 30 days from last use, at most 365 days. A session records whether
   it passed two-step (`mfa`); owner powers need `mfa`.
 
@@ -31,13 +41,25 @@ Users never see the name KeaC. In Kea and KeaS it is "your Kea account"; its add
 
 | Method, path | Body | Returns |
 |---|---|---|
-| `GET /health` | | `{ ok, version, features[] }` |
+| `GET /health` | | `{ ok, version, features[] }` (`oauthCreate`, `passwordRetired` among them) |
 | `GET /terms` | | current terms |
-| `POST /auth/register` | `{ provider: 'google'\|'microsoft', idToken, password, name?, termsVersion, termsSections, age13 }` | `{ token, me }` |
-| `POST /auth/login` | `{ email, password, code? }` | `{ token, me }`, or 401 `{ totpRequired, backupCodes }` |
-| `POST /auth/oauth` | `{ provider, idToken }` | `{ token, me }` (sign in with Google/Microsoft) |
-| `POST /auth/reset/oauth` | `{ provider, idToken, password }` | `{ ok }` (new password) |
-| `GET /me`, `POST /auth/logout`, sessions, two-step, backup codes, export, delete | as Hub 0.5 | |
+| `POST /auth/oauth` | `{ provider: 'google'\|'microsoft', idToken, code? }` | `{ token, me }` (signed in) |
+| | no account for that email, no terms in the body | 404 `{ needsAccount: true, email, name, termsVersion }`. The ID token is **not** used up: send the same one again with the terms |
+| | `{ provider, idToken, termsVersion, termsSections, age13: true, name?, birthYear? }` | 201 `{ token, me, created: true }` (the account is made) |
+| | the owner's account, two-step on, no or wrong `code` | 401 `{ totpRequired, backupCodes }` (the token is not used up: send it again with `code`) |
+| `POST /auth/google` | `{ idToken, ... }` | the same as `/auth/oauth` with Google (Hub 0.5's path) |
+| `POST /auth/register` | `{ provider, idToken, termsVersion, termsSections, age13, name? }` | 201 `{ token, me }`; 409 `{ exists }` when the email has an account. With a `password`: 410 |
+| `POST /auth/login` | `{ email, password, code? }` | the owner's account only (the KeaC desktop app). Anyone else: 410 |
+| `POST /auth/reset/oauth`, `/auth/reset/google` | | the owner's account only. Anyone else: 410 |
+| `POST /me/password`, `/me/totp/setup`, `/me/totp/enable`, `/me/totp/backup-codes`, `/me/totp/disable` | | the owner's account only. Anyone else: 410 `{ passwordRetired }` or `{ twoStepRetired }` |
+| `POST /me/sessions/sign-out-others` | `{ provider, idToken }` (a fresh sign-in with the account's own email) | `{ signedOut }`; without one 401 `{ signInRequired }` |
+| `POST /me/delete` | `{ confirm: 'DELETE', provider, idToken, eraseNow? }` | `{ ok, deleted }` |
+| `GET /me`, `POST /auth/logout`, sessions, export | as Hub 0.5 | |
+
+**410 `{ passwordRetired: true }`** answers an older client's password sign-in or registration, with the sentence "Kea
+accounts now sign in with Google or Microsoft only. Update Kea, then choose Continue with Google or Continue with
+Microsoft with your account’s email." Clients show it as is. The password isn't looked at and the attempt doesn't
+count as a failed sign-in.
 
 ## 2. Server passes (public)
 
@@ -48,8 +70,8 @@ How a Kea account signs in to a KeaS server without KeaS ever seeing a password.
    `{ serverId, publicKey (JWK), name, sig }` where `sig` signs `kea-server-identity:<serverId>:<nonce>`.
    Kea checks the signature and that `serverId` matches the key. A KeaS is **never registered** with KeaC.
 2. **Pass request.** Kea (signed in to KeaC) calls `POST <keac>/v1/pass { serverId }` with its session. Needs a
-   two-step session if the account has two-step on, and a verified email (403 `{ needsVerify: true }` otherwise: only an
-   account moved from the old Hub can lack one, until it verifies with Google or Microsoft). KeaC answers `{ pass, exp }`.
+   verified email (and, for the KeaC owner's own account only, a session that passed its two-step code) (403 `{ needsVerify: true }` otherwise: only an
+   account moved from the old Hub can lack one, until it signs in with Google or Microsoft). KeaC answers `{ pass, exp }`.
 3. **Pass format.** JWT-shaped, `alg: EdDSA`, header `kid`. Payload:
    `{ iss: 'kea', aud: 'keas:<serverId>', sub: <account id>, email, name, ev: true, iat, exp }`.
    Lifetime **7 days**. Kea renews it silently once a day while online, so users never see expiry.

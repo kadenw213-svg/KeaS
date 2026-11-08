@@ -47,7 +47,13 @@ app.on('second-instance', () => showWindow());
 // ---------- the Kea account (KeaC) and the KeaS server's sign-in ----------
 const keacUrl = () => config.keacUrl || null;
 let accountApi = null;
-const account = () => (accountApi ||= createAccount({ dir: app.getPath('userData'), protect, getUrl: keacUrl, setUrl: (u) => { config = writeConfig({ ...config, keacUrl: u || null }); }, client: `KeaS/${app.getVersion()}` }));
+// Google or Microsoft in the system browser (oauth.cjs): the client ids are KeaS's settings on this PC (googleClientId
+// and googleClientSecret, microsoftClientId in keas-config.json).
+const clientIdOf = (provider) => String((provider === 'microsoft' ? config.microsoftClientId : config.googleClientId) || '').trim();
+const providers = () => ({ google: !!clientIdOf('google'), microsoft: !!clientIdOf('microsoft') });
+const idTokenFor = (provider, loginHint) => require('./oauth.cjs').idToken({ provider, clientId: clientIdOf(provider), clientSecret: provider === 'google' ? config.googleClientSecret || null : null, loginHint, open: (u) => shell.openExternal(u) });
+const account = () => (accountApi ||= createAccount({ dir: app.getPath('userData'), protect, getUrl: keacUrl, setUrl: (u) => { config = writeConfig({ ...config, keacUrl: u || null }); }, client: `KeaS/${app.getVersion()}`, idTokenFor: (p, hint) => (clientIdOf(p) ? idTokenFor(p, hint) : Promise.reject(Object.assign(new Error(NOT_SET_UP), { status: 503, data: { notSetUp: true } }))) }));
+const NOT_SET_UP = 'Google and Microsoft sign-in aren’t set up in this KeaS yet. Add a client id in keas-config.json (googleClientId or microsoftClientId).';
 const serverId = async () => { const me = config.dataDir && serverIdentity(config.dataDir); if (!me) throw new Error('Start the KeaS server first.'); return me.serverId; };
 async function owner(method, p, body) {
   const { ownerFetch } = await import(pathToFileURL(path.join(ROOT, 'hub', 'lib', 'ownerauth.mjs')).href);
@@ -368,19 +374,16 @@ function registerIpc() {
       defaults, resume: flow.resumeChoices(config, defaults), version: app.getVersion(), legacy,
       legacyMessage: legacy ? 'Your Kea accounts are still here. Move them to your Kea account server, then this PC becomes your organization’s server.' : null,
       view: flow.firstView({ legacy, config }), account: account().cached(), startWithWindows: flow.startWithWindows(config),
-      server: await serverFacts(), setupCode: mode === 'keas' ? setupSecret() : null, google: !!config.googleClientId,
+      server: await serverFacts(), setupCode: mode === 'keas' ? setupSecret() : null, google: providers().google, providers: providers(),
     };
   });
 
   // ---------- the Kea account (KeaC) ----------
   handle('account:status', () => account().status());
-  handle('account:login', (a) => account().login(a));
-  handle('account:google', async () => {
-    if (!config.googleClientId) throw new Error('Signing in with Google isn’t set up in this KeaS. Use your email and password.');
-    const { googleIdToken } = require('./oauth.cjs');
-    const idToken = await googleIdToken({ clientId: config.googleClientId, clientSecret: config.googleClientSecret || null, open: (u) => shell.openExternal(u) });
-    return account().oauth({ provider: 'google', idToken });
-  });
+  // Continue with Google or Microsoft (the system browser), and the owner's two-step code when KeaC asks for it.
+  handle('account:oauth', ({ provider }) => account().oauth({ provider: provider === 'microsoft' ? 'microsoft' : 'google' }));
+  handle('account:google', () => account().oauth({ provider: 'google' }));
+  handle('account:continue', ({ code }) => account().continueSignIn({ code }));
   handle('account:logout', async () => { payrollApi?.forget?.(); await link().logout().catch(() => {}); return account().logout(); });
   handle('account:setUrl', async ({ url }) => { payrollApi?.forget?.(); link().forget(); return account().changeUrl(url); });
   // Trusting KeaC's key: what it lists, with fingerprints (and which one is this PC's own old Hub key), then pinning.

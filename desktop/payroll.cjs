@@ -177,19 +177,20 @@ function createPayroll({ getConfig, setConfig, userData, root, hubPort, account,
     return show(s);
   }
   /**
-   * Opens a vault that's set up: the passphrase (from the remembered sign-in), or with "ask every time" the password
-   * and passphrase first, then { need: 'code' } when the Hub wants a two-step code, then all three.
+   * Opens a vault that's set up: the passphrase (from the remembered sign-in), or with "ask every time" a fresh Google
+   * or Microsoft sign-in (`provider`; on a PC still running the Kea Hub, its password) and the passphrase first, then
+   * { need: 'code' } when the owner's account wants its two-step code, then the code.
    */
-  async function unlock({ passphrase, password, code }) {
+  async function unlock({ passphrase, password, code, provider }) {
     if (!account?.signedIn()) throw new PayrollError('Sign in to your Kea account first.', { need: 'signin' });
     await start();
     let token;
     try {
       if (askEveryTime()) {
-        try { token = await account.freshPayrollToken({ password, code }); }
+        try { token = await account.freshPayrollToken({ password, code, provider }); }
         catch (e) {
           if (e.data?.totpRequired && !code) {
-            // The password was right. Check the passphrase now, so the code is asked for last.
+            // The sign-in was right. Check the passphrase now, so the code is asked for last.
             server.keas.checkPassphrase({ email: account.cached()?.email, passphrase });
             return { need: 'code' };
           }

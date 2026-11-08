@@ -18,8 +18,8 @@ export function signWith(key, payload, kid = key.kid) {
   return `${head}.${body}.${sign(null, Buffer.from(`${head}.${body}`), key.privateKey).toString('base64url')}`;
 }
 
-export async function fakeKeac({ now = () => Date.now() } = {}) {
-  const st = { keys: [{ ...newKey(), status: 'current' }], revoked: new Map(), down: false, calls: [], accounts: new Map(), sessions: new Map() };
+export async function fakeKeac({ now = () => Date.now(), idp = null } = {}) {
+  const st = { keys: [{ ...newKey(), status: 'current' }], revoked: new Map(), down: false, calls: [], accounts: new Map(), sessions: new Map(), usedTokens: new Set() };
   const current = () => st.keys.find((k) => k.status === 'current');
   const srv = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://x');
@@ -31,10 +31,18 @@ export async function fakeKeac({ now = () => Date.now() } = {}) {
     const me = () => st.sessions.get(String(req.headers.authorization || '').replace(/^Bearer /, ''));
     const pub = (a) => ({ id: a.id, email: a.email, displayName: a.name, totpEnabled: !!a.code });
     if (u.pathname === '/v1/health') return json(200, { ok: true, service: 'keac', features: ['pass'] });
-    if (u.pathname === '/v1/auth/login') return body().then((b) => {
-      const a = st.accounts.get(String(b.email || '').toLowerCase());
-      if (!a || a.password !== b.password) return json(401, { error: 'Wrong email or password.' });
-      if (a.code && b.code !== a.code) return json(401, { error: b.code ? 'That code is wrong.' : 'Enter your two-step code.', totpRequired: true });
+    // (Kea accounts have no passwords: an older KeaS's password sign-in is refused, as KeaC does.)
+    if (u.pathname === '/v1/auth/login' || u.pathname === '/v1/auth/register') return json(410, { error: 'Kea accounts now sign in with Google or Microsoft only. Update Kea, then choose Continue with Google or Continue with Microsoft with your account’s email.', passwordRetired: true });
+    // Continue with Google or Microsoft: the provider's ID token (checked with the stand-in provider's key, test/helpers/idp.mjs).
+    // Only an account with `code` (the owner's) asks for its two-step code; the token is used up only when it signs in.
+    if (u.pathname === '/v1/auth/oauth') return body().then((b) => {
+      const who = idp ? idp.check(b.idToken) : null;
+      if (!who) return json(401, { error: 'That Google sign-in didn’t check out.' });
+      if (st.usedTokens.has(b.idToken)) return json(401, { error: 'That Google sign-in was already used. Try again.' });
+      const a = st.accounts.get(who.email);
+      if (!a) return json(404, { error: `There’s no Kea account for ${who.email} yet. Agree to the terms to make it.`, needsAccount: true, email: who.email });
+      if (a.code && b.code !== a.code) return json(401, { error: b.code ? 'That code is wrong.' : 'Enter your two-step code.', totpRequired: true, backupCodes: true });
+      st.usedTokens.add(b.idToken);
       const token = Math.random().toString(16).slice(2) + Date.now();
       st.sessions.set(token, a);
       json(200, { token, me: pub(a), account: pub(a) });
@@ -65,8 +73,8 @@ export async function fakeKeac({ now = () => Date.now() } = {}) {
     pass({ serverId, aud = `keas:${serverId}`, sub, email, name = '', iat = Math.floor(now() / 1000), exp = iat + 7 * 86400, key = current(), ev = true, iss = 'kea', extra = {} }) {
       return signWith(key, { iss, aud, sub, email, name, ev, iat, exp, ...extra });
     },
-    /** A Kea account people can sign in to (code: its two-step code, when on). */
-    addAccount({ id, email, password, name = '', code = null }) { st.accounts.set(email.toLowerCase(), { id, email: email.toLowerCase(), password, name, code }); },
+    /** A Kea account people can sign in to with Google or Microsoft (code: the owner account's two-step code). */
+    addAccount({ id, email, name = '', code = null }) { st.accounts.set(email.toLowerCase(), { id, email: email.toLowerCase(), name, code }); },
     revoke(id) { st.revoked.set(id, { at: now(), active: true }); },
     unrevoke(id) { const r = st.revoked.get(id); if (r) { r.active = false; r.at = now(); } },
     /** Publishes a new key as 'next'; promote() makes it current and retires the old one. */

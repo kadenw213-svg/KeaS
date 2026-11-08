@@ -7,7 +7,8 @@ contextBridge.exposeInMainWorld('keas', {
   state: call('state'),
   // The Kea account (KeaC) and trusting its key.
   accountStatus: call('account:status'),
-  accountLogin: call('account:login'),
+  accountOauth: call('account:oauth'),
+  accountContinue: call('account:continue'),
   accountGoogle: call('account:google'),
   accountLogout: call('account:logout'),
   accountSetUrl: call('account:setUrl'),

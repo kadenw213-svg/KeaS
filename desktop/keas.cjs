@@ -96,9 +96,12 @@ function createKeasLink({ dir, protect, base, owner, serverId, account, fetchImp
     await ensure();
     return (await ownerOk('POST', '/owner/payroll-token', { session: read().token })).token;
   }
-  /** "Ask for my sign-in every time": a fresh KeaC sign-in, a pass, a KeaS session just for this token, then ended. */
-  async function freshPayrollToken({ password, code }) {
-    const { pass } = await account.freshPass(await serverId(), { password, code });
+  /**
+   * "Ask for my sign-in every time": a fresh Google or Microsoft sign-in at KeaC (with the owner's two-step code when
+   * KeaC asks for it), a pass, a KeaS session just for this token, then ended.
+   */
+  async function freshPayrollToken({ provider, code }) {
+    const { pass } = await account.freshPass(await serverId(), { provider, code });
     const s = await raw('POST', '/v1/auth/pass', { pass });
     try { return (await ownerOk('POST', '/owner/payroll-token', { session: s.token })).token; }
     finally { raw('POST', '/v1/auth/logout', {}, s.token).catch(() => {}); }

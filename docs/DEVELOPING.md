@@ -156,7 +156,8 @@ test/           node:test suites for the Hub, the org engine and the workforce s
   the vault checks it against that key, read from the data folder on this PC (`serverIssuer`, `hubTrustKeys`). This is
   safer than handing the vault a KeaC pass: the token lasts 15 minutes instead of 7 days, can't be used as a pass, is
   only made on this PC with the owner key for a live (not revoked) session, and adds no new key the vault must trust.
-  "Ask for my sign-in every time" gets a fresh KeaC sign-in (password and code), a pass, a session just for that token,
+  "Ask for my sign-in every time" gets a fresh Google or Microsoft sign-in at KeaC (in the system browser, loopback +
+  PKCE, `desktop/oauth.cjs`; the KeaC owner's account also gives its two-step code), a pass, a session just for that token,
   then ends it. No password goes through the vault (`/v1/vault/setup` and `/v1/vault/signin` with `mode: 'hub'` answer
   410 when `serverIssuer` is set). A local password still works only while the server can't be reached, if the owner
   turned it on. While the PC is still a Kea Hub, payroll signs in at that Hub as before (`desktop/legacy-account.cjs`).
