@@ -12,7 +12,8 @@ const step = (id, title, done, text, action = null, extra = {}) => ({ id, title,
  * f: {
  *   hub: hub mode (the Hub's PC), config, folderProblem, hubRunning, lastStartError, owner: { exists, owner, totp } | null,
  *   update: { status, version }, account: account.status() result, orgs: [{ id, name, state, role, status }] | null,
- *   orgsError, payroll: { initialized, summary: { left, total, year, steps } | null } | null
+ *   orgsError, payroll: { initialized, summary: { left, total, year, steps } | null } | null,
+ *   payCodes: { [orgId]: { count, given } | { error } } | undefined (the organizations this person runs)
  * }
  */
 function keasSteps(f = {}) {
@@ -62,6 +63,14 @@ function keasSteps(f = {}) {
         org.status === 'active' ? 'The Hub’s owner approved it.' : org.status === 'suspended' ? 'It’s suspended on the Kea Hub. Contact Kea support.' : 'Waiting for the Kea Hub’s owner to approve it. This list checks again by itself.', 'recheck'));
       if (['owner', 'admin'].includes(org.role)) steps.push(step('orgPlace', 'Where people work', !!org.state,
         org.state ? `${org.state}. Payroll asks for the city or county.` : 'Add the state, so the right labor and tax rules apply.', 'orgEdit'));
+      // Pay codes: a job's rate (Lifeguard $15). Payroll pays every hour at the code it was worked at.
+      const pc = f.payCodes?.[org.id];
+      if (['owner', 'admin'].includes(org.role) && org.status === 'active' && pc) {
+        steps.push(step('payCodes', 'Pay codes', pc.count > 0 && pc.given > 0,
+          pc.error ? `Can’t check right now: ${pc.error}` : !pc.count ? 'Make a pay code for each job and its rate (like Lifeguard, $15 an hour), then give people theirs. Payroll pays every hour at the code it was worked at.'
+            : !pc.given ? `${pc.count} pay code${pc.count === 1 ? '' : 's'}, not given to anyone yet. Give each person theirs; their first is their default.` : `${pc.count} pay code${pc.count === 1 ? '' : 's'}, given to people.`,
+          'recheck'));
+      }
     }
   }
 

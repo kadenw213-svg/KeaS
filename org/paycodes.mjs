@@ -62,14 +62,24 @@ export function makePayLogic(core, sealer) {
     if (aid && !granted(oid, aid, r.id)) bad('That pay code wasn’t given to this person. Pick one of their codes.');
     return r.id;
   }
-  /** Each punch's code: one switched later, else the punch's own, else its shift's, else the person's default now. */
+  /**
+   * Each punch's code: one switched later, else the punch's own, else its shift's, else the person's default now. A
+   * clock-out shows its clock-in's (a stretch of work is paid at one code).
+   */
   function effectiveCodes(oid, aid, punches) {
     const ids = punches.map((p) => p.id);
     const over = ids.length ? new Map(h.all('SELECT punch_id, pay_code_id FROM org_punch_codes WHERE punch_id IN (SELECT value FROM json_each(?))', JSON.stringify(ids)).map((r) => [r.punch_id, r.pay_code_id])) : new Map();
     const shiftIds = [...new Set(punches.map((p) => p.shift_id).filter(Boolean))];
     const shiftCode = shiftIds.length ? new Map(h.all('SELECT id, pay_code_id FROM org_shifts WHERE id IN (SELECT value FROM json_each(?))', JSON.stringify(shiftIds)).map((r) => [r.id, r.pay_code_id])) : new Map();
     const def = defaultOf(oid, aid);
-    return new Map(punches.map((p) => [p.id, over.get(p.id) ?? p.pay_code_id ?? (p.shift_id ? shiftCode.get(p.shift_id) : null) ?? def]));
+    const own = (p) => over.get(p.id) ?? p.pay_code_id ?? (p.shift_id ? shiftCode.get(p.shift_id) : null) ?? def;
+    const out = new Map();
+    let open = null;
+    for (const p of [...punches].sort((a, b) => a.at - b.at || (a.created_at ?? 0) - (b.created_at ?? 0))) {
+      if (p.type === 'in') { open = p; out.set(p.id, own(p)); }
+      else { out.set(p.id, open ? out.get(open.id) : own(p)); open = null; }
+    }
+    return out;
   }
   /**
    * Worked minutes by code for one person between two local dates (each stretch from clock-in to clock-out is paid at
@@ -274,7 +284,8 @@ export function mountPayCodes(core, { R, Rplain, deptRow, positionRow, clock }) 
     const x = asOrg(params.id, me);
     const { o, s } = x;
     const cur = clock.currentPeriod(o, s);
-    const period = query.periodStart ? clock.periodOf(o, s, core.kit.V.str(query.periodStart, 'Period start', { min: 10, max: 10 })) : cur;
+    if (query.periodStart != null && !/^\d{4}-\d{2}-\d{2}$/.test(String(query.periodStart))) bad('Period start must be a date like 2026-12-01.');
+    const period = query.periodStart ? clock.periodOf(o, s, String(query.periodStart)) : cur;
     if (query.periodStart && period.start !== query.periodStart) bad(`That isn’t the first day of a pay period. Try ${period.start}.`);
     const codes = memberCodesOut(o.id, me.id, true);
     const tc = clock.computeTimecard(o, s, me.id, period);

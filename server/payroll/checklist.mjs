@@ -68,7 +68,8 @@ export function payrollChecklist(c, org) {
 
   // 6. People, and what payroll needs for each.
   const people = h.all(`SELECT id FROM people WHERE org_id = ? AND status IN ('active','leave') AND worker_type = 'employee' ORDER BY name`, org.id).map((r) => c.getPerson(r.id, org.id));
-  const hasRate = (p) => p.payRateCents != null || !!h.get('SELECT 1 FROM pay_rates WHERE person_id = ?', p.id);
+  // (Someone paid by pay codes in the org engine has their rates there.)
+  const hasRate = (p) => p.payRateCents != null || !!h.get('SELECT 1 FROM pay_rates WHERE person_id = ?', p.id) || c.engine?.defaultRateOf(p, period) != null;
   // (The payroll admin is on the list from setup; until they get a pay rate they aren't counted as someone paid.)
   const paid = people.filter((p) => hasRate(p) || !(p.roles || []).includes('owner'));
   steps.push(step('people', 'Employees added', paid.length > 0, paid.length ? `${paid.length} ${paid.length === 1 ? 'person' : 'people'} on payroll.` : 'Add the people you pay (or import them).', { view: 'employees' }));

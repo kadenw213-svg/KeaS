@@ -1,6 +1,6 @@
 # KeaS workforce server
 
-The organization server: schedules, punches, timecards, certifications and pay-run preparation. It listens on 127.0.0.1.
+The payroll vault (`vault: true`, started by the KeaS app, with its hours from the org engine: see docs/DEVELOPING.md), and the development workforce server with sample data: schedules, punches, timecards, certifications and pay-run preparation. It listens on 127.0.0.1. The KeaS app no longer runs it as an organization server; organizations live in the org engine (`org/`).
 
 - **Development data:** `node server/seed.mjs` loads a sample workplace, and `demo-login` signs in as one of its people.
 - **Payroll safety:** a pay run is finalized only with tax and labor tables verified for that year (`verified` / `verifiedFor`). Until then every pay-run response has `canFinalize:false`.

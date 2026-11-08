@@ -174,6 +174,16 @@ function createAccount({ dir, protect, getUrl, setUrl, fetchImpl = fetch, client
     }
     return out;
   }
+  /** An organization's pay codes, for the checklist: { count, given } (how many, and how many people have one). */
+  async function orgPayCodes({ id }) {
+    try { const r = await req('GET', `/v1/orgs/${oid(id)}/pay-codes`); return { count: (r.codes || []).filter((c) => c.active).length, given: (r.codes || []).reduce((a, c) => a + (c.holders || 0), 0) }; }
+    catch (e) { if (missingRoute(e)) return { count: null, error: 'This Kea Hub has no pay codes yet. It needs a KeaS update.' }; throw e; }
+  }
+  /**
+   * What payroll pays a period from (the org engine's pay feed): people, punches with their pay codes, the codes'
+   * rates and timecard approvals. Needs rates.view and timecards.view for the whole organization.
+   */
+  const orgPayFeed = ({ id, from, to }) => req('GET', `/v1/orgs/${oid(id)}/pay-feed?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
   const orgApprove = ({ id, accountId, approve }) => req('POST', `/v1/orgs/${oid(id)}/members/${oid(accountId)}/approve`, { approve: approve !== false });
   async function orgVerifyEmail({ id, accountId }) {
     try { return await req('POST', `/v1/orgs/${oid(id)}/members/${oid(accountId)}/verify-email`, {}); }
@@ -185,7 +195,7 @@ function createAccount({ dir, protect, getUrl, setUrl, fetchImpl = fetch, client
     catch (e) { if (missingRoute(e)) throw new AccountError('This Kea Hub doesn’t have backup codes yet. It needs a KeaS update.', 404); throw e; }
   }
 
-  return { url, status, login, orgs, createOrg, joinOrg, updateOrg, orgPeople, orgApprove, orgVerifyEmail, backupCodes, register, logout, changeUrl, terms, acceptTerms, adopt, payrollToken, freshPayrollToken, cached, signedIn: () => !!readToken(), forget: signOutHere };
+  return { url, status, login, orgs, createOrg, joinOrg, updateOrg, orgPeople, orgPayCodes, orgPayFeed, orgApprove, orgVerifyEmail, backupCodes, register, logout, changeUrl, terms, acceptTerms, adopt, payrollToken, freshPayrollToken, cached, signedIn: () => !!readToken(), forget: signOutHere };
 }
 
 module.exports = { createAccount, checkUrl, AccountError, DEFAULT_HUB_URL };

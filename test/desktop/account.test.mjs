@@ -156,6 +156,16 @@ test('people asking to join, verifying their email, and new backup codes, from K
     assert.deepEqual([people[0].pending.length, people[0].unverified.length], [0, 0]);
     assert.equal((await sam.status()).account.emailVerified, true);
 
+    // Pay codes, for the checklist and payroll: how many the organization has, and the pay feed payroll reads.
+    assert.deepEqual(await boss.orgPayCodes({ id: org.id }), { count: 0, given: 0 });
+    const pcAuth = { 'content-type': 'application/json', authorization: 'Bearer ' + bossLogin.token };
+    const pc = await (await fetch(url + '/v1/orgs/' + org.id + '/pay-codes', { method: 'POST', headers: pcAuth, body: JSON.stringify({ name: 'Lifeguard', rate: 15 }) })).json();
+    await fetch(url + '/v1/orgs/' + org.id + '/members/' + samId + '/pay-codes', { method: 'POST', headers: pcAuth, body: JSON.stringify({ codeId: pc.code.id }) });
+    assert.deepEqual(await boss.orgPayCodes({ id: org.id }), { count: 1, given: 1 });
+    const feed = await boss.orgPayFeed({ id: org.id, from: '2026-12-01', to: '2026-12-14' });
+    assert.deepEqual([feed.v, feed.codes[0].rateCents, feed.people.find((p) => p.accountId === samId).defaultCodeId], [1, 1500, pc.code.id]);
+    await assert.rejects(sam.orgPayFeed({ id: org.id, from: '2026-12-01', to: '2026-12-14' }), (e) => e.status === 403);
+
     // Backup codes: with two-step sign-in on, the password and the app's code make new ones.
     const login = await (await fetch(`${url}/v1/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: 'sam@school.edu', password: 'correct horse battery staple' }) })).json();
     const auth = { 'content-type': 'application/json', authorization: `Bearer ${login.token}` };

@@ -14,6 +14,12 @@
 // accept a Hub's new signing key (only after the owner has seen and confirmed its fingerprint). None of these can be
 // changed from the payroll page or any other web page.
 //
+// Hours: the vault doesn't keep its own people, shifts and punches here. Each pay run asks the organization's KeaS
+// server (the org engine on the Kea Hub this account signs in to) for the period's pay feed: members by Kea account,
+// punches with their pay codes, the codes' rates and timecard approvals (engineFeed below). That needs the signed-in
+// account to have rates.view and timecards.view for the whole organization (Owner and Admin do). The organization is
+// the one this account runs (payrollOrgId in keas-config.json picks one when there are several).
+//
 // The payroll folder is locked down like the data folder (this Windows account, SYSTEM and Administrators only), and
 // files the payroll page saves (W-2 and 1099 data, bank files, reports) go into its Exports folder, not Downloads.
 const crypto = require('crypto');
@@ -53,6 +59,22 @@ function createPayroll({ getConfig, setConfig, userData, root, hubPort, account,
   /** The states KeaS has tax tables for (shared/tax/<ST>-<year>.json). */
   const taxStates = () => { try { return [...new Set(fs.readdirSync(path.join(root, 'shared', 'tax')).map((f) => /^([A-Z]{2})-\d{4}\.json$/.exec(f)?.[1]).filter((s) => s && s !== 'US'))]; } catch { return []; } };
 
+  /** The organization payroll is for: payrollOrgId, else the active one this account owns or runs. */
+  async function payrollOrg() {
+    const orgs = await account.orgs();
+    const want = getConfig().payrollOrgId;
+    const runs = (o) => ['owner', 'admin'].includes(o.role) && o.status === 'active' && o.memberStatus !== 'pending';
+    const o = (want && orgs.find((x) => x.id === want)) || orgs.find((x) => runs(x) && x.role === 'owner') || orgs.find(runs);
+    if (!o) throw new PayrollError('This Kea account doesn’t run an organization, so there are no hours to pay. Sign in with the owner’s or an admin’s account.');
+    return o;
+  }
+  /** The engine's hours for a pay period (server/payroll/engine.mjs), through the signed-in Kea account. */
+  async function engineFeed({ from, to }) {
+    if (!account?.signedIn()) throw new PayrollError('KeaS isn’t signed in to a Kea account.');
+    const o = await payrollOrg();
+    return account.orgPayFeed({ id: o.id, from, to });
+  }
+
   // (Two callers at once, like the window and the checklist as KeaS starts, share one start: otherwise both got past
   // the check above and two vault servers opened the same vault file.)
   let starting = null;
@@ -78,7 +100,7 @@ function createPayroll({ getConfig, setConfig, userData, root, hubPort, account,
     };
     // setupToken: only this app's payroll window gets it (in the address's fragment, which never reaches a server or a
     // log), so nothing else on this PC can claim an empty vault by reaching the port first.
-    server = createApp({ dbFile: path.join(dir(), 'payroll-vault.db'), vault: true, hubUrl: hubUrl(), localSignIn, hubTrustKeys, log: false, setupToken: crypto.randomBytes(32).toString('base64url'), onVaultLock: (why) => setImmediate(() => locked(why)) });
+    server = createApp({ dbFile: path.join(dir(), 'payroll-vault.db'), vault: true, hubUrl: hubUrl(), localSignIn, hubTrustKeys, log: false, setupToken: crypto.randomBytes(32).toString('base64url'), onVaultLock: (why) => setImmediate(() => locked(why)), engineFeed });
     port = await server.listen(0);
     log('payroll vault started', dir());
     return port;

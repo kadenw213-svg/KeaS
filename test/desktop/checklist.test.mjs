@@ -75,3 +75,22 @@ test('the Hub’s PC: folder, running, reachable, owner with two-step, start bef
   // Not the Hub's PC (or setup not finished): no Hub steps.
   assert.ok(!ids(keasSteps({ hub: false, config, account: me(), orgs: [] })).includes('hubRunning'));
 });
+
+test('pay codes: for whoever runs the organization; done once codes exist and people have them', () => {
+  const org = [{ id: 'o1', name: 'Camp', role: 'owner', status: 'active', state: 'CO' }];
+  const base = { account: me(), orgs: org, payroll: { initialized: false } };
+  assert.ok(!ids(keasSteps(base)).includes('payCodes'), 'only when KeaS could ask the organization');
+  let r = keasSteps({ ...base, payCodes: { o1: { count: 0, given: 0 } } });
+  assert.deepEqual(ids(r), ['account', 'email', 'org', 'orgApproved', 'orgPlace', 'payCodes', 'payroll']);
+  assert.equal(get(r, 'payCodes').done, false);
+  assert.match(get(r, 'payCodes').text, /Lifeguard, \$15/);
+  r = keasSteps({ ...base, payCodes: { o1: { count: 2, given: 0 } } });
+  assert.match(get(r, 'payCodes').text, /not given to anyone/);
+  r = keasSteps({ ...base, payCodes: { o1: { count: 2, given: 5 } } });
+  assert.equal(get(r, 'payCodes').done, true);
+  r = keasSteps({ ...base, payCodes: { o1: { error: 'offline' } } });
+  assert.match(get(r, 'payCodes').text, /offline/);
+  // A member never sees it.
+  r = keasSteps({ account: me(), orgs: [{ ...org[0], role: 'member' }], payCodes: {} });
+  assert.ok(!ids(r).includes('payCodes'));
+});

@@ -4,7 +4,6 @@
 // picking which drive holds the data, setting up Tailscale so it's reachable from anywhere, and (for the Hub) making
 // the owner account. After that it runs the server in the background, starts with Windows, and sits in the tray.
 const { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage, nativeTheme, safeStorage } = require('electron');
-const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -41,7 +40,7 @@ const account = () => (accountApi ||= createAccount({
   setUrl: (u) => { config = writeConfig({ ...config, accountHubUrl: u || null }); },
   client: `KeaS/${app.getVersion()}`,
 }));
-let hub = null, org = null;
+let hub = null;
 // The Hub started before sign-in by the Scheduled Task (bootstart.cjs) is a separate process: KeaS then uses it instead
 // of starting its own, and starts its own only if that one stops answering.
 let hubExternal = false, hubWatch = null, extDb = null;
@@ -81,25 +80,12 @@ async function secureFolders() {
     catch (e) { folderProblem = `${label}: ${e.message}`; log('folder permissions', dir, e.message); }
   }
 }
-/**
- * The organization server's vault passphrase: random, kept only in KeaS's settings encrypted with Windows DPAPI
- * (safeStorage), so it never sits in a file next to the database. A key file left by an older KeaS is moved in and
- * then deleted.
- */
-function orgVaultPassphrase() {
-  if (!safeStorage.isEncryptionAvailable()) throw new Error('Windows can’t protect the organization server’s key on this PC (DPAPI isn’t available).');
-  if (config.orgVaultKey) return { pass: safeStorage.decryptString(Buffer.from(config.orgVaultKey, 'base64')), legacy: null };
-  const legacy = path.join(config.dataDir, 'org.db.vaultkey');
-  const had = fs.existsSync(legacy);
-  const pass = had ? fs.readFileSync(legacy, 'utf8').trim() : crypto.randomBytes(32).toString('base64url');
-  config = writeConfig({ ...config, orgVaultKey: safeStorage.encryptString(pass).toString('base64') });
-  return { pass, legacy: had ? legacy : null };
-}
-function removeKeyFile(file) {
-  try { const n = fs.statSync(file).size; fs.writeFileSync(file, Buffer.alloc(n)); fs.rmSync(file, { force: true }); log('moved the vault key into Windows-protected settings'); } catch (e) { log('key file', e.message); }
-}
+// (KeaS 0.5 could also run a separate organization server on this PC, role 'org', with its own people, shifts and
+// punches. That's retired: organizations live in the org engine on the Kea Hub, and payroll reads its hours from
+// there. A PC set up that way says so on its status screen; its org.db stays where it was.)
+const ORG_SERVER_RETIRED = 'This PC was set up as a KeaS organization server, which KeaS no longer runs. Organizations now live on the Kea Hub (schedules, the time clock and pay codes), and Payroll reads its hours from there. Your old org.db is still in the data folder; ask Kea support to bring its people and punches over (hub/import-org-server.mjs).';
 async function startServices() {
-  if (config.dataDir && !hub && !org && !hubExternal) await secureFolders();
+  if (config.dataDir && !hub && !hubExternal) await secureFolders();
   // A folder that was refused isn't used at all, not even by a Hub that started before sign-in.
   if (folderProblem) {
     if (config.role === 'hub') {
@@ -126,15 +112,7 @@ async function startServices() {
     await hub.listen({ port: HUB_PORT, ownerPort: HUB_PORT + 1 });
     log('hub started', config.dataDir);
   }
-  if (config.role === 'org' && !org) {
-    const { createApp } = await import(pathToFileURL(path.join(ROOT, 'server', 'index.mjs')).href);
-    const { pass, legacy } = orgVaultPassphrase();
-    // (Never the demo sign-in here; the Funnel address is the only other name it answers to.)
-    org = createApp({ dbFile: path.join(config.dataDir, 'org.db'), log: false, passphrase: pass, devKeyFile: false, demo: false, publicHosts: config.publicUrl ? [config.publicUrl] : [] });
-    if (legacy) removeKeyFile(legacy);
-    await org.listen(ORG_PORT);
-    log('org server started', config.dataDir);
-  }
+  if (config.role === 'org') { log('organization server mode is retired; nothing started'); throw new Error(ORG_SERVER_RETIRED); }
 }
 const servicePort = () => (config.role === 'hub' ? HUB_PORT : ORG_PORT);
 function watchExternalHub() {
@@ -237,7 +215,7 @@ function showWindow() {
         try { win.show(); win.focus(); await new Promise((r) => setTimeout(r, 400)); fs.writeFileSync(process.env.KEAS_CAPTURE, (await win.webContents.capturePage()).toPNG()); break; } catch (e) { console.log('[capture error]', e.message); }
       }
       app.isQuitting = true;
-      try { await hub?.close(); await org?.close(); } catch {}
+      try { await hub?.close(); } catch {}
       app.exit(0);
     }, Number(process.env.KEAS_CAPTURE_DELAY || 1500)));
   }
@@ -443,7 +421,7 @@ function registerIpc() {
     const hub = hubMode();
     const defaults = hub && !config.setupDone ? { hubData: await defaultFolder('Kea Hub') } : {};
     return {
-      config: publicConfig(), folderProblem, folderWarning, lastStartError, payrollOpen: !!payrollApi?.isOpen(), running: { hub: hubRunning(), org: !!org, hubExternal }, port: servicePort(),
+      config: publicConfig(), folderProblem, folderWarning, lastStartError, payrollOpen: !!payrollApi?.isOpen(), running: { hub: hubRunning(), org: false, hubExternal }, port: servicePort(),
       defaults, resume: hub ? flow.resumeChoices(config, defaults) : null, version: app.getVersion(),
       hub, view: flow.firstView({ hub, config, signedIn: account().signedIn() }), account: account().cached(), startWithWindows: flow.startWithWindows(config),
     };
@@ -471,7 +449,15 @@ function registerIpc() {
     let owner = null;
     if (hub && config.ownerEmail && hubRunning()) { try { owner = ownerLib.ownerState(await hubDb(), config.ownerEmail); } catch {} }
     const p = a.signedIn ? await payroll().status().catch(() => null) : null;
-    return require('./checklist.cjs').keasSteps({ hub, config, folderProblem, hubRunning: hubRunning(), lastStartError, owner, update: updates?.state(), account: a, orgs, orgsError, payroll: p });
+    // Pay codes in each organization this person runs (payroll pays hours at their codes' rates).
+    let payCodes = null;
+    if (orgs) {
+      payCodes = {};
+      for (const o of orgs.filter((x) => ['owner', 'admin'].includes(x.role) && x.status === 'active' && x.memberStatus !== 'pending')) {
+        try { payCodes[o.id] = await account().orgPayCodes({ id: o.id }); } catch (e) { payCodes[o.id] = { error: e.message }; }
+      }
+    }
+    return require('./checklist.cjs').keasSteps({ hub, config, folderProblem, hubRunning: hubRunning(), lastStartError, owner, update: updates?.state(), account: a, orgs, orgsError, payroll: p, payCodes });
   });
   handle('org:create', (a) => account().createOrg(a));
   handle('org:join', (a) => account().joinOrg(a));
@@ -507,7 +493,8 @@ function registerIpc() {
   });
   hubHandle('checkFolder', ({ dir }) => checkFolder(dir));
   hubHandle('saveSetup', async ({ role, dataDir, storageDir, quotaGb, reach }) => {
-    if (!['hub', 'org'].includes(role)) throw new Error('Pick what this PC is for.');
+    if (role === 'org') throw new Error(ORG_SERVER_RETIRED);
+    if (role !== 'hub') throw new Error('Pick what this PC is for.');
     // A different role serves a different port: the old one's Funnel goes, so nothing stays public by accident.
     if (config.role && config.role !== role && config.tailscale) {
       try { await tailscale.funnelOff(servicePort()); } catch (e) { log('funnel off', e.message); }
@@ -523,7 +510,7 @@ function registerIpc() {
   });
   hubHandle('start', async () => {
     try { await startServices(); lastStartError = null; } catch (e) { lastStartError = e.message; throw e; }
-    return { hub: hubRunning(), org: !!org, port: servicePort() };
+    return { hub: hubRunning(), org: false, port: servicePort() };
   });
   // Reachability changed after setup (Hub settings): the Hub restarts so it reads addresses the right way.
   hubHandle('reach:set', async ({ reach }) => {
@@ -689,4 +676,4 @@ app.whenReady().then(async () => {
 });
 // (With a tray, closing the window keeps KeaS running; without one, it quits.)
 app.on('window-all-closed', () => { if (!tray) app.quit(); });
-app.on('before-quit', async () => { app.isQuitting = true; clearInterval(hubWatch); updates?.stop(); try { await hub?.close(); await org?.close(); extDb?.close(); } catch {} });
+app.on('before-quit', async () => { app.isQuitting = true; clearInterval(hubWatch); updates?.stop(); try { await hub?.close(); extDb?.close(); } catch {} });
