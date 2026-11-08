@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   expandSlots, prefillUsual, prefillFrom, usualFromAnswers, cleanAnswers, hoursMarked, autofill, sheetsExport, longExport,
   certStage, addMonths, nextMonth, fmtTime, sortTodo, toCsv,
-} from '../../hub/org/logic.mjs';
+} from '../../org/logic.mjs';
 
 const TZ = 'America/Denver';
 // A December form like the owner's: weekday blocks, a short Saturday, closed on Christmas, a swim meet added.

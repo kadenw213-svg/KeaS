@@ -1,6 +1,6 @@
 // Org logic with no database: availability periods and blocks, prefill, hours, coverage, auto-fill, CSV, countdowns.
 // Times of day are "HH:MM" wall-clock in the org's time zone; dates are "YYYY-MM-DD".
-import { addDays, dayNum, weekday, weekStartOf, zonedToUtc } from '../../server/lib/time.mjs';
+import { addDays, dayNum, weekday, weekStartOf, zonedToUtc } from '../server/lib/time.mjs';
 
 export const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 export const STATES = ['A', 'I', 'N']; // Available, If needed, Not available

@@ -1,53 +1,44 @@
-// Organizations on the Kea Hub: members and join codes, structure and budgets, certifications and org classes,
-// availability forms, schedules (manual, auto-fill, drafts), swaps, acknowledgments and the to-do box.
-// Mounted from hub/index.mjs with mountOrgs(); the tables are in ./schema.mjs.
+// Organizations: members and join codes, structure and budgets, certifications and org classes, availability forms,
+// schedules (manual, auto-fill, drafts), swaps, acknowledgments and the to-do box. Mounted by mountOrg (./index.mjs);
+// roles are in ./roleRoutes.mjs, the time clock in ./clock.mjs, the tables in ./schema.mjs.
 //
-// Payroll data is refused here on purpose: SSNs, bank details and pay runs stay in the payroll vault on the payroll
-// admin's own PC (see noPayroll below).
+// Who may do what comes from roles (./roles.mjs): every check is an ability, for the department the action is about.
+// Payroll data is refused here on purpose: SSNs, bank details and pay runs stay in the payroll vault (see noPayroll).
 import { randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ORG_SCHEMA } from './schema.mjs';
 import { checkNoPayroll, PAYROLL_MESSAGE } from './payroll.mjs';
 import {
   isDate, isTime, toMin, nextMonth, datesIn, expandSlots, prefillUsual, prefillFrom, usualFromAnswers, cleanAnswers, hoursMarked,
   needOf, needTotal, autofill, sheetsExport, longExport, certStage, addMonths, sortTodo, fmtRange, DAY_NAMES, daysUntil,
 } from './logic.mjs';
-import { mergeRules, checkAssignment } from '../../server/lib/rules.mjs';
-import { addDays, localDate, zonedToUtc, ageOn, dayNum, weekStartOf } from '../../server/lib/time.mjs';
+import { mergeRules, checkAssignment } from '../server/lib/rules.mjs';
+import { addDays, localDate, zonedToUtc, ageOn, dayNum, weekStartOf } from '../server/lib/time.mjs';
+import { ORG_DEFAULTS, TODO_KINDS } from './core.mjs';
+import { LEGACY_ROLES, effective, outranks, legacyRole, can as canDo, reach } from './roles.mjs';
 
-const LABOR_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'shared', 'labor');
-const RANK = { member: 1, manager: 2, admin: 3, owner: 4 };
-const ROLES = ['owner', 'admin', 'manager', 'member'];
+const LABOR_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'shared', 'labor');
 const KINDS = ['nonprofit', 'government', 'private', 'school', 'other'];
 const CODE_ALPHA = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const ORG_CODE_LEN = 12;
 const newOrgCode = () => [...randomBytes(ORG_CODE_LEN)].map((b) => CODE_ALPHA[b % CODE_ALPHA.length]).join('');
-const TODO_KINDS = ['availability', 'cert', 'class', 'swap', 'ack', 'missing', 'approvals', 'budget', 'drafts', 'staffcerts'];
-export const ORG_DEFAULTS = {
-  autoApproveJoins: false,
-  swapNeedsApproval: true,
-  budgetWarnPct: 90,
-  certWarnDays: [60, 30, 7],
-  reminders: [72, 24, 0],
-  autofill: { useIfNeeded: true, hardMaxHours: false, allowOvertime: false },
-  todoKinds: Object.fromEntries(TODO_KINDS.map((k) => [k, true])),
-  ruleOverrides: {},
-  membersSeeSchedule: true,
-};
-export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, bad, forbidden, notFound, rawOut, notify = () => {}, extrasFor = () => ({}) }) {
-  h.db.exec(ORG_SCHEMA);
-  // Org classes made before classes.org_id existed.
-  h.run('UPDATE classes SET org_id = (SELECT org_id FROM org_classes WHERE class_id = classes.id) WHERE org_id IS NULL AND id IN (SELECT class_id FROM org_classes)');
-  const id = () => randomUUID();
-  const J = (s, d) => { try { return s == null ? d : JSON.parse(s); } catch { return d; } };
-  const today = (tz) => localDate(now(), tz);
+export { ORG_DEFAULTS };
+
+/**
+ * The org routes, on the host's router R (and the operator's console router O, when there is one). classes: the host
+ * has classes (the Kea Hub's classes, class_members, class_sessions and invites tables), so organizations can run them.
+ */
+export function mountRoutes(core, { R, O = null, classes = false, operator = null }) {
+  const { h, now, audit, notify, identity, V, HttpError, bad, forbidden, notFound, tx, id, J, today, orgSettings, loadOrg, memberRow, asOrg, membersOf, names, positionsOf, subtree } = core;
+  const { limit, normCode, rawOut } = core.kit;
 
   /** Refuse payroll details anywhere in a request body (./payroll.mjs). */
   const noPayroll = (v) => checkNoPayroll(v, () => bad(PAYROLL_MESSAGE), () => { throw new HttpError(413, 'That request is too big to check. Send less at a time.'); });
   // Every org route goes through here: payroll guard first.
   const OR = (method, path, fn, opts) => R(method, path, (ctx) => { noPayroll(ctx.body); return fn(ctx); }, opts);
+  // Org classes made before classes.org_id existed.
+  if (classes) h.run('UPDATE classes SET org_id = (SELECT org_id FROM org_classes WHERE class_id = classes.id) WHERE org_id IS NULL AND id IN (SELECT class_id FROM org_classes)');
 
   // ---------- validation ----------
   const date = (v, name, { optional = false } = {}) => { if ((v == null || v === '') && optional) return null; if (!isDate(v)) bad(`${name} must be a date like 2026-12-01.`); return v; };
@@ -62,73 +53,66 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   const tags = (v) => list(v, 'Tags', 30).map((t) => V.str(t, 'Tag', { min: 1, max: 30 }).toLowerCase());
   const validTz = (tz) => { try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return tz; } catch { bad('Pick a real time zone, like America/Denver.'); } };
   const cents = (v, name) => (v == null || v === '' ? null : Math.round(num(v, name, { min: 0, max: 1e7 }) * 100));
+  /** A role's reach: 'org' (or nothing) for the whole organization, or a list of its department ids. */
+  const parseScope = (oid, v) => {
+    if (v == null || v === 'org') return null;
+    const ids = list(v, 'Departments', 100).map((d) => deptRow(oid, d).id);
+    if (!ids.length) bad('Pick at least one department, or the whole organization.');
+    return [...new Set(ids)];
+  };
 
   // ---------- orgs and membership ----------
-  const orgSettings = (o) => {
-    const s = J(o.settings, {});
-    return { ...ORG_DEFAULTS, ...s, autofill: { ...ORG_DEFAULTS.autofill, ...(s.autofill || {}) }, todoKinds: { ...ORG_DEFAULTS.todoKinds, ...(s.todoKinds || {}) } };
-  };
-  const loadOrg = (oid) => h.get('SELECT * FROM orgs WHERE id = ?', oid);
-  const memberRow = (oid, aid) => h.get('SELECT * FROM org_members WHERE org_id = ? AND account_id = ?', oid, aid);
-  const roleWord = { member: 'members', manager: 'managers', admin: 'admins', owner: 'the owner' };
-  /** The org and my membership, or 404 (other orgs are invisible), or 403 for too low a role. */
-  // An organization works only once the Hub's owner has approved it (active), and stops when it's suspended. A route
-  // that must work before or after that (seeing the organization's own page) opts in with inactiveOk.
-  function asOrg(oid, me, min = 'member', { pendingOk = false, inactiveOk = false } = {}) {
-    const o = loadOrg(oid);
-    const m = o && memberRow(oid, me.id);
-    if (!o || !m) notFound('Organization not found.');
-    if (m.status !== 'active' && !pendingOk) forbidden('Your request to join is waiting for approval.');
-    if (o.status === 'suspended' && !inactiveOk) forbidden('This organization is suspended on the Kea Hub.');
-    if (o.status !== 'active' && !inactiveOk) forbidden('This organization is still waiting for approval on the Kea Hub.');
-    if (RANK[m.role] < RANK[min]) forbidden(`Only ${min === 'manager' ? 'managers and admins' : min === 'admin' ? 'admins' : roleWord[min]} can do that.`);
-    return { o, m, s: orgSettings(o), tz: o.tz, mgr: RANK[m.role] >= RANK.manager, admin: RANK[m.role] >= RANK.admin };
-  }
-  const orgOut = (o, m) => ({
-    id: o.id, name: o.name, kind: o.kind, tz: o.tz, state: o.state, workweekStart: o.workweek_start, status: o.status, createdAt: o.created_at,
-    role: m?.role ?? null, memberStatus: m?.status ?? null,
-    members: h.get("SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND status = 'active'", o.id).n,
-    ...(m && RANK[m.role] >= RANK.admin ? { settings: orgSettings(o) } : {}),
-  });
-  const positionsOf = (oid, aid) => h.all('SELECT position_id FROM org_member_positions WHERE org_id = ? AND account_id = ?', oid, aid).map((r) => r.position_id);
-  // The supporter badge for everyone; a phone number only between active coworkers, and only if its owner shares it
-  // with organizations (accounts.phone_visibility).
-  const memberOut = (r, viewer) => {
-    const mgr = RANK[viewer.role] >= RANK.manager, admin = RANK[viewer.role] >= RANK.admin, self = r.account_id === viewer.account_id;
+  const extrasOf = (r, opts) => r.profile?.extras?.('orgs', opts) ?? {};
+  /**
+   * A member as the viewer (an asOrg result) sees them. all: everyone's abilities (core effAll), for their 0.5 role
+   * name; contact details, birthdates and cost rates follow the viewer's abilities for that person's department.
+   */
+  const memberOut = (r, x, all = null) => {
+    const self = r.account_id === x.who.id, d = r.department_id ?? null;
     return {
-      id: r.account_id, name: r.display_name, role: r.role, status: r.status, departmentId: r.department_id, title: r.title, emailVerified: !!r.email_verified,
+      id: r.account_id, name: r.display_name, role: core.legacyFor(r.org_id, r.account_id, all, x.tree), status: r.status, departmentId: r.department_id, title: r.title, emailVerified: !!r.email_verified,
       positionIds: positionsOf(r.org_id, r.account_id), joinedAt: r.joined_at, you: self,
-      ...extrasFor(r, 'orgs', { phone: r.status === 'active' && viewer.status === 'active' }),
-      ...(mgr || self ? { email: r.email, desiredMin: r.desired_min, desiredMax: r.desired_max, prefs: J(r.prefs, []), minor: r.birthdate ? ageOn(r.birthdate, localDate(now(), 'UTC')) < 18 : null } : {}),
-      ...(admin || self ? { birthdate: r.birthdate } : {}),
-      ...(admin ? { costRate: r.cost_rate == null ? null : r.cost_rate / 100 } : {}),
+      ...extrasOf(r, { phone: r.status === 'active' && x.m.status === 'active' }),
+      ...(self || x.can('people.view', d) ? { email: r.email, desiredMin: r.desired_min, desiredMax: r.desired_max, prefs: J(r.prefs, []), minor: r.birthdate ? ageOn(r.birthdate, localDate(now(), 'UTC')) < 18 : null } : {}),
+      ...(self || x.can('people.birthdate', d) ? { birthdate: r.birthdate } : {}),
+      ...(x.can('rates.view', d) ? { costRate: r.cost_rate == null ? null : r.cost_rate / 100 } : {}),
+      ...(self || x.can('roles.assign', d) ? { roles: core.assignmentsOut(r.org_id, r.account_id) } : {}),
     };
   };
-  const membersOf = (oid, { status = 'active' } = {}) =>
-    h.all(`SELECT m.*, a.display_name, a.email, a.email_verified, a.phone, a.phone_visibility, a.supporter_until FROM org_members m JOIN accounts a ON a.id = m.account_id WHERE m.org_id = ?${status ? ' AND m.status = ?' : ''} ORDER BY a.display_name`, ...(status ? [oid, status] : [oid]));
+  /** An organization as one of its members (m: their membership row, or null) sees it. */
+  const orgOut = (o, m) => {
+    const eff = m ? core.effOf(o.id, m.account_id) : null;
+    return {
+      id: o.id, name: o.name, kind: o.kind, tz: o.tz, state: o.state, workweekStart: o.workweek_start, status: o.status, createdAt: o.created_at,
+      role: m ? core.legacyFor(o.id, m.account_id) : null, memberStatus: m?.status ?? null,
+      members: h.get("SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND status = 'active'", o.id).n,
+      ...(eff && canDo(eff, 'settings.edit', null) ? { settings: orgSettings(o) } : {}),
+    };
+  };
 
   // How many rows of each kind one organization can have (audit 2026-11-06, section 2 L2): far above any real one, so a
-  // script can't fill the Hub's database through one organization.
+  // script can't fill the server's database through one organization.
   const capRows = (table, oid, max, what) => {
     if (h.get(`SELECT COUNT(*) AS n FROM ${table} WHERE org_id = ?`, oid).n >= max) bad(`This organization has the most ${what} it can have (${max}). Remove some first.`);
   };
-  const getSetting = (k, d) => { const r = h.get('SELECT value FROM settings WHERE key = ?', k); return r ? JSON.parse(r.value) : d; };
-  const setSetting = (k, v) => h.run('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', k, JSON.stringify(v));
 
   OR('POST', '/v1/orgs', ({ me, body, ip }) => {
-    // (Joining doesn't need this: an unverified person's join waits for a manager. Making one does.)
-    if (!me.email_verified && me.role !== 'owner') forbidden('Verify your email first (Settings > Account > Verify with Google, or ask the Kea Hub’s owner), then create the organization.');
+    const who = identity.who(me);
+    // (Joining doesn't need this: an unverified person's join waits for a manager. Making one does, on the Kea Hub.)
+    const pol = identity.orgPolicy ? identity.orgPolicy(who) : { allowed: true, autoApprove: true };
+    if (!pol.allowed) forbidden(pol.message || 'You can’t make an organization on this server.');
     const name = V.name(body.name, 'Name', { min: 2, max: 120 });
     const kind = V.enum(body.kind ?? 'private', 'Kind', KINDS);
     const tz = validTz(V.str(body.tz ?? 'America/Denver', 'Time zone', { min: 3, max: 60 }));
     const state = body.state == null ? null : V.str(body.state, 'State', { min: 2, max: 10 }).toUpperCase();
     const ws = V.int(body.workweekStart ?? 0, 'Week start', { min: 0, max: 6 });
     if (h.get("SELECT COUNT(*) AS n FROM orgs WHERE created_by = ? AND status = 'pending'", me.id).n >= 3) bad('You already have three organizations waiting for approval.');
-    const auto = me.role === 'owner' || getSetting('orgs', {}).autoApprove === true;
+    const auto = !!pol.autoApprove;
     const oid = id();
-    h.tx(() => {
+    tx(() => {
       h.run('INSERT INTO orgs (id,name,kind,tz,state,workweek_start,status,created_by,created_at,decided_at) VALUES (?,?,?,?,?,?,?,?,?,?)', oid, name, kind, tz, state, ws, auto ? 'active' : 'pending', me.id, now(), auto ? now() : null);
-      h.run("INSERT INTO org_members (org_id,account_id,role,status,joined_at) VALUES (?,?,'owner','active',?)", oid, me.id, now());
+      h.run("INSERT INTO org_members (org_id,account_id,status,joined_at) VALUES (?,?,'active',?)", oid, me.id, now());
+      core.grant(oid, me.id, core.templateRole(oid, 'owner').id, null, me.id);
     });
     audit(me.id, 'org.create', oid, { name, auto }, ip);
     return { status: 201, body: { org: orgOut(loadOrg(oid), memberRow(oid, me.id)) } };
@@ -136,53 +120,63 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   // (Before /v1/orgs/:id, which would otherwise match "join".)
   OR('POST', '/v1/orgs/join', ({ me, body, ip }) => {
     limit('join', ip); limit('join', me.id);
+    const who = identity.who(me);
     // Managers see the email as who someone is. One nobody has proven yet (an Outlook or school address can't be
     // verified with Google) doesn't get in by the code alone: it becomes a request a manager approves or declines.
-    const unverified = !me.email_verified && me.role !== 'owner';
+    const unverified = !who.emailVerified && !who.superuser;
     const code = normCode(body.code);
-    const c = code.length >= 10 ? h.get('SELECT * FROM org_codes WHERE code = ?', code) : null;
+    const cd = code.length >= 10 ? h.get('SELECT * FROM org_codes WHERE code = ?', code) : null;
     const nope = "That code doesn't work. Check it, or ask for a new one.";
-    if (!c || c.revoked || (c.expires_at != null && c.expires_at <= now()) || (c.max_uses != null && c.uses >= c.max_uses)) notFound(nope);
-    const o = loadOrg(c.org_id);
+    if (!cd || cd.revoked || (cd.expires_at != null && cd.expires_at <= now()) || (cd.max_uses != null && cd.uses >= cd.max_uses)) notFound(nope);
+    const o = loadOrg(cd.org_id);
     if (!o || o.status === 'suspended') notFound(nope);
-    if (o.status === 'pending') forbidden('This organization is still waiting for approval on the Kea Hub. Try again later.');
+    const role = h.get('SELECT * FROM org_roles WHERE id = ? AND org_id = ?', cd.role_id, o.id);
+    if (!role || role.template_key === 'owner') notFound(nope);
+    if (o.status === 'pending') forbidden('This organization is still waiting for approval on this server. Try again later.');
     const existing = memberRow(o.id, me.id);
     if (existing) return { org: orgOut(o, existing), alreadyMember: true };
     // (An unverified email always waits, even with automatic approval on.)
-    const pending = unverified || (!!c.needs_approval && !orgSettings(o).autoApproveJoins);
-    h.tx(() => {
+    const pending = unverified || (!!cd.needs_approval && !orgSettings(o).autoApproveJoins);
+    const scope = cd.role_scope == null ? null : J(cd.role_scope, null);
+    tx(() => {
       capRows('org_members', o.id, 5000, 'members');
-      h.run('INSERT INTO org_members (org_id,account_id,role,status,department_id,joined_at,via_code) VALUES (?,?,?,?,?,?,?)', o.id, me.id, c.role, pending ? 'pending' : 'active', c.department_id, now(), c.code);
-      if (c.position_id) h.run('INSERT OR IGNORE INTO org_member_positions (org_id,account_id,position_id) VALUES (?,?,?)', o.id, me.id, c.position_id);
-      h.run('UPDATE org_codes SET uses = uses + 1 WHERE code = ?', c.code);
+      h.run('INSERT INTO org_members (org_id,account_id,status,department_id,joined_at,via_code) VALUES (?,?,?,?,?,?)', o.id, me.id, pending ? 'pending' : 'active', cd.department_id, now(), cd.code);
+      core.grant(o.id, me.id, role.id, scope, `code:${cd.code}`);
+      if (cd.position_id) h.run('INSERT OR IGNORE INTO org_member_positions (org_id,account_id,position_id) VALUES (?,?,?)', o.id, me.id, cd.position_id);
+      h.run('UPDATE org_codes SET uses = uses + 1 WHERE code = ?', cd.code);
     });
-    audit(me.id, pending ? 'org.join_request' : 'org.join', o.id, { role: c.role, pending, emailVerified: !unverified }, ip);
-    if (pending) tellApprovers(o, me, c.role, !unverified);
+    const legacy = core.legacyFor(o.id, me.id);
+    audit(me.id, pending ? 'org.join_request' : 'org.join', o.id, { role: legacy, roleId: role.id, pending, emailVerified: !unverified }, ip);
+    if (pending) tellApprovers(o, me, who, cd.department_id ?? null, !unverified);
     return { org: orgOut(o, memberRow(o.id, me.id)), alreadyMember: false, pending, ...(pending ? { emailVerified: !unverified, message: 'Request sent. Your manager approves it.' } : {}) };
   });
-  // A new request to join: a notice for everyone who can approve it (people above the role it asks for). An
-  // organization that got a lot of requests today stops getting notices; the requests still wait under Approvals.
-  function tellApprovers(o, me, role, emailVerified) {
-    const today = h.get("SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND status = 'pending' AND joined_at > ?", o.id, now() - 86400_000).n;
-    if (today > 20) return;
-    const approvers = h.all("SELECT account_id, role FROM org_members WHERE org_id = ? AND status = 'active' AND role IN ('owner','admin','manager') ORDER BY joined_at LIMIT 200", o.id)
-      .filter((m) => m.role === 'owner' || RANK[m.role] > RANK[role]).slice(0, 50);
+  // A new request to join: a notice for everyone who can approve it (people who may approve joins there and outrank
+  // the role it asks for). An organization that got a lot of requests today stops getting notices; the requests still
+  // wait under Approvals.
+  function tellApprovers(o, me, who, dept, emailVerified) {
+    const todayN = h.get("SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND status = 'pending' AND joined_at > ?", o.id, now() - 86400_000).n;
+    if (todayN > 20) return;
+    const all = core.effAll(o.id);
+    const asked = all.get(me.id) ?? core.NOBODY;
+    const approvers = h.all("SELECT account_id FROM org_members WHERE org_id = ? AND status = 'active' ORDER BY joined_at LIMIT 200", o.id)
+      .filter((m) => { const e = all.get(m.account_id); return e && canDo(e, 'people.approve', dept) && outranks(e, asked); }).slice(0, 50);
     for (const m of approvers)
       notify(m.account_id, 'org_join', `Someone asks to join ${o.name}`, emailVerified
         ? 'Approve or decline it in Kea: Work, People, Approvals.'
         : 'Their email isn’t verified. Approve or decline it in Kea (Work, People, Approvals), and verify their email there if you know it’s theirs.',
-      { data: { orgId: o.id, accountId: me.id, name: String(me.display_name ?? '').slice(0, 60), emailVerified } });
+      { data: { orgId: o.id, accountId: me.id, name: String(who.name ?? '').slice(0, 60), emailVerified } });
   }
   OR('GET', '/v1/orgs', ({ me }) => ({
-    orgs: h.all('SELECT o.*, m.role AS m_role, m.status AS m_status FROM orgs o JOIN org_members m ON m.org_id = o.id WHERE m.account_id = ? ORDER BY o.name', me.id)
-      .map((o) => orgOut(o, { role: o.m_role, status: o.m_status })),
+    orgs: h.all('SELECT o.*, m.status AS m_status FROM orgs o JOIN org_members m ON m.org_id = o.id WHERE m.account_id = ? ORDER BY o.name', me.id)
+      .map((o) => orgOut(o, { account_id: me.id, status: o.m_status })),
   }));
   OR('GET', '/v1/orgs/:id', ({ me, params }) => {
-    const { o, m } = asOrg(params.id, me, 'member', { pendingOk: true, inactiveOk: true });
-    return { org: orgOut(o, m), me: memberOut({ ...m, display_name: me.display_name, email: me.email, email_verified: me.email_verified, phone: me.phone, phone_visibility: me.phone_visibility, supporter_until: me.supporter_until }, m) };
+    const x = asOrg(params.id, me, null, { pendingOk: true, inactiveOk: true });
+    const p = core.profilesOf([me.id]).get(me.id) ?? { name: x.who.name, email: x.who.email, emailVerified: x.who.emailVerified };
+    return { org: orgOut(x.o, x.m), me: { ...memberOut(core.withProfile(x.m, p), x), ...core.abilitiesOut(x.eff) } };
   });
   OR('POST', '/v1/orgs/:id', ({ me, params, body, ip }) => {
-    const { o, s } = asOrg(params.id, me, 'admin');
+    const { o, s } = asOrg(params.id, me, 'settings.edit', { dept: null });
     const next = { ...J(o.settings, {}) };
     if (body.settings) {
       const b = V.obj(body.settings);
@@ -203,6 +197,15 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
         for (const [k, v] of Object.entries(t)) { if (!TODO_KINDS.includes(k)) bad(`Unknown to-do kind: ${k}`); next.todoKinds[k] = V.bool(v, k); }
       }
       if ('ruleOverrides' in b) next.ruleOverrides = V.obj(b.ruleOverrides);
+      if ('clock' in b) {
+        const k = V.obj(b.clock);
+        next.clock = { ...s.clock };
+        if ('periodDays' in k) next.clock.periodDays = V.enum(k.periodDays, 'Pay period', [7, 14]);
+        if ('periodAnchor' in k) next.clock.periodAnchor = k.periodAnchor == null ? null : date(k.periodAnchor, 'First day of a pay period');
+        if ('lateThresholdMin' in k) next.clock.lateThresholdMin = V.int(k.lateThresholdMin, 'Late after (minutes)', { min: 0, max: 120 });
+        if ('needShift' in k) next.clock.needShift = V.bool(k.needShift, 'Clocking in needs a shift');
+      }
+      if ('timeOffKinds' in b) next.timeOffKinds = [...new Set(list(b.timeOffKinds, 'Kinds of time off', 20).map((x) => V.str(x, 'Kind', { min: 1, max: 30 }).toLowerCase()))];
     }
     h.run('UPDATE orgs SET name = ?, kind = ?, tz = ?, state = ?, workweek_start = ?, settings = ? WHERE id = ?',
       body.name != null ? V.name(body.name, 'Name', { min: 2, max: 120 }) : o.name,
@@ -216,153 +219,194 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   });
 
   // ---------- join codes ----------
-  const codeOut = (c) => ({
-    code: c.code, role: c.role, label: c.label, departmentId: c.department_id, positionId: c.position_id, needsApproval: !!c.needs_approval,
-    uses: c.uses, maxUses: c.max_uses, expiresAt: c.expires_at, revoked: !!c.revoked, createdAt: c.created_at,
-    usable: !c.revoked && (c.expires_at == null || c.expires_at > now()) && (c.max_uses == null || c.uses < c.max_uses),
-  });
+  const codeOut = (cd, roleRow) => {
+    const scope = cd.role_scope == null ? null : J(cd.role_scope, null);
+    return {
+      code: cd.code, role: roleRow ? legacyRole(core.effWith(cd.org_id, roleRow, scope)) : 'member', roleId: cd.role_id, roleName: roleRow?.name ?? null, scope: scope ?? 'org',
+      label: cd.label, departmentId: cd.department_id, positionId: cd.position_id, needsApproval: !!cd.needs_approval,
+      uses: cd.uses, maxUses: cd.max_uses, expiresAt: cd.expires_at, revoked: !!cd.revoked, createdAt: cd.created_at,
+      usable: !!roleRow && !cd.revoked && (cd.expires_at == null || cd.expires_at > now()) && (cd.max_uses == null || cd.uses < cd.max_uses),
+    };
+  };
+  const codeRole = (cd) => h.get('SELECT * FROM org_roles WHERE id = ? AND org_id = ?', cd.role_id, cd.org_id);
   OR('POST', '/v1/orgs/:id/codes', ({ me, params, body, ip }) => {
-    const { o, m } = asOrg(params.id, me, 'manager');
-    const role = V.enum(body.role ?? 'member', 'Role', ['admin', 'manager', 'member']);
-    // A code can't hand out more than its maker has: managers make member codes, admins make manager codes, owners admin.
-    if (RANK[role] >= RANK[m.role] && m.role !== 'owner') forbidden(`Only ${role === 'admin' ? 'the owner' : 'admins'} can make ${role} codes.`);
-    const days = V.int(body.expiresDays ?? null, 'Days', { optional: true, min: 1, max: 365 });
+    const x = asOrg(params.id, me, 'codes.make');
+    const { o } = x;
+    // The role: by id, or by its 0.5 name (member, manager, admin) for the matching template.
+    const role = body.roleId ? core.roleRow(o.id, V.str(body.roleId, 'Role', { min: 1, max: 80 })) : core.templateRole(o.id, V.enum(body.role ?? 'member', 'Role', ['admin', 'manager', 'member']));
+    if (role.template_key === 'owner') bad('Join codes can’t make owners. Give the Owner role to someone after they join.');
+    const scope = parseScope(o.id, body.scope);
     const dept = body.departmentId ? deptRow(o.id, body.departmentId).id : null;
+    x.need('codes.make', dept);
+    // A code can't hand out more than its maker has: managers make member codes, admins manager codes, owners admin.
+    if (!outranks(x.eff, core.effWith(o.id, role, scope, x.tree))) forbidden('You can only make codes for roles below your own.');
+    const days = V.int(body.expiresDays ?? null, 'Days', { optional: true, min: 1, max: 365 });
     const pos = body.positionId ? positionRow(o.id, body.positionId).id : null;
     const code = newOrgCode();
+    const legacy = legacyRole(core.effWith(o.id, role, scope, x.tree));
     capRows('org_codes', o.id, 1000, 'join codes');
-    h.run('INSERT INTO org_codes (code,org_id,role,label,department_id,position_id,needs_approval,max_uses,expires_at,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-      code, o.id, role, V.str(body.label, 'Label', { optional: true, max: 60 }), dept, pos,
-      body.needsApproval == null ? (role === 'member' ? 0 : 1) : V.bool(body.needsApproval, 'Needs approval') ? 1 : 0,
+    h.run('INSERT INTO org_codes (code,org_id,role_id,role_scope,label,department_id,position_id,needs_approval,max_uses,expires_at,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+      code, o.id, role.id, scope == null ? null : JSON.stringify(scope), V.str(body.label, 'Label', { optional: true, max: 60 }), dept, pos,
+      body.needsApproval == null ? (legacy === 'member' ? 0 : 1) : V.bool(body.needsApproval, 'Needs approval') ? 1 : 0,
       V.int(body.maxUses ?? null, 'Max uses', { optional: true, min: 1, max: 10000 }), days ? now() + days * 86400_000 : null, me.id, now());
-    audit(me.id, 'org.code_create', o.id, { role }, ip);
-    return { status: 201, body: { code: codeOut(h.get('SELECT * FROM org_codes WHERE code = ?', code)) } };
+    audit(me.id, 'org.code_create', o.id, { role: legacy, roleId: role.id }, ip);
+    return { status: 201, body: { code: codeOut(h.get('SELECT * FROM org_codes WHERE code = ?', code), role) } };
   });
   OR('GET', '/v1/orgs/:id/codes', ({ me, params, query }) => {
-    const { o } = asOrg(params.id, me, 'manager');
-    return { codes: h.all(`SELECT * FROM org_codes WHERE org_id = ?${query.all ? '' : ' AND revoked = 0'} ORDER BY created_at DESC`, o.id).map(codeOut) };
+    const x = asOrg(params.id, me, 'codes.make');
+    return { codes: h.all(`SELECT * FROM org_codes WHERE org_id = ?${query.all ? '' : ' AND revoked = 0'} ORDER BY created_at DESC`, x.o.id).filter((cd) => x.can('codes.make', cd.department_id ?? null)).map((cd) => codeOut(cd, codeRole(cd))) };
   });
   OR('POST', '/v1/orgs/:id/codes/:code/revoke', ({ me, params, ip }) => {
-    const { o, m } = asOrg(params.id, me, 'manager');
-    const c = h.get('SELECT * FROM org_codes WHERE code = ? AND org_id = ?', normCode(params.code), o.id) ?? notFound('Code not found.');
-    if (RANK[c.role] >= RANK[m.role] && m.role !== 'owner') forbidden('You can only revoke codes you could make.');
-    h.run('UPDATE org_codes SET revoked = 1 WHERE code = ?', c.code);
-    audit(me.id, 'org.code_revoke', o.id, null, ip);
+    const x = asOrg(params.id, me, 'codes.make');
+    const cd = h.get('SELECT * FROM org_codes WHERE code = ? AND org_id = ?', normCode(params.code), x.o.id) ?? notFound('Code not found.');
+    const role = codeRole(cd);
+    if (!x.can('codes.make', cd.department_id ?? null) || (role && !outranks(x.eff, core.effWith(x.o.id, role, cd.role_scope == null ? null : J(cd.role_scope, null), x.tree)))) forbidden('You can only revoke codes you could make.');
+    h.run('UPDATE org_codes SET revoked = 1 WHERE code = ?', cd.code);
+    audit(me.id, 'org.code_revoke', x.o.id, null, ip);
     return { ok: true };
   });
 
   // ---------- members ----------
   OR('GET', '/v1/orgs/:id/members', ({ me, params }) => {
-    const { o, m, mgr } = asOrg(params.id, me);
+    const x = asOrg(params.id, me);
+    const all = core.effAll(x.o.id, x.tree);
     return {
-      members: membersOf(o.id).map((r) => memberOut(r, m)),
-      pending: mgr ? membersOf(o.id, { status: 'pending' }).map((r) => memberOut(r, m)) : [],
+      members: membersOf(x.o.id).map((r) => memberOut(r, x, all)),
+      pending: x.can('people.approve') ? membersOf(x.o.id, { status: 'pending' }).filter((r) => x.can('people.approve', r.department_id ?? null)).map((r) => memberOut(r, x, all)) : [],
     };
   });
   OR('POST', '/v1/orgs/:id/members/:aid/approve', ({ me, params, body, ip }) => {
-    const { o, m } = asOrg(params.id, me, 'manager');
+    const x = asOrg(params.id, me, 'people.approve');
+    const { o } = x;
     const t = memberRow(o.id, params.aid);
     if (!t || t.status !== 'pending') notFound('No request from that person.');
-    if (RANK[t.role] >= RANK[m.role] && m.role !== 'owner') forbidden('Ask an admin to approve this one.');
-    if (body.approve === false) h.run('DELETE FROM org_members WHERE org_id = ? AND account_id = ?', o.id, t.account_id);
+    x.need('people.approve', t.department_id ?? null);
+    if (!x.outranks(t.account_id, core.effAll(o.id, x.tree))) forbidden('Ask an admin to approve this one.');
+    if (body.approve === false) tx(() => { h.run('DELETE FROM org_role_assignments WHERE org_id = ? AND account_id = ?', o.id, t.account_id); h.run('DELETE FROM org_members WHERE org_id = ? AND account_id = ?', o.id, t.account_id); });
     else h.run("UPDATE org_members SET status = 'active' WHERE org_id = ? AND account_id = ?", o.id, t.account_id);
     audit(me.id, body.approve === false ? 'org.join_deny' : 'org.join_approve', o.id, { account: t.account_id }, ip);
     if (body.approve === false) notify(t.account_id, 'org', `${o.name} didn’t approve your request to join`, 'Ask someone there for a new join code if you think this was a mistake.', { data: { orgId: o.id, approved: false } });
     else notify(t.account_id, 'org', `You’re in: ${o.name}`, 'Your request to join was approved. It’s in Work mode now.', { data: { orgId: o.id, approved: true } });
     return { ok: true };
   });
-  // Marks a member's (or someone asking to join's) email as verified, for a manager who knows it's really theirs.
-  // Managers and up, for people below them (an owner for anyone); the Hub's owner for anyone in any organization.
-  // The one verifying must have a verified email themselves. It counts everywhere on the Hub, payroll included.
+  // Marks a member's (or someone asking to join's) email as verified, for a manager who knows it's really theirs:
+  // people who may verify emails there, for people they outrank; the server's operator for anyone in any
+  // organization. The one verifying must have a verified email themselves. Only where the sign-in system allows it.
   OR('POST', '/v1/orgs/:id/members/:aid/verify-email', ({ me, params, ip }) => {
-    const hubOwner = me.role === 'owner';
-    let o, m = null;
+    if (!identity.verifyEmail) notFound('Emails are verified by the Kea account here, not by organizations.');
+    const who = identity.who(me);
+    const hubOwner = !!who.superuser;
+    let o, x = null;
     if (hubOwner) o = loadOrg(params.id) ?? notFound('Organization not found.');
     else {
-      ({ o, m } = asOrg(params.id, me, 'manager'));
-      if (!me.email_verified) forbidden('Verify your own email first.');
+      x = asOrg(params.id, me, 'people.verify');
+      o = x.o;
+      if (!who.emailVerified) forbidden('Verify your own email first.');
     }
     const t = memberRow(o.id, params.aid);
     if (!t) notFound('That person isn’t in this organization or asking to join it.');
-    if (!hubOwner && t.account_id !== me.id && RANK[t.role] >= RANK[m.role] && m.role !== 'owner') forbidden('Ask an admin to verify this one.');
-    const a = h.get('SELECT id, email, email_verified, verified_by FROM accounts WHERE id = ?', t.account_id) ?? notFound('Account not found.');
-    if (a.email_verified) return { ok: true, already: true, emailVerified: true, verifiedBy: a.verified_by };
+    if (x && t.account_id !== me.id && (!x.can('people.verify', t.department_id ?? null) || !x.outranks(t.account_id, core.effAll(o.id, x.tree)))) forbidden('Ask an admin to verify this one.');
     const by = hubOwner ? 'Owner' : 'Manager';
-    h.run('UPDATE accounts SET email_verified = 1, verified_by = ?, updated_at = ? WHERE id = ? AND email_verified = 0', by, now(), a.id);
-    audit(me.id, 'account.verify_email', a.id, { by, org: o.id, email: a.email }, ip);
-    notify(a.id, 'account', 'Your email is verified', hubOwner ? 'The Kea Hub’s owner verified it.' : `A manager at ${o.name} verified it.`, { data: { orgId: o.id, by } });
+    const r = identity.verifyEmail(t.account_id, { by, orgId: o.id }) ?? notFound('Account not found.');
+    if (r.already) return { ok: true, already: true, emailVerified: true, verifiedBy: r.verifiedBy };
+    audit(me.id, 'account.verify_email', t.account_id, { by, org: o.id, email: r.email ?? null }, ip);
+    notify(t.account_id, 'account', 'Your email is verified', hubOwner ? 'The Kea Hub’s owner verified it.' : `A manager at ${o.name} verified it.`, { data: { orgId: o.id, by } });
     return { ok: true, already: false, emailVerified: true, verifiedBy: by };
   });
   OR('POST', '/v1/orgs/:id/members/:aid', ({ me, params, body, ip }) => {
-    const { o, m } = asOrg(params.id, me);
+    const x = asOrg(params.id, me);
+    const { o } = x;
     const t = memberRow(o.id, params.aid) ?? notFound('Not a member.');
     const self = t.account_id === me.id;
-    const mgr = RANK[m.role] >= RANK.manager, admin = RANK[m.role] >= RANK.admin;
-    if (!self && !mgr) forbidden('Only managers and admins can change other people.');
-    if (!self && RANK[t.role] >= RANK[m.role] && m.role !== 'owner') forbidden('You can only change people below your role.');
-    const set = {};
-    if (body.role != null) {
-      const role = V.enum(body.role, 'Role', ROLES);
-      if (!admin) forbidden('Only admins can change roles.');
-      if ((role === 'owner' || role === 'admin' || t.role === 'admin' || t.role === 'owner') && m.role !== 'owner') forbidden('Only the owner can make or change admins.');
-      if (self && m.role === 'owner' && role !== 'owner' && h.get("SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND role = 'owner'", o.id).n < 2) bad('Make someone else an owner first.');
-      set.role = role;
+    const d = t.department_id ?? null;
+    const all = core.effAll(o.id, x.tree);
+    if (!self) {
+      if (!['people.edit', 'roles.assign', 'rates.assign', 'people.birthdate'].some((a) => x.can(a, d))) forbidden('Only managers and admins can change other people.');
+      if (!x.outranks(t.account_id, all)) forbidden('You can only change people below your role.');
     }
-    if ('departmentId' in body) { if (!mgr) forbidden('Only managers can change departments.'); set.department_id = body.departmentId ? deptRow(o.id, body.departmentId).id : null; }
-    if ('title' in body) { if (!mgr) forbidden('Only managers can change titles.'); set.title = V.str(body.title, 'Title', { optional: true, max: 80 }); }
-    if ('costRate' in body) { if (!admin) forbidden('Only admins can set cost rates.'); set.cost_rate = cents(body.costRate, 'Cost rate'); }
+    const set = {};
+    let newRole = null;
+    if (body.role != null) {
+      // (KeaS 0.5's fixed roles: the template of that name, for the whole organization, in place of every role held.)
+      const key = V.enum(body.role, 'Role', LEGACY_ROLES);
+      if (!x.can('roles.assign', d)) forbidden('Only admins can change roles.');
+      newRole = core.templateRole(o.id, key);
+      if (!x.owner && (!x.outranks(t.account_id, all) || !outranks(x.eff, core.effWith(o.id, newRole, null, x.tree)))) forbidden('Only the owner can make or change admins.');
+      if (key !== 'owner' && core.isOwner(o.id, t.account_id) && core.ownersOf(o.id).length < 2) bad('Make someone else an owner first.');
+    }
+    const editOther = (what) => { if (!self && !x.can('people.edit', d)) forbidden(`Only managers can change ${what}.`); };
+    if ('departmentId' in body) {
+      if (!x.can('people.edit', d)) forbidden('Only managers can change departments.');
+      set.department_id = body.departmentId ? deptRow(o.id, body.departmentId).id : null;
+      if (!x.can('people.edit', set.department_id)) forbidden('You can only move people into departments you manage.');
+    }
+    if ('title' in body) { if (!x.can('people.edit', d)) forbidden('Only managers can change titles.'); set.title = V.str(body.title, 'Title', { optional: true, max: 80 }); }
+    if ('costRate' in body) { if (!x.can('rates.assign', d)) forbidden('Only admins can set cost rates.'); set.cost_rate = cents(body.costRate, 'Cost rate'); }
     if ('birthdate' in body) {
-      if (!self && !admin) forbidden('Only admins can change a birthdate.');
+      const may = x.can('people.birthdate', d);
+      if (!self && !may) forbidden('Only admins can change a birthdate.');
       // (Your own only while it's empty: the minor labor rules depend on it, so changing it is an admin's job.)
-      if (self && !admin && t.birthdate != null) forbidden('Your birthdate is already set. Ask an admin to correct it.');
+      if (self && !may && t.birthdate != null) forbidden('Your birthdate is already set. Ask an admin to correct it.');
       set.birthdate = date(body.birthdate, 'Birthdate', { optional: true });
     }
-    if ('desiredMin' in body) set.desired_min = num(body.desiredMin, 'Desired hours', { max: 168 });
-    if ('desiredMax' in body) set.desired_max = num(body.desiredMax, 'Desired hours', { max: 168 });
-    if ('prefs' in body) set.prefs = JSON.stringify(tags(body.prefs));
+    if ('desiredMin' in body) { editOther('desired hours'); set.desired_min = num(body.desiredMin, 'Desired hours', { max: 168 }); }
+    if ('desiredMax' in body) { editOther('desired hours'); set.desired_max = num(body.desiredMax, 'Desired hours', { max: 168 }); }
+    if ('prefs' in body) { editOther('preferences'); set.prefs = JSON.stringify(tags(body.prefs)); }
     if ('usualWeek' in body) {
+      editOther('the usual week');
       const u = V.obj(body.usualWeek);
       const clean = {};
       for (const [k, v] of Object.entries(u)) if (/^[0-6]\|\d{2}:\d{2}-\d{2}:\d{2}$/.test(k) && (v === 'A' || v === 'I')) clean[k] = v;
       set.usual_week = JSON.stringify(clean);
     }
     const cols = Object.keys(set);
-    h.tx(() => {
-      if (cols.length) h.run(`UPDATE org_members SET ${cols.map((c) => `${c} = ?`).join(', ')} WHERE org_id = ? AND account_id = ?`, ...cols.map((c) => set[c]), o.id, t.account_id);
+    tx(() => {
+      if (cols.length) h.run(`UPDATE org_members SET ${cols.map((k) => `${k} = ?`).join(', ')} WHERE org_id = ? AND account_id = ?`, ...cols.map((k) => set[k]), o.id, t.account_id);
+      if (newRole) {
+        h.run('DELETE FROM org_role_assignments WHERE org_id = ? AND account_id = ?', o.id, t.account_id);
+        core.grant(o.id, t.account_id, newRole.id, null, me.id);
+      }
       if ('positionIds' in body) {
-        if (!mgr) forbidden('Only managers can change positions.');
+        if (!x.can('people.edit', d)) forbidden('Only managers can change positions.');
         const ids = list(body.positionIds, 'Positions', 50).map((p) => positionRow(o.id, p).id);
         h.run('DELETE FROM org_member_positions WHERE org_id = ? AND account_id = ?', o.id, t.account_id);
         for (const p of ids) h.run('INSERT OR IGNORE INTO org_member_positions (org_id,account_id,position_id) VALUES (?,?,?)', o.id, t.account_id, p);
       }
     });
-    if (!self) audit(me.id, 'org.member_update', o.id, { account: t.account_id, ...Object.fromEntries(cols.filter((c) => c !== 'cost_rate' && c !== 'birthdate').map((c) => [c, set[c]])) }, ip);
-    const r = h.get('SELECT m.*, a.display_name, a.email, a.email_verified, a.phone, a.phone_visibility, a.supporter_until FROM org_members m JOIN accounts a ON a.id = m.account_id WHERE m.org_id = ? AND m.account_id = ?', o.id, t.account_id);
-    return { member: { ...memberOut(r, m), ...(self ? { usualWeek: J(r.usual_week, {}) } : {}) } };
+    if (!self || newRole) audit(me.id, 'org.member_update', o.id, { account: t.account_id, ...(newRole ? { role: newRole.template_key } : {}), ...Object.fromEntries(cols.filter((k) => k !== 'cost_rate' && k !== 'birthdate').map((k) => [k, set[k]])) }, ip);
+    const x2 = asOrg(o.id, me, null, { inactiveOk: true });
+    const r = core.memberWithProfile(o.id, t.account_id);
+    return { member: { ...memberOut(r, x2), ...(self ? { usualWeek: J(r.usual_week, {}) } : {}) } };
   });
   OR('POST', '/v1/orgs/:id/members/:aid/remove', ({ me, params, ip }) => {
-    const { o, m } = asOrg(params.id, me, 'manager');
+    const x = asOrg(params.id, me, 'people.remove');
+    const { o } = x;
     const t = memberRow(o.id, params.aid) ?? notFound('Not a member.');
     if (t.account_id === me.id) bad('Use Leave to leave the organization.');
-    if (RANK[t.role] >= RANK[m.role] && m.role !== 'owner') forbidden('You can only remove people below your role.');
+    x.need('people.remove', t.department_id ?? null);
+    if (!x.outranks(t.account_id, core.effAll(o.id, x.tree))) forbidden('You can only remove people below your role.');
+    if (core.isOwner(o.id, t.account_id) && core.ownersOf(o.id).length < 2) bad('Make someone else an owner first.');
     removeMember(o.id, t.account_id);
     audit(me.id, 'org.member_remove', o.id, { account: t.account_id }, ip);
     return { ok: true };
   });
   function removeMember(oid, aid) {
-    h.tx(() => {
+    tx(() => {
+      h.run('DELETE FROM org_role_assignments WHERE org_id = ? AND account_id = ?', oid, aid);
+      h.run('DELETE FROM org_member_positions WHERE org_id = ? AND account_id = ?', oid, aid);
       h.run('DELETE FROM org_members WHERE org_id = ? AND account_id = ?', oid, aid);
-      // Future draft and published shifts open up again; their past is kept for budgets.
+      // Future draft and published shifts open up again; their past is kept for budgets (and punches for timecards).
       h.run('UPDATE org_shifts SET account_id = NULL WHERE org_id = ? AND account_id = ? AND start_at > ?', oid, aid, now());
       h.run("UPDATE org_swaps SET status = 'cancelled' WHERE org_id = ? AND (from_account = ? OR claimant = ?) AND status IN ('offered','claimed')", oid, aid, aid);
-      h.run('DELETE FROM class_members WHERE account_id = ? AND class_id IN (SELECT class_id FROM org_classes WHERE org_id = ?) AND role != ?', aid, oid, 'instructor');
+      h.run("UPDATE org_time_off SET status = 'cancelled' WHERE org_id = ? AND account_id = ? AND status = 'pending'", oid, aid);
+      if (classes) h.run('DELETE FROM class_members WHERE account_id = ? AND class_id IN (SELECT class_id FROM org_classes WHERE org_id = ?) AND role != ?', aid, oid, 'instructor');
     });
   }
   OR('POST', '/v1/orgs/:id/leave', ({ me, params, ip }) => {
     const o = loadOrg(params.id);
     const m = o && memberRow(params.id, me.id);
     if (!m) notFound('Organization not found.');
-    if (m.role === 'owner' && h.get("SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND role = 'owner'", o.id).n < 2) bad('You are the only owner. Make someone else an owner first.');
+    if (core.isOwner(o.id, me.id) && core.ownersOf(o.id).length < 2) bad('You are the only owner. Make someone else an owner first.');
     removeMember(o.id, me.id);
     audit(me.id, 'org.leave', o.id, null, ip);
     return { ok: true };
@@ -375,24 +419,17 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   const ccRow = (oid, cid) => h.get('SELECT * FROM org_cost_centers WHERE id = ? AND org_id = ?', cid, oid) ?? bad('That cost center is not in this organization.');
   const deptOut = (d) => ({ id: d.id, parentId: d.parent_id, name: d.name, costCenterId: d.cost_center_id, locationId: d.location_id, sort: d.sort });
   const posOut = (p, admin) => ({ id: p.id, name: p.name, departmentId: p.department_id, tags: J(p.tags, []), color: p.color, ...(admin ? { costRate: p.cost_rate == null ? null : p.cost_rate / 100 } : {}) });
-  /** A department and everything under it. */
-  const subtree = (oid, did) => {
-    const all = h.all('SELECT id, parent_id FROM org_departments WHERE org_id = ?', oid);
-    const out = new Set([did]);
-    for (let grew = true; grew;) { grew = false; for (const d of all) if (d.parent_id && out.has(d.parent_id) && !out.has(d.id)) { out.add(d.id); grew = true; } }
-    return out;
-  };
   OR('GET', '/v1/orgs/:id/structure', ({ me, params }) => {
-    const { o, admin } = asOrg(params.id, me);
+    const x = asOrg(params.id, me); const { o } = x;
     return {
       departments: h.all('SELECT * FROM org_departments WHERE org_id = ? ORDER BY sort, name', o.id).map(deptOut),
-      positions: h.all('SELECT * FROM org_positions WHERE org_id = ? ORDER BY name', o.id).map((p) => posOut(p, admin)),
+      positions: h.all('SELECT * FROM org_positions WHERE org_id = ? ORDER BY name', o.id).map((p) => posOut(p, x.can('rates.view', p.department_id ?? null))),
       locations: h.all('SELECT * FROM org_locations WHERE org_id = ? ORDER BY name', o.id).map((l) => ({ id: l.id, name: l.name, address: l.address })),
       costCenters: h.all('SELECT * FROM org_cost_centers WHERE org_id = ? ORDER BY code', o.id).map((c) => ({ id: c.id, code: c.code, name: c.name })),
     };
   });
   OR('POST', '/v1/orgs/:id/departments', ({ me, params, body }) => {
-    const { o } = asOrg(params.id, me, 'admin');
+    const { o } = asOrg(params.id, me, 'structure.edit', { dept: null });
     const did = id();
     capRows('org_departments', o.id, 500, 'departments');
     h.run('INSERT INTO org_departments (id,org_id,parent_id,name,cost_center_id,location_id,sort) VALUES (?,?,?,?,?,?,?)', did, o.id,
@@ -401,7 +438,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { status: 201, body: { department: deptOut(deptRow(o.id, did)) } };
   });
   OR('POST', '/v1/orgs/:id/departments/:did', ({ me, params, body }) => {
-    const { o } = asOrg(params.id, me, 'admin');
+    const { o } = asOrg(params.id, me, 'structure.edit', { dept: null });
     const d = deptRow(o.id, params.did);
     let parent = d.parent_id;
     if ('parentId' in body) {
@@ -416,7 +453,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { department: deptOut(deptRow(o.id, d.id)) };
   });
   OR('POST', '/v1/orgs/:id/departments/:did/delete', ({ me, params }) => {
-    const { o } = asOrg(params.id, me, 'admin');
+    const { o } = asOrg(params.id, me, 'structure.edit', { dept: null });
     const d = deptRow(o.id, params.did);
     h.tx(() => {
       // Teams under it move up a level; people and positions in it keep working, with no department.
@@ -429,25 +466,27 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { ok: true };
   });
   OR('POST', '/v1/orgs/:id/positions', ({ me, params, body }) => {
-    const { o } = asOrg(params.id, me, 'admin');
+    const x = asOrg(params.id, me, 'structure.edit', { dept: null }); const { o } = x;
+    if ('costRate' in body && !x.can('rates.assign', null)) forbidden('Only admins can set cost rates.');
     const pid = id();
     capRows('org_positions', o.id, 500, 'positions');
     h.run('INSERT INTO org_positions (id,org_id,name,department_id,tags,cost_rate,color) VALUES (?,?,?,?,?,?,?)', pid, o.id, V.str(body.name, 'Name', { min: 1, max: 80 }),
       body.departmentId ? deptRow(o.id, body.departmentId).id : null, JSON.stringify(tags(body.tags)), cents(body.costRate, 'Cost rate'), V.str(body.color, 'Color', { optional: true, max: 20 }));
-    return { status: 201, body: { position: posOut(positionRow(o.id, pid), true) } };
+    return { status: 201, body: { position: posOut(positionRow(o.id, pid), x.can('rates.view', null)) } };
   });
   OR('POST', '/v1/orgs/:id/positions/:pid', ({ me, params, body }) => {
-    const { o } = asOrg(params.id, me, 'admin');
+    const x = asOrg(params.id, me, 'structure.edit', { dept: null }); const { o } = x;
+    if ('costRate' in body && !x.can('rates.assign', null)) forbidden('Only admins can set cost rates.');
     const p = positionRow(o.id, params.pid);
     h.run('UPDATE org_positions SET name = ?, department_id = ?, tags = ?, cost_rate = ?, color = ? WHERE id = ?',
       body.name != null ? V.str(body.name, 'Name', { min: 1, max: 80 }) : p.name,
       'departmentId' in body ? (body.departmentId ? deptRow(o.id, body.departmentId).id : null) : p.department_id,
       'tags' in body ? JSON.stringify(tags(body.tags)) : p.tags, 'costRate' in body ? cents(body.costRate, 'Cost rate') : p.cost_rate,
       'color' in body ? V.str(body.color, 'Color', { optional: true, max: 20 }) : p.color, p.id);
-    return { position: posOut(positionRow(o.id, p.id), true) };
+    return { position: posOut(positionRow(o.id, p.id), x.can('rates.view', null)) };
   });
   OR('POST', '/v1/orgs/:id/positions/:pid/delete', ({ me, params }) => {
-    const { o } = asOrg(params.id, me, 'admin');
+    const { o } = asOrg(params.id, me, 'structure.edit', { dept: null });
     const p = positionRow(o.id, params.pid);
     if (h.get("SELECT 1 FROM org_shifts WHERE position_id = ? AND org_id = ? AND end_at > ?", p.id, o.id, now())) bad('Upcoming shifts use this position. Move or remove them first.');
     h.tx(() => { h.run('DELETE FROM org_member_positions WHERE position_id = ? AND org_id = ?', p.id, o.id); h.run('DELETE FROM org_positions WHERE id = ?', p.id); });
@@ -459,7 +498,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   ]) {
     const out = (r) => Object.fromEntries([['id', r.id], ...fields.map(([f]) => [f, r[f]])]);
     OR('POST', `/v1/orgs/:id/${path}`, ({ me, params, body }) => {
-      const { o } = asOrg(params.id, me, 'admin');
+      const { o } = asOrg(params.id, me, 'structure.edit', { dept: null });
       const rid = id();
       const vals = fields.map(([f, n, min, max]) => V.str(body[f], n, { min, max, optional: min === 0 }));
       capRows(table, o.id, 300, path.replace('-', ' '));
@@ -467,14 +506,14 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
       return { status: 201, body: { item: out(h.get(`SELECT * FROM ${table} WHERE id = ?`, rid)) } };
     });
     OR('POST', `/v1/orgs/:id/${path}/:rid`, ({ me, params, body }) => {
-      const { o } = asOrg(params.id, me, 'admin');
+      const { o } = asOrg(params.id, me, 'structure.edit', { dept: null });
       const r = h.get(`SELECT * FROM ${table} WHERE id = ? AND org_id = ?`, params.rid, o.id) ?? notFound();
       const vals = fields.map(([f, n, min, max]) => (f in body ? V.str(body[f], n, { min, max, optional: min === 0 }) : r[f]));
       h.run(`UPDATE ${table} SET ${fields.map((f) => `${f[0]} = ?`).join(', ')} WHERE id = ?`, ...vals, r.id);
       return { item: out(h.get(`SELECT * FROM ${table} WHERE id = ?`, r.id)) };
     });
     OR('POST', `/v1/orgs/:id/${path}/:rid/delete`, ({ me, params }) => {
-      const { o } = asOrg(params.id, me, 'admin');
+      const { o } = asOrg(params.id, me, 'structure.edit', { dept: null });
       const col = table === 'org_locations' ? 'location_id' : 'cost_center_id';
       h.tx(() => { h.run(`UPDATE org_departments SET ${col} = NULL WHERE ${col} = ? AND org_id = ?`, params.rid, o.id); h.run(`DELETE FROM ${table} WHERE id = ? AND org_id = ?`, params.rid, o.id); });
       return { ok: true };
@@ -540,7 +579,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     warn: 'warnDays' in body ? JSON.stringify(list(body.warnDays, 'Warnings', 6).map((d) => V.int(d, 'Days', { min: 1, max: 365 }))) : prev.warn_days ?? JSON.stringify(orgSettings(o).certWarnDays),
   });
   OR('POST', '/v1/orgs/:id/cert-types', ({ me, params, body }) => {
-    const { o } = asOrg(params.id, me, 'admin');
+    const { o } = asOrg(params.id, me, 'certs.types', { dept: null });
     const f = certTypeFields(o, body);
     if (!f.name) bad('Give the certification a name.');
     const tid = id();
@@ -549,33 +588,38 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { status: 201, body: { certType: certTypeOut(certTypeRow(o.id, tid)) } };
   });
   OR('POST', '/v1/orgs/:id/cert-types/:tid', ({ me, params, body }) => {
-    const { o } = asOrg(params.id, me, 'admin');
+    const { o } = asOrg(params.id, me, 'certs.types', { dept: null });
     const t = certTypeRow(o.id, params.tid);
     const f = certTypeFields(o, body, t);
     h.run('UPDATE org_cert_types SET name = ?, valid_months = ?, positions = ?, warn_days = ? WHERE id = ?', f.name, f.valid, f.positions, f.warn, t.id);
     return { certType: certTypeOut(certTypeRow(o.id, t.id)) };
   });
   OR('POST', '/v1/orgs/:id/cert-types/:tid/delete', ({ me, params }) => {
-    const { o } = asOrg(params.id, me, 'admin');
+    const { o } = asOrg(params.id, me, 'certs.types', { dept: null });
     const t = certTypeRow(o.id, params.tid);
     h.tx(() => { h.run('DELETE FROM org_certs WHERE type_id = ? AND org_id = ?', t.id, o.id); h.run('UPDATE org_classes SET cert_type_id = NULL WHERE cert_type_id = ?', t.id); h.run('DELETE FROM org_cert_types WHERE id = ?', t.id); });
     return { ok: true };
   });
   OR('GET', '/v1/orgs/:id/certs', ({ me, params, query }) => {
-    const { o, mgr, tz } = asOrg(params.id, me);
+    const x = asOrg(params.id, me); const { o, tz } = x;
+    const mgr = x.can('certs.manage');
+    const deptOf = new Map(h.all('SELECT account_id, department_id FROM org_members WHERE org_id = ?', o.id).map((r) => [r.account_id, r.department_id ?? null]));
+    const mine = (aid) => aid === me.id || x.can('certs.manage', deptOf.get(aid) ?? null);
     const who = mgr ? (query.accountId || null) : me.id;
+    if (who && !mine(who)) forbidden('You can only see the certifications of people you manage.');
+    const nm = names(o.id);
     const types = typesMap(o.id);
-    const rows = h.all(`SELECT c.*, a.display_name FROM org_certs c JOIN accounts a ON a.id = c.account_id WHERE c.org_id = ?${who ? ' AND c.account_id = ?' : ''} ORDER BY c.expires_on`, ...(who ? [o.id, who] : [o.id]));
+    const rows = h.all(`SELECT c.* FROM org_certs c WHERE c.org_id = ?${who ? ' AND c.account_id = ?' : ''} ORDER BY c.expires_on`, ...(who ? [o.id, who] : [o.id])).filter((r) => mine(r.account_id));
     // Required certs people don't have yet, for the positions they hold.
     const missing = [];
-    for (const m of who ? [memberRow(o.id, who)].filter(Boolean) : membersOf(o.id)) {
+    for (const m of who ? [memberRow(o.id, who)].filter(Boolean) : membersOf(o.id).filter((r) => mine(r.account_id))) {
       const pos = positionsOf(o.id, m.account_id);
       for (const t of types.values()) {
         const req = J(t.positions, []).filter((p) => pos.includes(p));
         if (req.length && !rows.some((c) => c.account_id === m.account_id && c.type_id === t.id)) missing.push({ accountId: m.account_id, typeId: t.id, typeName: t.name, positionIds: req });
       }
     }
-    return { certs: rows.map((c) => ({ ...certOut(c, tz, types), name: c.display_name })), missing };
+    return { certs: rows.map((c) => ({ ...certOut(c, tz, types), name: nm.get(c.account_id) ?? null })), missing };
   });
   const issueCert = (o, aid, tid, issuedOn, expiresOn, by, source = 'manual', classId = null, note = null) => {
     const t = certTypeRow(o.id, tid);
@@ -586,15 +630,19 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return cid;
   };
   OR('POST', '/v1/orgs/:id/certs', ({ me, params, body, ip }) => {
-    const { o, tz } = asOrg(params.id, me, 'manager');
+    const x = asOrg(params.id, me, 'certs.manage'); const { o, tz } = x;
     const aid = V.str(body.accountId, 'Person', { min: 1, max: 80 });
-    if (!memberRow(o.id, aid)) bad('That person is not in this organization.');
+    const tm = memberRow(o.id, aid);
+    if (!tm) bad('That person is not in this organization.');
+    x.need('certs.manage', tm.department_id ?? null);
     const cid = issueCert(o, aid, V.str(body.typeId, 'Certification', { min: 1, max: 80 }), date(body.issuedOn ?? today(tz), 'Issued'), date(body.expiresOn, 'Expires', { optional: true }), me.id, 'manual', null, V.str(body.note, 'Note', { optional: true, max: 300 }));
     audit(me.id, 'org.cert_add', o.id, { account: aid }, ip);
     return { status: 201, body: { cert: certOut(h.get('SELECT * FROM org_certs WHERE id = ?', cid), tz, typesMap(o.id)) } };
   });
   OR('POST', '/v1/orgs/:id/certs/:cid/delete', ({ me, params, ip }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const x = asOrg(params.id, me, 'certs.manage'); const { o } = x;
+    const cr = h.get('SELECT account_id FROM org_certs WHERE id = ? AND org_id = ?', params.cid, o.id);
+    if (cr) x.need('certs.manage', memberRow(o.id, cr.account_id)?.department_id ?? null);
     h.run('DELETE FROM org_certs WHERE id = ? AND org_id = ?', params.cid, o.id);
     audit(me.id, 'org.cert_delete', o.id, { cert: params.cid }, ip);
     return { ok: true };
@@ -605,27 +653,29 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   const nextSession = (cid) => h.get('SELECT * FROM class_sessions WHERE class_id = ? AND end_at > ? ORDER BY start_at LIMIT 1', cid, now());
   const iso = (ms) => { const d = new Date(ms); return Number.isFinite(d.getTime()) ? d.toISOString() : null; };
   const sessOut = (s) => s && { id: s.id, title: s.title, start: iso(s.start_at), end: iso(s.end_at), startAt: s.start_at, location: s.location, meetingUrl: s.meeting_url };
-  const orgClassOut = (c, viewer) => {
-    const mine = h.get('SELECT * FROM org_class_assignments WHERE class_id = ? AND account_id = ?', c.class_id, viewer.account_id);
+  if (classes) {
+  const orgClassOut = (c, x) => {
+    const mine = h.get('SELECT * FROM org_class_assignments WHERE class_id = ? AND account_id = ?', c.class_id, x.who.id);
+    const nm = x.can('classes.manage') ? names(c.org_id) : null;
     return {
       id: c.class_id, title: c.title, description: c.description, meetingUrl: c.meeting_url, status: c.status, certTypeId: c.cert_type_id,
       sessions: h.all('SELECT * FROM class_sessions WHERE class_id = ? ORDER BY start_at', c.class_id).map(sessOut),
       mine: mine ? { dueOn: mine.due_on, completedOn: mine.completed_on } : null,
-      ...(RANK[viewer.role] >= RANK.manager ? {
-        assigned: h.all('SELECT x.*, a.display_name FROM org_class_assignments x JOIN accounts a ON a.id = x.account_id WHERE x.class_id = ? ORDER BY a.display_name', c.class_id)
+      ...(nm ? {
+        assigned: h.all('SELECT * FROM org_class_assignments WHERE class_id = ?', c.class_id).map((a) => ({ ...a, display_name: nm.get(a.account_id) ?? '' })).sort((a, b) => (a.display_name < b.display_name ? -1 : a.display_name > b.display_name ? 1 : 0))
           .map((x) => ({ accountId: x.account_id, name: x.display_name, dueOn: x.due_on, completedOn: x.completed_on })),
       } : {}),
     };
   };
   OR('GET', '/v1/orgs/:id/classes', ({ me, params }) => {
-    const { o, m, mgr } = asOrg(params.id, me);
+    const x = asOrg(params.id, me); const { o } = x; const mgr = x.can('classes.manage');
     const rows = mgr
       ? h.all("SELECT oc.*, c.title, c.description, c.meeting_url, c.status FROM org_classes oc JOIN classes c ON c.id = oc.class_id WHERE oc.org_id = ? AND c.status = 'active' ORDER BY c.title", o.id)
       : h.all("SELECT oc.*, c.title, c.description, c.meeting_url, c.status FROM org_classes oc JOIN classes c ON c.id = oc.class_id JOIN org_class_assignments x ON x.class_id = oc.class_id AND x.account_id = ? WHERE oc.org_id = ? AND c.status = 'active' ORDER BY c.title", me.id, o.id);
-    return { classes: rows.map((c) => orgClassOut(c, m)) };
+    return { classes: rows.map((c) => orgClassOut(c, x)) };
   });
   OR('POST', '/v1/orgs/:id/classes', ({ me, params, body, ip }) => {
-    const { o, m } = asOrg(params.id, me, 'manager');
+    const x = asOrg(params.id, me, 'classes.manage'); const { o } = x;
     capRows('org_classes', o.id, 500, 'classes');
     const cid = id();
     const cert = body.certTypeId ? certTypeRow(o.id, body.certTypeId).id : null;
@@ -636,10 +686,10 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
       h.run('INSERT INTO org_classes (class_id,org_id,cert_type_id,created_at) VALUES (?,?,?,?)', cid, o.id, cert, now());
     });
     audit(me.id, 'org.class_create', o.id, { class: cid }, ip);
-    return { status: 201, body: { class: orgClassOut(orgClassRow(o.id, cid), m) } };
+    return { status: 201, body: { class: orgClassOut(orgClassRow(o.id, cid), x) } };
   });
   OR('POST', '/v1/orgs/:id/classes/:cid', ({ me, params, body }) => {
-    const { o, m } = asOrg(params.id, me, 'manager');
+    const x = asOrg(params.id, me, 'classes.manage'); const { o } = x;
     const c = orgClassRow(o.id, params.cid);
     h.tx(() => {
       h.run('UPDATE classes SET title = ?, description = ?, meeting_url = ?, status = ? WHERE id = ?',
@@ -649,10 +699,10 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
         body.status != null ? V.enum(body.status, 'Status', ['active', 'archived']) : c.status, c.class_id);
       if ('certTypeId' in body) h.run('UPDATE org_classes SET cert_type_id = ? WHERE class_id = ?', body.certTypeId ? certTypeRow(o.id, body.certTypeId).id : null, c.class_id);
     });
-    return { class: orgClassOut(orgClassRow(o.id, c.class_id), m) };
+    return { class: orgClassOut(orgClassRow(o.id, c.class_id), x) };
   });
   OR('POST', '/v1/orgs/:id/classes/:cid/sessions', ({ me, params, body }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'classes.manage');
     const c = orgClassRow(o.id, params.cid);
     const start = V.time(body.start, 'Start'), end = V.time(body.end, 'End');
     if (end <= start) bad('The end must be after the start.');
@@ -662,13 +712,13 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { status: 201, body: { session: sessOut(h.get('SELECT * FROM class_sessions WHERE id = ?', sid)) } };
   });
   OR('POST', '/v1/orgs/:id/classes/:cid/sessions/:sid/delete', ({ me, params }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'classes.manage');
     const c = orgClassRow(o.id, params.cid);
     h.run('DELETE FROM class_sessions WHERE id = ? AND class_id = ?', params.sid, c.class_id);
     return { ok: true };
   });
   OR('POST', '/v1/orgs/:id/classes/:cid/assign', ({ me, params, body, ip }) => {
-    const { o, m } = asOrg(params.id, me, 'manager');
+    const x = asOrg(params.id, me, 'classes.manage'); const { o } = x;
     const c = orgClassRow(o.id, params.cid);
     const due = date(body.dueOn, 'Due', { optional: true });
     const ids = list(body.accountIds, 'People', 2000).map((a) => V.str(a, 'Person', { min: 1, max: 80 }));
@@ -686,10 +736,10 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
       }
     });
     audit(me.id, 'org.class_assign', o.id, { class: c.class_id, count: n }, ip);
-    return { assigned: n, class: orgClassOut(orgClassRow(o.id, c.class_id), m) };
+    return { assigned: n, class: orgClassOut(orgClassRow(o.id, c.class_id), x) };
   });
   OR('POST', '/v1/orgs/:id/classes/:cid/complete', ({ me, params, body, ip }) => {
-    const { o, m, tz } = asOrg(params.id, me, 'manager');
+    const x = asOrg(params.id, me, 'classes.manage'); const { o, tz } = x;
     const c = orgClassRow(o.id, params.cid);
     const on = date(body.completedOn ?? today(tz), 'Completed');
     const issued = [];
@@ -704,8 +754,9 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
       }
     });
     audit(me.id, 'org.class_complete', o.id, { class: c.class_id, issued: issued.length }, ip);
-    return { issued, class: orgClassOut(orgClassRow(o.id, c.class_id), m) };
+    return { issued, class: orgClassOut(orgClassRow(o.id, c.class_id), x) };
   });
+  }
 
   // ---------- block templates ----------
   const parseNeed = (oid, v) => list(v, 'Need', 30).map((n) => ({ positionId: positionRow(oid, n?.positionId).id, count: V.int(n.count, 'How many', { min: 0, max: 200 }) })).filter((n) => n.count > 0);
@@ -724,11 +775,11 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   };
   const setOut = (r) => ({ id: r.id, name: r.name, positionId: r.position_id, blocks: J(r.blocks, []), createdAt: r.created_at });
   OR('GET', '/v1/orgs/:id/block-sets', ({ me, params }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'forms.manage');
     return { blockSets: h.all('SELECT * FROM org_block_sets WHERE org_id = ? ORDER BY name', o.id).map(setOut) };
   });
   OR('POST', '/v1/orgs/:id/block-sets', ({ me, params, body }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'forms.manage');
     const sid = id();
     capRows('org_block_sets', o.id, 300, 'block templates');
     h.run('INSERT INTO org_block_sets (id,org_id,name,position_id,blocks,created_at) VALUES (?,?,?,?,?,?)', sid, o.id, V.str(body.name, 'Name', { min: 1, max: 80 }),
@@ -736,14 +787,14 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { status: 201, body: { blockSet: setOut(h.get('SELECT * FROM org_block_sets WHERE id = ?', sid)) } };
   });
   OR('POST', '/v1/orgs/:id/block-sets/:sid', ({ me, params, body }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'forms.manage');
     const r = h.get('SELECT * FROM org_block_sets WHERE id = ? AND org_id = ?', params.sid, o.id) ?? notFound();
     h.run('UPDATE org_block_sets SET name = ?, position_id = ?, blocks = ? WHERE id = ?', body.name != null ? V.str(body.name, 'Name', { min: 1, max: 80 }) : r.name,
       'positionId' in body ? (body.positionId ? positionRow(o.id, body.positionId).id : null) : r.position_id, 'blocks' in body ? JSON.stringify(parseBlocks(o.id, body.blocks)) : r.blocks, r.id);
     return { blockSet: setOut(h.get('SELECT * FROM org_block_sets WHERE id = ?', r.id)) };
   });
   OR('POST', '/v1/orgs/:id/block-sets/:sid/delete', ({ me, params }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'forms.manage');
     h.run('DELETE FROM org_block_sets WHERE id = ? AND org_id = ?', params.sid, o.id);
     return { ok: true };
   });
@@ -800,7 +851,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return zonedToUtc(d, '23:59', o.tz);
   };
   OR('GET', '/v1/orgs/:id/forms', ({ me, params }) => {
-    const { o, mgr } = asOrg(params.id, me);
+    const x = asOrg(params.id, me); const { o } = x; const mgr = x.can('forms.manage');
     const rows = h.all('SELECT * FROM org_forms WHERE org_id = ? ORDER BY period_start DESC, created_at DESC', o.id);
     return {
       forms: rows.filter((f) => mgr || (f.status !== 'draft' && inAudience(o, f, me.id))).map((f) => {
@@ -817,7 +868,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     ? formRow(o.id, idOrLast)
     : h.get('SELECT * FROM org_forms WHERE org_id = ? AND period_start < ? ORDER BY period_start DESC, created_at DESC LIMIT 1', o.id, before);
   OR('POST', '/v1/orgs/:id/forms', ({ me, params, body, ip }) => {
-    const { o, s, tz } = asOrg(params.id, me, 'manager');
+    const { o, s, tz } = asOrg(params.id, me, 'forms.manage');
     const def = nextMonth(today(tz));
     const start = date(body.periodStart ?? def.start, 'Start');
     const end = date(body.periodEnd ?? (body.periodStart ? addDays(nextMonth(start).start, -1) : def.end), 'End');
@@ -858,7 +909,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     h.run("UPDATE org_forms SET status = 'open', published_at = COALESCE(published_at, ?) WHERE id = ?", now(), fid);
   };
   OR('POST', '/v1/orgs/:id/forms/:fid', ({ me, params, body }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'forms.manage');
     const f = formRow(o.id, params.fid);
     // (Answers are keyed by date and block id, so blocks keep their ids when edited; answers for removed ones drop out.)
     const start = body.periodStart != null ? date(body.periodStart, 'Start') : f.period_start, end = body.periodEnd != null ? date(body.periodEnd, 'End') : f.period_end;
@@ -876,14 +927,14 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
       'allowChanges' in body ? (V.bool(body.allowChanges, 'Change requests') ? 1 : 0) : f.allow_changes, f.id);
     return { form: formOut(formRow(o.id, f.id)) };
   });
-  OR('POST', '/v1/orgs/:id/forms/:fid/open', ({ me, params }) => { const { o } = asOrg(params.id, me, 'manager'); openForm(o, params.fid); return { form: formOut(formRow(o.id, params.fid)) }; });
+  OR('POST', '/v1/orgs/:id/forms/:fid/open', ({ me, params }) => { const { o } = asOrg(params.id, me, 'forms.manage'); openForm(o, params.fid); return { form: formOut(formRow(o.id, params.fid)) }; });
   OR('POST', '/v1/orgs/:id/forms/:fid/close', ({ me, params }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'forms.manage');
     h.run("UPDATE org_forms SET status = 'closed' WHERE id = ? AND org_id = ?", formRow(o.id, params.fid).id, o.id);
     return { form: formOut(formRow(o.id, params.fid)) };
   });
   OR('POST', '/v1/orgs/:id/forms/:fid/delete', ({ me, params, ip }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'forms.manage');
     const f = formRow(o.id, params.fid);
     h.tx(() => { h.run('UPDATE org_schedules SET form_id = NULL WHERE form_id = ?', f.id); h.run('DELETE FROM org_forms WHERE id = ?', f.id); });
     audit(me.id, 'org.form_delete', o.id, { form: f.id }, ip);
@@ -896,7 +947,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   const schedulePublishedFor = (f) => !!h.get("SELECT 1 FROM org_schedules WHERE form_id = ? AND status = 'published'", f.id);
   /** The form as a person fills it in: slots, their answers, prefill choices and where they stand. */
   OR('GET', '/v1/orgs/:id/forms/:fid', ({ me, params }) => {
-    const { o, m, mgr } = asOrg(params.id, me);
+    const x = asOrg(params.id, me); const { o, m } = x; const mgr = x.can('forms.manage');
     const f = formRow(o.id, params.fid);
     if (!mgr && (f.status === 'draft' || !inAudience(o, f, me.id))) notFound('Form not found.');
     const slots = slotsOf(o, f);
@@ -978,18 +1029,19 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { status, response: responseOut(h.get('SELECT * FROM org_responses WHERE form_id = ? AND account_id = ?', f.id, me.id)), hours: hoursMarked(slots, r.answers, periodDays(f)) };
   });
   OR('GET', '/v1/orgs/:id/forms/:fid/changes', ({ me, params }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'forms.manage');
     const f = formRow(o.id, params.fid);
-    return { changes: h.all('SELECT c.*, a.display_name FROM org_response_changes c JOIN accounts a ON a.id = c.account_id WHERE c.form_id = ? ORDER BY c.created_at DESC', f.id).map((c) => {
+    const nm = names(o.id);
+    return { changes: h.all('SELECT c.* FROM org_response_changes c WHERE c.form_id = ? ORDER BY c.created_at DESC', f.id).map((c) => {
       const cur = h.get('SELECT answers FROM org_responses WHERE form_id = ? AND account_id = ?', f.id, c.account_id);
       const p = J(c.proposal, {}), was = J(cur?.answers, {});
       const keys = new Set([...Object.keys(p.answers || {}), ...Object.keys(was)]);
-      return { id: c.id, accountId: c.account_id, name: c.display_name, reason: c.reason, status: c.status, createdAt: c.created_at,
+      return { id: c.id, accountId: c.account_id, name: nm.get(c.account_id) ?? null, reason: c.reason, status: c.status, createdAt: c.created_at,
         diff: [...keys].filter((k) => (p.answers?.[k] || 'N') !== (was[k] || 'N')).sort().map((k) => ({ key: k, from: was[k] || 'N', to: p.answers?.[k] || 'N' })) };
     }) };
   });
   OR('POST', '/v1/orgs/:id/changes/:chid/decide', ({ me, params, body, ip }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'forms.manage');
     const c = h.get('SELECT c.* FROM org_response_changes c JOIN org_forms f ON f.id = c.form_id WHERE c.id = ? AND f.org_id = ?', params.chid, o.id) ?? notFound('Change request not found.');
     if (c.status !== 'pending') bad('That change request was already decided.');
     const approve = V.bool(body.approve, 'Approve');
@@ -1011,7 +1063,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     });
   };
   OR('GET', '/v1/orgs/:id/forms/:fid/matrix', ({ me, params, query }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'forms.manage');
     const f = formRow(o.id, params.fid);
     const slots = slotsOf(o, f);
     const sched = query.scheduleId ? h.get('SELECT * FROM org_schedules WHERE id = ? AND org_id = ?', query.scheduleId, o.id) : h.get('SELECT * FROM org_schedules WHERE form_id = ? ORDER BY created_at DESC LIMIT 1', f.id);
@@ -1032,7 +1084,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     };
   });
   OR('GET', '/v1/orgs/:id/forms/:fid/people', ({ me, params }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'forms.manage');
     const f = formRow(o.id, params.fid);
     const slots = slotsOf(o, f);
     const nudged = new Map(h.all('SELECT * FROM org_nudges WHERE form_id = ?', f.id).map((n) => [n.account_id, n.at]));
@@ -1044,7 +1096,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { form: formOut(f), people, missing: people.filter((p) => !p.submitted).length };
   });
   OR('POST', '/v1/orgs/:id/forms/:fid/nudge', ({ me, params, body }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'forms.manage');
     const f = formRow(o.id, params.fid);
     if (f.status !== 'open') bad('Send the form out first.');
     const answered = new Set(h.all('SELECT account_id FROM org_responses WHERE form_id = ? AND submitted_at IS NOT NULL', f.id).map((r) => r.account_id));
@@ -1060,7 +1112,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { nudged: n };
   });
   OR('GET', '/v1/orgs/:id/forms/:fid/export', ({ me, params, query }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'forms.manage');
     const f = formRow(o.id, params.fid);
     const slots = slotsOf(o, f);
     const rows = responsesFor(o, f).filter((p) => p.submittedAt).sort((a, b) => a.submittedAt - b.submittedAt);
@@ -1074,7 +1126,6 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   // ---------- schedules ----------
   const schedRow = (oid, sid) => h.get('SELECT * FROM org_schedules WHERE id = ? AND org_id = ?', sid, oid) ?? notFound('Schedule not found.');
   const shiftRow = (oid, shid) => h.get('SELECT * FROM org_shifts WHERE id = ? AND org_id = ?', shid, oid) ?? notFound('Shift not found.');
-  const names = (oid) => new Map(h.all('SELECT a.id, a.display_name FROM org_members m JOIN accounts a ON a.id = m.account_id WHERE m.org_id = ?', oid).map((r) => [r.id, r.display_name]));
   const posNames = (oid) => new Map(h.all('SELECT id, name FROM org_positions WHERE org_id = ?', oid).map((p) => [p.id, p.name]));
   const shiftOut = (s, nm, pn) => ({
     id: s.id, scheduleId: s.schedule_id, accountId: s.account_id, name: s.account_id ? nm.get(s.account_id) ?? null : null, positionId: s.position_id, positionName: pn.get(s.position_id) ?? null,
@@ -1089,11 +1140,11 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return f ? slotsOf(o, f) : [];
   };
   OR('GET', '/v1/orgs/:id/schedules', ({ me, params }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'schedule.edit');
     return { schedules: h.all('SELECT * FROM org_schedules WHERE org_id = ? ORDER BY period_start DESC', o.id).map(schedOut) };
   });
   OR('POST', '/v1/orgs/:id/schedules', ({ me, params, body, ip }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'schedule.edit');
     const f = body.formId ? formRow(o.id, body.formId) : null;
     const start = f ? f.period_start : date(body.periodStart, 'Start'), end = f ? f.period_end : date(body.periodEnd, 'End');
     if (end < start) bad('The end must be on or after the start.');
@@ -1106,7 +1157,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   });
   /** The schedule builder's data: slots with need, coverage and who's available, shifts, people's hours, budgets. */
   OR('GET', '/v1/orgs/:id/schedules/:sid', ({ me, params }) => {
-    const { o, s, admin } = asOrg(params.id, me, 'manager');
+    const x = asOrg(params.id, me, 'schedule.edit'); const { o, s } = x; const admin = x.can('budgets.costs', null);
     const sc = schedRow(o.id, params.sid);
     const slots = schedSlots(o, sc);
     const overrides = J(sc.need_overrides, {});
@@ -1144,7 +1195,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   const weekKey = (o, d) => weekStartOf(d, o.workweek_start);
   const weeksOf = (o, start, end) => { const out = []; for (let w = weekKey(o, start); w <= end; w = addDays(w, 7)) out.push(w); return out; };
   OR('POST', '/v1/orgs/:id/schedules/:sid/needs', ({ me, params, body }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'schedule.edit');
     const sc = schedRow(o.id, params.sid);
     const keys = new Set(schedSlots(o, sc).map((x) => x.key));
     const next = { ...J(sc.need_overrides, {}) };
@@ -1172,7 +1223,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   };
   const verdict = (problems) => ({ problems, blocked: problems.some((p) => p.blocking), canForce: problems.every((p) => !p.blocking || p.forceable) });
   OR('POST', '/v1/orgs/:id/schedules/:sid/check', ({ me, params, body }) => {
-    const { o, s } = asOrg(params.id, me, 'manager');
+    const { o, s } = asOrg(params.id, me, 'schedule.edit');
     const sc = schedRow(o.id, params.sid);
     const prev = body.shiftId ? shiftRow(o.id, body.shiftId) : null;
     const pl = placeOf(o, sc, body, prev);
@@ -1182,10 +1233,11 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return verdict(problemsFor(o, cx, aid, positionId, pl.startAt, pl.endAt, prev?.id));
   });
   OR('POST', '/v1/orgs/:id/shifts', ({ me, params, body, ip }) => {
-    const { o, s } = asOrg(params.id, me, 'manager');
+    const x = asOrg(params.id, me, 'schedule.edit'); const { o, s } = x;
     const sc = body.scheduleId ? schedRow(o.id, body.scheduleId) : null;
     const pl = placeOf(o, sc ?? { form_id: null }, body);
     const pos = positionRow(o.id, body.positionId);
+    x.need('schedule.edit', body.departmentId ? deptRow(o.id, body.departmentId).id : pos.department_id ?? null);
     const aid = body.accountId ? V.str(body.accountId, 'Person', { min: 1, max: 80 }) : null;
     let forced = 0;
     if (aid) {
@@ -1202,8 +1254,9 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { status: 201, body: { shift: shiftOut(sh, names(o.id), posNames(o.id)), ...(aid ? verdict(problemsFor(o, checkCtx(o, s), aid, pos.id, sh.start_at, sh.end_at, sh.id)) : {}) } };
   });
   OR('POST', '/v1/orgs/:id/shifts/:shid', ({ me, params, body, ip }) => {
-    const { o, s } = asOrg(params.id, me, 'manager');
+    const x = asOrg(params.id, me, 'schedule.edit'); const { o, s } = x;
     const sh = shiftRow(o.id, params.shid);
+    x.need('schedule.edit', sh.department_id ?? null);
     const sc = sh.schedule_id ? schedRow(o.id, sh.schedule_id) : { form_id: null };
     const pl = placeOf(o, sc, body, sh);
     const pos = body.positionId ? positionRow(o.id, body.positionId).id : sh.position_id;
@@ -1221,13 +1274,14 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { shift: shiftOut(shiftRow(o.id, sh.id), names(o.id), posNames(o.id)) };
   });
   OR('POST', '/v1/orgs/:id/shifts/:shid/delete', ({ me, params }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const x = asOrg(params.id, me, 'schedule.edit'); const { o } = x;
     const sh = shiftRow(o.id, params.shid);
+    x.need('schedule.edit', sh.department_id ?? null);
     h.tx(() => { h.run("UPDATE org_swaps SET status = 'cancelled' WHERE shift_id = ? AND status IN ('offered','claimed')", sh.id); h.run('DELETE FROM org_shifts WHERE id = ?', sh.id); });
     return { ok: true };
   });
   OR('POST', '/v1/orgs/:id/schedules/:sid/autofill', ({ me, params, body, ip }) => {
-    const { o, s } = asOrg(params.id, me, 'manager');
+    const { o, s } = asOrg(params.id, me, 'schedule.edit', { dept: null });
     const sc = schedRow(o.id, params.sid);
     const f = sc.form_id ? h.get('SELECT * FROM org_forms WHERE id = ?', sc.form_id) : null;
     if (!f) bad('Auto-fill needs a schedule made from an availability form.');
@@ -1258,19 +1312,22 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { added: res.add.length, ifNeededUsed: res.add.filter((a) => a.state === 'I').length, unfilled: res.unfilled };
   });
   OR('POST', '/v1/orgs/:id/schedules/:sid/clear', ({ me, params, body }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'schedule.edit', { dept: null });
     const sc = schedRow(o.id, params.sid);
     const only = V.enum(body.source ?? 'autofill', 'Which', ['autofill', 'drafts']);
     const r = h.run(`DELETE FROM org_shifts WHERE schedule_id = ? AND status = 'draft'${only === 'autofill' ? " AND source = 'autofill'" : ''}`, sc.id);
     return { removed: Number(r.changes) };
   });
   OR('POST', '/v1/orgs/:id/schedules/:sid/publish', ({ me, params, body, ip }) => {
-    const { o, s, admin } = asOrg(params.id, me, 'manager');
+    const x = asOrg(params.id, me, 'schedule.publish'); const { o, s } = x; const admin = x.can('budgets.costs', null);
+    // (Someone who publishes for some departments publishes only their shifts.)
+    const where = reach(x.eff, 'schedule.publish');
     const sc = schedRow(o.id, params.sid);
     const over = budgetRows(o, s, sc.period_start, sc.period_end).filter((b) => b.current && b.scheduled > b.amount);
     // Only an admin is asked: the question itself would tell a manager about cost (admins see it under To do).
     if (admin && over.length && body.confirmOverBudget !== true) throw new HttpError(409, 'This schedule goes over budget. Publish anyway?', { budgetWarnings: over });
-    const r = h.run("UPDATE org_shifts SET status = 'published' WHERE schedule_id = ? AND status = 'draft' AND account_id IS NOT NULL", sc.id);
+    const r = where === 'org' ? h.run("UPDATE org_shifts SET status = 'published' WHERE schedule_id = ? AND status = 'draft' AND account_id IS NOT NULL", sc.id)
+      : h.run("UPDATE org_shifts SET status = 'published' WHERE schedule_id = ? AND status = 'draft' AND account_id IS NOT NULL AND department_id IN (SELECT value FROM json_each(?))", sc.id, JSON.stringify(where));
     h.run("UPDATE org_schedules SET status = 'published', published_at = ? WHERE id = ?", now(), sc.id);
     audit(me.id, 'org.schedule_publish', o.id, { schedule: sc.id, shifts: Number(r.changes), overBudget: over.length }, ip);
     return { published: Number(r.changes), schedule: schedOut(schedRow(o.id, sc.id)) };
@@ -1284,7 +1341,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
       shifts: shifts.map((x) => ({ ...x, name: nm.get(x.accountId) ?? null, ...(cx && d.status === 'waiting' ? verdict(problemsFor(o, cx, x.accountId, x.positionId, x.startAt, x.endAt)) : {}) })) };
   };
   OR('POST', '/v1/orgs/:id/schedules/:sid/drafts', ({ me, params, body, ip }) => {
-    const { o, s } = asOrg(params.id, me, 'manager');
+    const { o, s } = asOrg(params.id, me, 'schedule.edit');
     const sc = schedRow(o.id, params.sid);
     const cx = checkCtx(o, s);
     const shifts = list(body.shifts, 'Shifts', 3000).map((x, i) => {
@@ -1300,13 +1357,13 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { status: 201, body: { draft: draftOut(h.get('SELECT * FROM org_drafts WHERE id = ?', did), o, cx) } };
   });
   OR('GET', '/v1/orgs/:id/schedules/:sid/drafts', ({ me, params }) => {
-    const { o, s } = asOrg(params.id, me, 'manager');
+    const { o, s } = asOrg(params.id, me, 'schedule.edit');
     const sc = schedRow(o.id, params.sid);
     const cx = checkCtx(o, s);
     return { drafts: h.all('SELECT * FROM org_drafts WHERE schedule_id = ? ORDER BY created_at DESC', sc.id).map((d) => draftOut(d, o, cx)) };
   });
   OR('POST', '/v1/orgs/:id/drafts/:did/apply', ({ me, params, body, ip }) => {
-    const { o, s } = asOrg(params.id, me, 'manager');
+    const { o, s } = asOrg(params.id, me, 'schedule.edit', { dept: null });
     const d = h.get('SELECT d.* FROM org_drafts d JOIN org_schedules sc ON sc.id = d.schedule_id WHERE d.id = ? AND sc.org_id = ?', params.did, o.id) ?? notFound('Draft not found.');
     if (d.status !== 'waiting') bad('That draft was already used or set aside.');
     const cx = checkCtx(o, s);
@@ -1329,7 +1386,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { added, skipped: skip };
   });
   OR('POST', '/v1/orgs/:id/drafts/:did/discard', ({ me, params }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'schedule.edit');
     const d = h.get('SELECT d.* FROM org_drafts d JOIN org_schedules sc ON sc.id = d.schedule_id WHERE d.id = ? AND sc.org_id = ?', params.did, o.id) ?? notFound('Draft not found.');
     h.run("UPDATE org_drafts SET status = 'discarded', decided_by = ?, decided_at = ? WHERE id = ?", me.id, now(), d.id);
     return { ok: true };
@@ -1345,7 +1402,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
       .map((x) => ({ ...shiftOut(x, nm, pn), swap: swaps.has(x.id) ? { id: swaps.get(x.id).id, status: swaps.get(x.id).status } : null })) };
   });
   OR('GET', '/v1/orgs/:id/schedule', ({ me, params, query }) => {
-    const { o, s, mgr } = asOrg(params.id, me);
+    const x = asOrg(params.id, me); const { o, s } = x; const mgr = x.can('schedule.view');
     if (!mgr && !s.membersSeeSchedule) forbidden('Your organization shows each person only their own shifts.');
     const from = query.from ? V.time(query.from, 'from') : now() - 86400_000, to = query.to ? V.time(query.to, 'to') : now() + 14 * 86400_000;
     if (to - from > 93 * 86400_000) bad('Ask for at most 93 days at a time.');
@@ -1361,7 +1418,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
       const pn = posNames(o.id);
       for (const x of h.all("SELECT * FROM org_shifts WHERE org_id = ? AND account_id = ? AND status = 'published' AND end_at > ? AND start_at < ? ORDER BY start_at", o.id, me.id, from, to))
         events.push({ id: `shift:${x.id}`, kind: 'shift', orgId: o.id, orgName: o.name, title: pn.get(x.position_id) ?? 'Shift', start: new Date(x.start_at).toISOString(), end: new Date(x.end_at).toISOString(), date: x.date });
-      for (const c of h.all("SELECT s.*, c.title AS class_title FROM class_sessions s JOIN org_classes oc ON oc.class_id = s.class_id JOIN classes c ON c.id = s.class_id JOIN class_members cm ON cm.class_id = s.class_id AND cm.account_id = ? WHERE oc.org_id = ? AND c.status = 'active' AND s.end_at >= ? AND s.start_at <= ?", me.id, o.id, from, to))
+      if (classes) for (const c of h.all("SELECT s.*, c.title AS class_title FROM class_sessions s JOIN org_classes oc ON oc.class_id = s.class_id JOIN classes c ON c.id = s.class_id JOIN class_members cm ON cm.class_id = s.class_id AND cm.account_id = ? WHERE oc.org_id = ? AND c.status = 'active' AND s.end_at >= ? AND s.start_at <= ?", me.id, o.id, from, to))
         events.push({ id: `class:${c.id}`, kind: 'class', orgId: o.id, orgName: o.name, title: c.title || c.class_title, classTitle: c.class_title, start: new Date(c.start_at).toISOString(), end: new Date(c.end_at).toISOString(), location: c.location, meetingUrl: c.meeting_url, date: localDate(c.start_at, o.tz) });
     }
     return { events: events.sort((a, b) => (a.start < b.start ? -1 : 1)) };
@@ -1387,11 +1444,11 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { status: 201, body: { swap: swapOut(h.get('SELECT * FROM org_swaps WHERE id = ?', wid), names(o.id), posNames(o.id)) } };
   });
   OR('GET', '/v1/orgs/:id/swaps', ({ me, params }) => {
-    const { o, mgr } = asOrg(params.id, me);
+    const x = asOrg(params.id, me); const { o } = x;
     const nm = names(o.id), pn = posNames(o.id);
     const mine = positionsOf(o.id, me.id);
-    const rows = h.all("SELECT w.*, s.position_id, s.start_at FROM org_swaps w JOIN org_shifts s ON s.id = w.shift_id WHERE w.org_id = ? AND (w.status IN ('offered','claimed') OR w.created_at > ?) ORDER BY s.start_at", o.id, now() - 30 * 86400_000);
-    return { swaps: rows.filter((w) => mgr || w.from_account === me.id || w.claimant === me.id || w.to_account === me.id || (w.status === 'offered' && !w.to_account && mine.includes(w.position_id) && w.start_at > now()))
+    const rows = h.all("SELECT w.*, s.position_id, s.start_at, s.department_id AS shift_dept FROM org_swaps w JOIN org_shifts s ON s.id = w.shift_id WHERE w.org_id = ? AND (w.status IN ('offered','claimed') OR w.created_at > ?) ORDER BY s.start_at", o.id, now() - 30 * 86400_000);
+    return { swaps: rows.filter((w) => x.can('swaps.decide', w.shift_dept ?? null) || w.from_account === me.id || w.claimant === me.id || w.to_account === me.id || (w.status === 'offered' && !w.to_account && mine.includes(w.position_id) && w.start_at > now()))
       .map((w) => swapOut(w, nm, pn)) };
   });
   const swapRow = (oid, wid) => h.get('SELECT * FROM org_swaps WHERE id = ? AND org_id = ?', wid, oid) ?? notFound('Swap not found.');
@@ -1414,8 +1471,9 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { swap: swapOut(swapRow(o.id, w.id), names(o.id), posNames(o.id)), ...v };
   });
   OR('POST', '/v1/orgs/:id/swaps/:wid/decide', ({ me, params, body, ip }) => {
-    const { o, s } = asOrg(params.id, me, 'manager');
+    const x = asOrg(params.id, me, 'swaps.decide'); const { o, s } = x;
     const w = swapRow(o.id, params.wid);
+    x.need('swaps.decide', h.get('SELECT department_id FROM org_shifts WHERE id = ?', w.shift_id)?.department_id ?? null);
     if (!['offered', 'claimed'].includes(w.status)) bad(`That swap is already ${w.status}.`);
     const approve = V.bool(body.approve, 'Approve');
     if (approve) {
@@ -1480,23 +1538,24 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     });
   }
   OR('GET', '/v1/orgs/:id/budgets', ({ me, params, query }) => {
-    const { o, s, tz, admin } = asOrg(params.id, me, 'manager');
+    const x = asOrg(params.id, me, 'budgets.view'); const { o, s, tz } = x; const admin = x.can('budgets.costs', null);
     const t = today(tz);
     const from = date(query.from ?? addDays(t, -31), 'From'), to = date(query.to ?? addDays(t, 93), 'To');
     // Managers: the budgets and hours only, under `plans` (budgets and unbudgeted stay empty, so an older Kea shows
     // no cost figures rather than breaking on missing ones).
     if (!admin) {
       const cost = laborCost(o, zonedToUtc(from, '00:00', o.tz), zonedToUtc(addDays(to, 1), '00:00', o.tz));
-      return { budgets: [], unbudgeted: [], warnPct: s.budgetWarnPct, costHidden: true, plans: budgetRows(o, s, from, to).map(budgetForManager),
-        hoursByDepartment: [...cost.entries()].map(([d, c]) => ({ departmentId: d, hours: Math.round(c.hours * 10) / 10 })) };
+      return { budgets: [], unbudgeted: [], warnPct: s.budgetWarnPct, costHidden: true, plans: budgetRows(o, s, from, to).filter((b) => x.can('budgets.view', b.departmentId)).map(budgetForManager),
+        hoursByDepartment: [...cost.entries()].filter(([d]) => x.can('budgets.view', d ?? null)).map(([d, c]) => ({ departmentId: d, hours: Math.round(c.hours * 10) / 10 })) };
     }
     // Departments without a budget still show what they're scheduled to cost.
     const cost = laborCost(o, zonedToUtc(from, '00:00', o.tz), zonedToUtc(addDays(to, 1), '00:00', o.tz));
     return { budgets: budgetRows(o, s, from, to), unbudgeted: [...cost.entries()].map(([d, c]) => ({ departmentId: d, scheduled: c.scheduled / 100, published: c.published / 100, hours: Math.round(c.hours * 10) / 10 })), warnPct: s.budgetWarnPct };
   });
   OR('POST', '/v1/orgs/:id/budgets', ({ me, params, body, ip }) => {
-    const { o } = asOrg(params.id, me, 'admin');
+    const x = asOrg(params.id, me, 'budgets.edit'); const { o } = x;
     const d = deptRow(o.id, body.departmentId);
+    x.need('budgets.edit', d.id);
     const start = date(body.periodStart, 'Start'), end = date(body.periodEnd, 'End');
     if (end < start) bad('The end must be on or after the start.');
     const bid = id();
@@ -1506,14 +1565,16 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { status: 201, body: { id: bid } };
   });
   OR('POST', '/v1/orgs/:id/budgets/:bid/delete', ({ me, params }) => {
-    const { o } = asOrg(params.id, me, 'admin');
+    const x = asOrg(params.id, me, 'budgets.edit'); const { o } = x;
+    const b = h.get('SELECT department_id FROM org_budgets WHERE id = ? AND org_id = ?', params.bid, o.id);
+    if (b) x.need('budgets.edit', b.department_id);
     h.run('DELETE FROM org_budgets WHERE id = ? AND org_id = ?', params.bid, o.id);
     return { ok: true };
   });
 
   // ---------- acknowledgments ----------
   OR('POST', '/v1/orgs/:id/policies', ({ me, params, body }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'policies.manage');
     const pid = id();
     capRows('org_policies', o.id, 1000, 'acknowledgments');
     h.run('INSERT INTO org_policies (id,org_id,title,body,url,due_on,audience,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)', pid, o.id, V.str(body.title, 'Title', { min: 1, max: 120 }),
@@ -1521,7 +1582,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { status: 201, body: { id: pid } };
   });
   OR('GET', '/v1/orgs/:id/policies', ({ me, params }) => {
-    const { o, mgr } = asOrg(params.id, me);
+    const x = asOrg(params.id, me); const { o } = x; const mgr = x.can('policies.manage');
     return { policies: h.all('SELECT * FROM org_policies WHERE org_id = ? ORDER BY created_at DESC', o.id).filter((p) => mgr || inAudience(o, p, me.id)).map((p) => ({
       id: p.id, title: p.title, body: p.body, url: p.url, dueOn: p.due_on, audience: J(p.audience, {}),
       ackedAt: h.get('SELECT at FROM org_policy_acks WHERE policy_id = ? AND account_id = ?', p.id, me.id)?.at ?? null,
@@ -1535,7 +1596,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
     return { ok: true };
   });
   OR('POST', '/v1/orgs/:id/policies/:pid/delete', ({ me, params }) => {
-    const { o } = asOrg(params.id, me, 'manager');
+    const { o } = asOrg(params.id, me, 'policies.manage');
     h.run('DELETE FROM org_policies WHERE id = ? AND org_id = ?', params.pid, o.id);
     return { ok: true };
   });
@@ -1551,7 +1612,10 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
       const s = orgSettings(o);
       const td = today(o.tz);
       const push = (kind, idPart, x) => { if (s.todoKinds[kind] !== false) items.push({ key: `${o.id}:${kind}:${idPart}`, kind, orgId: o.id, orgName: o.name, ...x }); };
-      const mgr = RANK[m.role] >= RANK.manager, admin = RANK[m.role] >= RANK.admin;
+      const eff = core.effOf(o.id, me.id);
+      const may = (a, d) => canDo(eff, a, d);
+      const mgr = ['forms.manage', 'people.approve', 'swaps.decide', 'schedule.edit', 'certs.manage', 'budgets.costs'].some((a) => may(a));
+      const admin = may('budgets.costs', null);
 
       // Availability forms waiting for me.
       for (const f of h.all("SELECT * FROM org_forms WHERE org_id = ? AND status = 'open' AND period_end >= ?", o.id, td)) {
@@ -1586,7 +1650,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
         push('cert', t.id, { title: `You need ${t.name}`, detail: 'Required for your position', dueAt: null, overdue: false, stage: 'missing', urgency: 2, action: { type: 'cert', typeId: t.id, classId: cls?.class_id ?? null } });
       }
       // Assigned classes and their next sessions.
-      for (const x of h.all("SELECT x.*, c.title FROM org_class_assignments x JOIN classes c ON c.id = x.class_id WHERE x.org_id = ? AND x.account_id = ? AND x.completed_on IS NULL AND c.status = 'active'", o.id, me.id)) {
+      if (classes) for (const x of h.all("SELECT x.*, c.title FROM org_class_assignments x JOIN classes c ON c.id = x.class_id WHERE x.org_id = ? AND x.account_id = ? AND x.completed_on IS NULL AND c.status = 'active'", o.id, me.id)) {
         const ns = nextSession(x.class_id);
         const due = x.due_on ? endOfDay(x.due_on, o.tz) : ns?.start_at ?? null;
         push('class', x.class_id, { title: `Class: ${x.title}`, detail: ns ? `Next session ${new Date(ns.start_at).toISOString()}` : x.due_on ? `Finish by ${x.due_on}` : 'Assigned to you',
@@ -1607,7 +1671,7 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
 
       if (!mgr) continue;
       // Managers: forms with people missing, approvals waiting, budget warnings, staff with expired certs.
-      for (const f of h.all("SELECT * FROM org_forms WHERE org_id = ? AND status = 'open' AND deadline_at IS NOT NULL", o.id)) {
+      if (may('forms.manage')) for (const f of h.all("SELECT * FROM org_forms WHERE org_id = ? AND status = 'open' AND deadline_at IS NOT NULL", o.id)) {
         const aud = audienceOf(o, f);
         const done = new Set(h.all('SELECT account_id FROM org_responses WHERE form_id = ? AND submitted_at IS NOT NULL', f.id).map((r) => r.account_id));
         const missing = aud.filter((a) => !done.has(a.account_id)).length;
@@ -1616,21 +1680,21 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
         if (!past && f.deadline_at - t0 > 3 * 86400_000) continue;
         push('missing', f.id, { title: past ? `${missing} ${missing === 1 ? 'person hasn’t' : 'people haven’t'} sent availability` : `${missing} still to answer: ${f.title}`, detail: f.title, dueAt: f.deadline_at, overdue: past, urgency: past ? 2 : 1, action: { type: 'formPeople', formId: f.id } });
       }
-      const joins = h.get("SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND status = 'pending'", o.id).n;
-      const changes = h.get("SELECT COUNT(*) AS n FROM org_response_changes c JOIN org_forms f ON f.id = c.form_id WHERE f.org_id = ? AND c.status = 'pending'", o.id).n;
-      const swaps = h.get("SELECT COUNT(*) AS n FROM org_swaps WHERE org_id = ? AND status = 'claimed'", o.id).n;
+      const joins = !may('people.approve') ? 0 : h.get("SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND status = 'pending'", o.id).n;
+      const changes = !may('forms.manage') ? 0 : h.get("SELECT COUNT(*) AS n FROM org_response_changes c JOIN org_forms f ON f.id = c.form_id WHERE f.org_id = ? AND c.status = 'pending'", o.id).n;
+      const swaps = !may('swaps.decide') ? 0 : h.get("SELECT COUNT(*) AS n FROM org_swaps WHERE org_id = ? AND status = 'claimed'", o.id).n;
       if (joins + changes + swaps) {
         const parts = [joins && `${joins} to join`, changes && `${changes} availability ${changes === 1 ? 'change' : 'changes'}`, swaps && `${swaps} ${swaps === 1 ? 'swap' : 'swaps'}`].filter(Boolean);
         push('approvals', 'all', { title: `${joins + changes + swaps} waiting for approval`, detail: parts.join(', '), dueAt: null, overdue: false, urgency: 2, counts: { joins, changes, swaps }, action: { type: 'approvals' } });
       }
-      const drafts = h.all("SELECT d.id, sc.title, sc.id AS sid FROM org_drafts d JOIN org_schedules sc ON sc.id = d.schedule_id WHERE sc.org_id = ? AND d.status = 'waiting'", o.id);
+      const drafts = !may('schedule.edit') ? [] : h.all("SELECT d.id, sc.title, sc.id AS sid FROM org_drafts d JOIN org_schedules sc ON sc.id = d.schedule_id WHERE sc.org_id = ? AND d.status = 'waiting'", o.id);
       for (const d of drafts) push('drafts', d.id, { title: 'A schedule draft is waiting for review', detail: d.title, dueAt: null, overdue: false, urgency: 1, action: { type: 'schedule', scheduleId: d.sid } });
       // (Budget warnings are cost figures: admins only.)
       if (admin) for (const b of budgetRows(o, s, td, addDays(td, 62)).filter((x) => x.current && x.warn))
         push('budget', b.id, { title: b.over ? `${b.departmentName} is over budget` : `${b.departmentName} is at ${b.pct}% of budget`, detail: `${b.periodStart} to ${b.periodEnd}: $${b.scheduled.toFixed(2)} of $${b.amount.toFixed(2)}`, dueAt: endOfDay(b.periodStart < td ? td : b.periodStart, o.tz), overdue: b.over, urgency: b.over ? 2 : 1, action: { type: 'budgets' } });
       const blocked = new Set();
       const tlist = [...types.values()];
-      for (const r of membersOf(o.id)) {
+      if (may('certs.manage')) for (const r of membersOf(o.id)) {
         const pos = positionsOf(o.id, r.account_id);
         for (const t of tlist) {
           if (!J(t.positions, []).some((p) => pos.includes(p))) continue;
@@ -1649,11 +1713,15 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
   OR('GET', '/v1/orgs-export', ({ me }) => ({
     exportedAt: new Date(now()).toISOString(),
     memberships: h.all('SELECT m.*, o.name AS org_name FROM org_members m JOIN orgs o ON o.id = m.org_id WHERE m.account_id = ?', me.id)
-      .map((m) => ({ orgId: m.org_id, org: m.org_name, role: m.role, status: m.status, title: m.title, birthdate: m.birthdate, desiredMin: m.desired_min, desiredMax: m.desired_max, usualWeek: J(m.usual_week, {}), joinedAt: m.joined_at, positionIds: positionsOf(m.org_id, me.id) })),
+      .map((m) => ({ orgId: m.org_id, org: m.org_name, role: core.legacyFor(m.org_id, me.id), roles: core.assignmentsOut(m.org_id, me.id), status: m.status, title: m.title, birthdate: m.birthdate, desiredMin: m.desired_min, desiredMax: m.desired_max, usualWeek: J(m.usual_week, {}), joinedAt: m.joined_at, positionIds: positionsOf(m.org_id, me.id) })),
     availability: h.all('SELECT r.*, f.title, f.org_id FROM org_responses r JOIN org_forms f ON f.id = r.form_id WHERE r.account_id = ?', me.id).map((r) => ({ orgId: r.org_id, form: r.title, ...responseOut(r) })),
     certs: h.all('SELECT c.*, t.name FROM org_certs c LEFT JOIN org_cert_types t ON t.id = c.type_id WHERE c.account_id = ?', me.id).map((c) => ({ orgId: c.org_id, name: c.name, issuedOn: c.issued_on, expiresOn: c.expires_on })),
     shifts: h.all('SELECT org_id, date, start_at, end_at, status FROM org_shifts WHERE account_id = ? ORDER BY start_at', me.id),
     swaps: h.all('SELECT org_id, shift_id, status, created_at FROM org_swaps WHERE from_account = ? OR claimant = ?', me.id, me.id),
+    timeClock: {
+      punches: h.all('SELECT org_id, type, at, source, shift_id FROM org_punches WHERE account_id = ? ORDER BY at', me.id),
+      timeOff: h.all('SELECT org_id, kind, start_date, end_date, hours, status FROM org_time_off WHERE account_id = ? ORDER BY start_date', me.id),
+    },
     acknowledgments: h.all('SELECT a.at, p.title, p.org_id FROM org_policy_acks a JOIN org_policies p ON p.id = a.policy_id WHERE a.account_id = ?', me.id),
   }), { terms: false });
   OR('POST', '/v1/todo/snooze', ({ me, body }) => {
@@ -1666,46 +1734,53 @@ export function mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, 
 
   /** A suspended organization's classes: archived, and their invite codes revoked (managers can reopen them later). */
   function shutClasses(oid) {
-    h.tx(() => {
+    if (!classes) return;
+    tx(() => {
       h.run("UPDATE classes SET status = 'archived' WHERE org_id = ? OR id IN (SELECT class_id FROM org_classes WHERE org_id = ?)", oid, oid);
       h.run('UPDATE invites SET revoked = 1 WHERE class_id IN (SELECT id FROM classes WHERE org_id = ?) OR class_id IN (SELECT class_id FROM org_classes WHERE org_id = ?)', oid, oid);
     });
   }
 
-  // ================= owner console: orgs hosted on the Hub =================
-  O('GET', '/owner/orgs', ({ query }) => ({
-    orgs: h.all(`SELECT o.*, a.email AS creator FROM orgs o JOIN accounts a ON a.id = o.created_by${query.status ? ' WHERE o.status = ?' : ''} ORDER BY o.created_at DESC LIMIT 500`, ...(query.status ? [query.status] : []))
-      .map((o) => ({ id: o.id, name: o.name, kind: o.kind, status: o.status, creator: o.creator, createdAt: o.created_at, note: o.note, members: h.get('SELECT COUNT(*) AS n FROM org_members WHERE org_id = ?', o.id).n })),
-    autoApprove: getSetting('orgs', {}).autoApprove === true,
-  }));
-  O('POST', '/owner/orgs/settings', ({ body }) => { setSetting('orgs', { ...getSetting('orgs', {}), autoApprove: V.bool(body.autoApprove, 'autoApprove') }); return { autoApprove: getSetting('orgs', {}).autoApprove }; });
-  O('POST', '/owner/orgs/:id/decide', ({ params, body }) => {
-    const o = loadOrg(params.id) ?? notFound();
-    const approve = V.bool(body.approve, 'approve');
-    h.run('UPDATE orgs SET status = ?, decided_at = ?, note = ? WHERE id = ?', approve ? 'active' : 'suspended', now(), V.str(body.note, 'note', { optional: true, max: 2000 }), o.id);
-    if (!approve) shutClasses(o.id);
-    audit('owner', approve ? 'owner.org_approve' : 'owner.org_deny', o.id, null, 'local');
-    const why = V.str(body.note, 'note', { optional: true, max: 2000 });
-    if (approve) notify(o.created_by, 'org', `${o.name} is approved on the Kea Hub`, 'Your organization is ready. Make join codes for your people in Work mode.', { note: why, data: { orgId: o.id, approved: true } });
-    else notify(o.created_by, 'org', `${o.name} wasn’t approved on the Kea Hub`, 'Organizations can also run their own KeaS server.', { note: why, data: { orgId: o.id, approved: false } });
-    return { ok: true };
-  });
-  O('POST', '/owner/orgs/:id/status', ({ params, body }) => {
-    const o = loadOrg(params.id) ?? notFound();
-    const st = V.enum(body.status, 'status', ['active', 'suspended']);
-    h.run('UPDATE orgs SET status = ?, note = COALESCE(?, note) WHERE id = ?', st, V.str(body.note, 'note', { optional: true, max: 2000 }), o.id);
-    if (st === 'suspended') { h.run('UPDATE org_codes SET revoked = 1 WHERE org_id = ?', o.id); shutClasses(o.id); }
-    audit('owner', `owner.org_${st}`, o.id, null, 'local');
-    return { ok: true };
-  });
-  O('POST', '/owner/orgs/:id/codes/revoke', ({ params }) => {
-    const o = loadOrg(params.id) ?? notFound();
-    const r = h.run('UPDATE org_codes SET revoked = 1 WHERE org_id = ? AND revoked = 0', o.id);
-    audit('owner', 'owner.org_codes_revoke', o.id, null, 'local');
-    return { revoked: Number(r.changes) };
-  });
+  // ================= the server operator's console: approving and suspending organizations =================
+  if (O) {
+    const op = operator ?? { autoApprove: () => false, setAutoApprove: () => {} };
+    O('GET', '/owner/orgs', ({ query }) => {
+      const rows = h.all(`SELECT o.* FROM orgs o${query.status ? ' WHERE o.status = ?' : ''} ORDER BY o.created_at DESC LIMIT 500`, ...(query.status ? [query.status] : []));
+      const p = core.profilesOf(rows.map((o) => o.created_by));
+      return {
+        orgs: rows.map((o) => ({ id: o.id, name: o.name, kind: o.kind, status: o.status, creator: p.get(o.created_by)?.email ?? null, createdAt: o.created_at, note: o.note, members: h.get('SELECT COUNT(*) AS n FROM org_members WHERE org_id = ?', o.id).n })),
+        autoApprove: op.autoApprove() === true,
+      };
+    });
+    O('POST', '/owner/orgs/settings', ({ body }) => { op.setAutoApprove(V.bool(body.autoApprove, 'autoApprove')); return { autoApprove: op.autoApprove() === true }; });
+    O('POST', '/owner/orgs/:id/decide', ({ params, body }) => {
+      const o = loadOrg(params.id) ?? notFound();
+      const approve = V.bool(body.approve, 'approve');
+      h.run('UPDATE orgs SET status = ?, decided_at = ?, note = ? WHERE id = ?', approve ? 'active' : 'suspended', now(), V.str(body.note, 'note', { optional: true, max: 2000 }), o.id);
+      if (!approve) shutClasses(o.id);
+      audit('owner', approve ? 'owner.org_approve' : 'owner.org_deny', o.id, null, 'local');
+      const why = V.str(body.note, 'note', { optional: true, max: 2000 });
+      if (approve) notify(o.created_by, 'org', `${o.name} is approved on the Kea Hub`, 'Your organization is ready. Make join codes for your people in Work mode.', { note: why, data: { orgId: o.id, approved: true } });
+      else notify(o.created_by, 'org', `${o.name} wasn’t approved on the Kea Hub`, 'Organizations can also run their own KeaS server.', { note: why, data: { orgId: o.id, approved: false } });
+      return { ok: true };
+    });
+    O('POST', '/owner/orgs/:id/status', ({ params, body }) => {
+      const o = loadOrg(params.id) ?? notFound();
+      const st = V.enum(body.status, 'status', ['active', 'suspended']);
+      h.run('UPDATE orgs SET status = ?, note = COALESCE(?, note) WHERE id = ?', st, V.str(body.note, 'note', { optional: true, max: 2000 }), o.id);
+      if (st === 'suspended') { h.run('UPDATE org_codes SET revoked = 1 WHERE org_id = ?', o.id); shutClasses(o.id); }
+      audit('owner', `owner.org_${st}`, o.id, null, 'local');
+      return { ok: true };
+    });
+    O('POST', '/owner/orgs/:id/codes/revoke', ({ params }) => {
+      const o = loadOrg(params.id) ?? notFound();
+      const r = h.run('UPDATE org_codes SET revoked = 1 WHERE org_id = ? AND revoked = 0', o.id);
+      audit('owner', 'owner.org_codes_revoke', o.id, null, 'local');
+      return { revoked: Number(r.changes) };
+    });
+  }
 
-  return { todoFor };
+  return { todoFor, removeMember, deptRow, positionRow, capRows, memberOut, orgOut, rulesFor, date, num, list, cents };
 }
 
 export { DAY_NAMES, fmtRange, datesIn, daysUntil };

@@ -11,7 +11,7 @@ import { createHub } from '../../hub/index.mjs';
 import { ownerFetch, ownerSign } from '../../hub/lib/ownerauth.mjs';
 import { codeAt, stepOf } from '../../hub/lib/totp.mjs';
 import { cleanText, isReservedName } from '../../hub/lib/names.mjs';
-import { cell } from '../../hub/org/logic.mjs';
+import { cell } from '../../org/logic.mjs';
 import { rotateOwnerKey } from '../../hub/owner.mjs';
 import { createHashPool } from '../../hub/lib/hashpool.mjs';
 import { createHubLog } from '../../hub/lib/hublog.mjs';

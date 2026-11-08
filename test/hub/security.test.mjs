@@ -10,7 +10,7 @@ import { createHub } from '../../hub/index.mjs';
 import { ownerFetch } from '../../hub/lib/ownerauth.mjs';
 import { clientAddress, cleanIp, ipBucket } from '../../hub/lib/clientip.mjs';
 import { failures, globalLockFor, GLOBAL_FREE, GLOBAL_IPS, GLOBAL_MAX_LOCK_MS } from '../../hub/lib/limiter.mjs';
-import { payrollKey, payrollValue, checkNoPayroll, MAX_NODES } from '../../hub/org/payroll.mjs';
+import { payrollKey, payrollValue, checkNoPayroll, MAX_NODES } from '../../org/payroll.mjs';
 
 test('a record id is never taken for an SSN (the org tests that failed now and then: about 1% of random ids did)', () => {
   assert.equal(payrollValue('0f3a2b1c-9d8e-4f7a-8b6c-a123456789bc'), false);

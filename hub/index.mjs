@@ -32,7 +32,8 @@ import { createHubLog } from './lib/hublog.mjs';
 import { FLOW_DEFAULTS, jsonParts } from './lib/flow.mjs';
 import { clientAddress, ipBucket, isLoopback } from './lib/clientip.mjs';
 import { scoreAnswer, capped, levelOf, weekStart, dayKey, streak } from './lib/study.mjs';
-import { mountOrgs } from './org/routes.mjs';
+import { mountOrg } from '../org/index.mjs';
+import { hubIdentity } from './orgIdentity.mjs';
 
 // The version the Hub reports (/v1/health; Kea reads it to tell which Hub it talks to). It comes from KeaS's own
 // package.json, or from version.txt beside the before-sign-in copy, so a release can't leave it behind.
@@ -781,13 +782,10 @@ export function createHub({
   // parent sign-offs, study progress and points, shared-Claude jobs and requests, flags, class/section/org memberships,
   // and its rows in organization tables. Audit rows are kept but anonymized (no account id, address or details).
   // Refused while it would leave an organization or a class with members but no owner: hand those over first.
+  let orgEngine = null; // (mounted with the other routes below)
   function deleteAccount(a, by, ip) {
     const blockers = [];
-    for (const o of h.all("SELECT o.id, o.name FROM org_members m JOIN orgs o ON o.id = m.org_id WHERE m.account_id = ? AND m.role = 'owner'", a.id)) {
-      const otherOwners = h.get("SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND role = 'owner' AND account_id != ?", o.id, a.id).n;
-      const others = h.get('SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND account_id != ?', o.id, a.id).n;
-      if (!otherOwners && others) blockers.push({ kind: 'org', id: o.id, name: o.name });
-    }
+    for (const o of orgEngine.soleOwnerOrgs(a.id)) blockers.push({ kind: 'org', id: o.id, name: o.name });
     for (const c of h.all('SELECT * FROM classes WHERE owner_id = ?', a.id)) {
       const heir = h.get("SELECT 1 FROM class_members WHERE class_id = ? AND role = 'instructor' AND account_id != ?", c.id, a.id);
       const others = h.get('SELECT COUNT(*) AS n FROM class_members WHERE class_id = ? AND account_id != ?', c.id, a.id).n;
@@ -800,8 +798,8 @@ export function createHub({
     h.tx(() => {
       // Organizations they made: handed to another owner (or member), or deleted when they were its only member.
       for (const o of h.all('SELECT id FROM orgs WHERE created_by = ?', a.id)) {
-        const heir = h.get("SELECT account_id FROM org_members WHERE org_id = ? AND account_id != ? ORDER BY CASE role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, joined_at LIMIT 1", o.id, a.id);
-        if (heir) h.run('UPDATE orgs SET created_by = ? WHERE id = ?', heir.account_id, o.id);
+        const heir = orgEngine.heirOf(o.id, a.id);
+        if (heir) h.run('UPDATE orgs SET created_by = ? WHERE id = ?', heir, o.id);
         else h.run('DELETE FROM orgs WHERE id = ?', o.id);
       }
       // Classes they made: to another instructor, or deleted when nobody else is in them.
@@ -810,7 +808,9 @@ export function createHub({
         if (heir) h.run('UPDATE classes SET owner_id = ? WHERE id = ?', heir.account_id, c.id);
         else h.run('DELETE FROM classes WHERE id = ?', c.id);
       }
-      // Every table that keeps rows per account (organization tables too, some of which have no foreign key).
+      // Their rows in organization tables (punches included, which nothing else may delete), then every other table
+      // that keeps rows per account.
+      orgEngine.forgetAccount(a.id);
       for (const { name } of h.all("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT IN ('accounts','audit') AND name NOT LIKE 'sqlite_%'")) {
         const cols = new Set(h.db.prepare(`PRAGMA table_info("${name}")`).all().map((c) => c.name));
         if (name === 'org_shifts' && cols.has('account_id')) { h.db.prepare('UPDATE org_shifts SET account_id = NULL WHERE account_id = ?').run(a.id); continue; }
@@ -1079,7 +1079,7 @@ export function createHub({
       courseJoinRequests: () => h.all('SELECT course_key, label, status, created_at, decided_at FROM course_join_requests WHERE account_id = ? ORDER BY created_at', me.id),
       // Course files that came from scans you started (shared with your section).
       contributedCourseFiles: () => h.all('SELECT cf.course_key, cf.path, cf.size, cf.updated_at FROM course_files cf JOIN course_materials cm ON cm.course_key = cf.course_key JOIN scan_jobs j ON j.id = cm.first_job_id WHERE j.account_id = ? ORDER BY cf.course_key, cf.path', me.id),
-      orgs: () => h.all('SELECT org_id, role, status, joined_at FROM org_members WHERE account_id = ?', me.id),
+      orgs: () => orgEngine.membershipsOf(me.id),
       activity: () => h.all('SELECT at, action, target, ip FROM audit WHERE actor = ? ORDER BY id DESC LIMIT 5000', me.id),
     }), CHUNK),
   }), { terms: false, basic: true });
@@ -2511,8 +2511,14 @@ export function createHub({
     const sp = spaces.course(runningJob(params.id).course_key);
     return rawOut(spaceRead(sp, spaceRow(sp, String(query.path ?? '')) ?? notFound()));
   });
-  // Organizations (hub/org/): members and codes, structure, budgets, certs, availability, schedules, the to-do box.
-  mountOrgs({ R, O, h, V, now, audit, limit, normCode, HttpError, bad, forbidden, notFound, rawOut, notify, extrasFor });
+  // Organizations (the org engine, org/): members, roles and codes, structure, budgets, certs, availability,
+  // schedules, the time clock, the to-do box. People are Hub accounts (hub/orgIdentity.mjs).
+  orgEngine = mountOrg({
+    R, O, h, now, audit, notify, classes: true,
+    identity: hubIdentity({ h, now, extrasFor, getSetting }),
+    operator: { autoApprove: () => getSetting('orgs', {}).autoApprove === true, setAutoApprove: (v) => setSetting('orgs', { ...getSetting('orgs', {}), autoApprove: v }) },
+    kit: { HttpError, V, limit, normCode, rawOut },
+  });
 
   // ================= request handling =================
   // Where requests come from: see hub/lib/clientip.mjs for what the tunnel sends and what is trusted.

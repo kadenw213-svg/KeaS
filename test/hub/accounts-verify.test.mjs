@@ -140,7 +140,7 @@ test('declining an unverified request removes it; approving one without verifyin
   // Still can't make an organization of their own.
   assert.equal((await call('POST', '/v1/orgs', b.token, { name: 'Mine' })).status, 403);
   // Joining doesn't make anyone a verifier: an unverified manager can't verify others.
-  hub.h.run("UPDATE org_members SET role = 'manager' WHERE org_id = ? AND account_id = ?", org.id, b.id);
+  hub.h.run("UPDATE org_role_assignments SET role_id = (SELECT id FROM org_roles WHERE org_id = ? AND template_key = 'manager') WHERE org_id = ? AND account_id = ?", org.id, org.id, b.id);
   const c = await person('cy@mail.com', 'Cy Unverified', { verified: false });
   ok(await call('POST', '/v1/orgs/join', c.token, { code: memberCode }));
   const refused = await call('POST', `/v1/orgs/${org.id}/members/${c.id}/verify-email`, b.token, {});
