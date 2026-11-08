@@ -489,3 +489,17 @@ test('tailscale: up keeps running unattended on Windows; Funnel off removes only
   assert.equal(ts.servesPort(mine, 4850), false, 'someone else’s Funnel is left alone');
   assert.equal(ts.servesPort({ Web: mine.Web }, 4860), false, 'served on the tailnet only is not a Funnel');
 });
+
+test('tailscale: on a PC where another program has Funnel’s https 443 (the Kea account server), KeaS takes 8443, and its address says so', () => {
+  const ts = require('../../desktop/tailscale.cjs');
+  const keac = { AllowFunnel: { 'pc.tail.ts.net:443': true }, Web: { 'pc.tail.ts.net:443': { Handlers: { '/': { Proxy: 'http://127.0.0.1:4870' } } } } };
+  assert.equal(ts.freePortFor({}, 4860), 443, 'a free PC: 443');
+  assert.equal(ts.freePortFor(keac, 4860), 8443, 'never another program’s 443');
+  assert.equal(ts.servesPort(keac, 4860), false);
+  const both = { AllowFunnel: { ...keac.AllowFunnel, 'pc.tail.ts.net:8443': true }, Web: { ...keac.Web, 'pc.tail.ts.net:8443': { Handlers: { '/': { Proxy: 'http://127.0.0.1:4860' } } } } };
+  assert.deepEqual([ts.funnelPortOf(both, 4860), ts.freePortFor(both, 4860), ts.servesPort(both, 4860)], [8443, 8443, true]);
+  assert.equal(ts.addressOf('pc.tail.ts.net', 8443), 'https://pc.tail.ts.net:8443');
+  assert.equal(ts.addressOf('pc.tail.ts.net', 443), 'https://pc.tail.ts.net');
+  const full = { AllowFunnel: {}, Web: Object.fromEntries([443, 8443, 10000].map((p) => [`pc.tail.ts.net:${p}`, { Handlers: { '/': { Proxy: `http://127.0.0.1:${p + 1}` } } }])) };
+  assert.equal(ts.freePortFor(full, 4860), null);
+});
