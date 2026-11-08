@@ -101,7 +101,7 @@ function sameOrigin(req, origins) {
  */
 export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = process.env.KEAS_WEB_DIR || DEFAULT_WEB_DIR, log = true, now = () => Date.now(),
   vault: vaultMode = process.env.KEAS_VAULT === '1', hubUrl = process.env.KEAS_HUB_URL || null, sharedDir = SHARED, passphrase = process.env.KEAS_VAULT_PASSPHRASE || null, fetchImpl = globalThis.fetch,
-  localSignIn = false, hubTrustKeys = null, devKeyFile = dbFile === DEFAULT_DB || dbFile === ':memory:' || process.env.KEAS_DEV_KEYFILE === '1',
+  localSignIn = false, hubTrustKeys = null, serverIssuer = null, publishStubs = null, devKeyFile = dbFile === DEFAULT_DB || dbFile === ':memory:' || process.env.KEAS_DEV_KEYFILE === '1',
   demo = process.env.KEAS_DEV_DEMO === '1', publicHosts = [], setupToken = undefined, onVaultLock = null, engineFeed = null } = {}) {
   const demoOn = !!demo && !vaultMode;
   const vaultSetupToken = !vaultMode || setupToken === false ? null : setupToken || process.env.KEAS_VAULT_SETUP_TOKEN || randomBytes(32).toString('base64url');
@@ -571,6 +571,12 @@ export function createApp({ dbFile = process.env.KEA_DB || DEFAULT_DB, webDir = 
     localSignIn: typeof localSignIn === 'function' ? localSignIn : () => !!localSignIn,
     // This PC's own Hub's public key (from the KeaS app, when this PC is the Hub): the Hub must prove it holds it.
     hubTrustKeys: typeof hubTrustKeys === 'function' ? hubTrustKeys : () => hubTrustKeys,
+    // A KeaS server on this PC (KeaS 0.6): its tokens' issuer, 'keas:<server id>'. Payroll then signs in only with the
+    // 15-minute token that server signs for the KeaS app's session (hub/index.mjs /owner/payroll-token), checked
+    // against hubTrustKeys (the server's identity key, read from its data folder), and never relays a password.
+    serverIssuer: typeof serverIssuer === 'function' ? serverIssuer : () => serverIssuer,
+    // Finalized stubs go to each member through the org engine (org/stubs.mjs), when the KeaS app gives a way there.
+    publishStubs: typeof publishStubs === 'function' ? publishStubs : null,
     setupToken: vaultSetupToken,
     // The KeaS app forgets the passphrase it kept for this run when the vault locks (after a quiet spell, or Lock).
     onVaultLock: typeof onVaultLock === 'function' ? onVaultLock : null,

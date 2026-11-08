@@ -9,10 +9,10 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import { createHub } from '../../hub/index.mjs';
-import { openDb } from '../../hub/db.mjs';
-import { ownerFetch } from '../../hub/lib/ownerauth.mjs';
-import { codeAt, stepOf } from '../../hub/lib/totp.mjs';
+import { createHub } from '../../hub/legacy/index.mjs';
+import { openDb } from '../../hub/legacy/db.mjs';
+import { ownerFetch } from '../../hub/legacy/lib/ownerauth.mjs';
+import { codeAt, stepOf } from '../../hub/legacy/lib/totp.mjs';
 
 let hub, base, ownerBase, dir;
 let clock = Date.UTC(2026, 10, 7, 15);
@@ -160,7 +160,7 @@ test('make-owner (node hub/owner.mjs) ends the account’s earlier sign-ins', as
   clock += 30_000;
   ok(await login(p.email, codeAt(t.secret, stepOf(clock))));
   assert.equal(hub.h.get('SELECT COUNT(*) AS n FROM sessions WHERE account_id = ?', p.id).n, 2);
-  const script = fileURLToPath(new URL('../../hub/owner.mjs', import.meta.url));
+  const script = fileURLToPath(new URL('../../hub/legacy/owner.mjs', import.meta.url));
   const out = execFileSync(process.execPath, [script, 'make-owner', p.email], { env: { ...process.env, KEA_HUB_DATA: dir }, encoding: 'utf8' });
   assert.match(out, /is now the Hub owner/);
   assert.match(out, /Signed out of 2 places/);

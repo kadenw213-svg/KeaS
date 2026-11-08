@@ -56,8 +56,15 @@ export function makeEngineSource({ h, feed, uid, now, iso }) {
     /** The engine's record for a vault person for this period (null when it isn't loaded or they aren't a member). */
     memberFor: (person, period) => (covers(period) ? cache.byPerson.get(person.id) ?? null : null),
     codeOf: (id) => cache?.codes.get(id) ?? null,
+    /** A code's rate on a local date: the newest change on or before it (an older feed without history: its rate). */
+    rateOn(id, date) {
+      const c = cache?.codes.get(id);
+      if (!c) return null;
+      if (!Array.isArray(c.rates) || !c.rates.length) return c.rateCents;
+      return c.rates.reduce((cur, x) => (x.from == null || x.from <= date ? x.rateCents : cur), c.rates[0].rateCents);
+    },
     /** A person's default code's rate (for holidays and paid time off when the vault has no rate of its own). */
-    defaultRateOf(person, period) { const m = covers(period) ? cache.byPerson.get(person.id) : null; return m?.defaultCodeId ? cache.codes.get(m.defaultCodeId)?.rateCents ?? null : null; },
+    defaultRateOf(person, period) { const m = covers(period) ? cache.byPerson.get(person.id) : null; return m?.defaultCodeId ? this.rateOn(m.defaultCodeId, period.end) : null; },
     org: () => cache?.feed.org ?? null,
     status: () => ({ loaded: cache ? { from: cache.from, to: cache.to, at: iso(cache.at), people: cache.feed.people.length, codes: cache.feed.codes.length } : null, error: lastError }),
     people: (org) => byName(h.all('SELECT id, name FROM people WHERE org_id = ? AND kea_account_id IS NOT NULL', org.id)),

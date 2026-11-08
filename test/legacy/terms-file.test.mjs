@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createHub } from '../../hub/index.mjs';
+import { createHub } from '../../hub/legacy/index.mjs';
 
-const shipped = JSON.parse(readFileSync(new URL('../../hub/terms/terms.json', import.meta.url), 'utf8'));
+const shipped = JSON.parse(readFileSync(new URL('../../hub/legacy/terms/terms.json', import.meta.url), 'utf8'));
 
 test('the terms file: published once, again when an update changes it, and owner-published terms stay until then', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'kea-terms-file-'));

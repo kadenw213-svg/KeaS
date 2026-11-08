@@ -1,119 +1,17 @@
+// Pure pieces of the KeaS server: signed tokens, limits, backup sealing, client addresses, the payroll guard, CSV cells.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { hashPassword, verifyPassword, needsRehash, passwordProblem } from '../../hub/lib/passwords.mjs';
-import { codeAt, checkCode, base32, unbase32, stepOf } from '../../hub/lib/totp.mjs';
 import { loadOrCreateKey, signToken, verifyToken } from '../../hub/lib/tokens.mjs';
-import { Windows, lockFor, FREE, MAX_LOCK_MS } from '../../hub/lib/limiter.mjs';
-import { scoreAnswer, POINTS, INTERVAL_DAYS, levelOf, xpForLevel, streak, weekStart, capped, DAILY_CAP } from '../../hub/lib/study.mjs';
+import { Windows, lockFor, FREE, MAX_LOCK_MS, failures, globalLockFor, GLOBAL_FREE, GLOBAL_IPS, GLOBAL_MAX_LOCK_MS } from '../../hub/lib/limiter.mjs';
 import { seal, open } from '../../hub/backup.mjs';
-import { courseKey, decide, isMinor, pickNext, DEFAULTS, limitsFor, cleanOverride, describeOverride, ACCOUNT_LIMITS } from '../../hub/lib/budget.mjs';
-import { normalizePhone, phoneShownIn, fmtBytes, addMonthsUtc, supporterUntil } from '../../hub/lib/account.mjs';
+import { clientAddress, cleanIp, ipBucket } from '../../hub/lib/clientip.mjs';
+import { payrollKey, payrollValue, checkNoPayroll, MAX_NODES } from '../../org/payroll.mjs';
 
-test('claude budget: course keys match however they are typed', () => {
-  assert.equal(courseKey({ school: 'UCCS', code: 'BIO 1010', term: 'Spring 2027', section: '002' }), courseKey({ school: ' uccs ', code: 'bio-1010', term: 'spring  2027', section: '002' }));
-  assert.equal(courseKey({ school: 'UCCS', code: '', term: 'x' }), null);
-});
-
-test('claude budget: decisions', () => {
-  const base = { verified: true, owner: false, birthYear: 1990, year: 2026, parentApproved: false, myQueued: 0, myJobsToday: 0, myJobsThisWeek: 0, myBatchesThisChapter: 0, myBatchesToday: 0 };
-  const d = (kind, f) => decide(kind, {}, { ...base, ...f });
-  assert.equal(d('regenerate').code, 'no_regenerate');
-  assert.equal(decide('regenerate', {}, { ...base, owner: true }).code, 'no_regenerate', 'not even the owner regenerates on the shared queue');
-  assert.equal(d('initial_scan', { verified: false }).code, 'verify');
-  assert.equal(d('initial_scan', {}).action, 'queue');
-  assert.equal(d('initial_scan', { courseHasMaterials: true }).action, 'share');
-  assert.equal(d('initial_scan', { alreadyScannedByMe: true }).code, 'already_scanned');
-  assert.equal(d('initial_scan', { joinJobId: 'j1' }).action, 'join');
-  assert.equal(d('update_scan', { hoursSinceCourseUpdate: 3 }).code, 'cooldown');
-  assert.equal(d('update_scan', { hoursSinceCourseUpdate: 30 }).action, 'queue');
-  assert.equal(d('more_questions', {}).code, 'chapter');
-  assert.equal(d('more_questions', { chapter: 'Ch 3', myBatchesThisChapter: DEFAULTS.questionBatchesPerChapter }).code, 'chapter_cap');
-  assert.equal(d('more_questions', { chapter: 'Ch 3', myBatchesToday: DEFAULTS.questionBatchesPerDay }).code, 'batch_day');
-  assert.equal(d('initial_scan', { myQueued: DEFAULTS.maxQueuedPerAccount }).code, 'queue_full');
-  assert.equal(d('initial_scan', { myJobsToday: DEFAULTS.perAccountDaily }).code, 'day_cap');
-  assert.equal(d('initial_scan', { myJobsThisWeek: DEFAULTS.perAccountWeekly }).code, 'week_cap');
-  assert.equal(decide('initial_scan', { perAccountDaily: 10 }, { ...base, myJobsToday: 5 }).action, 'queue', 'owner settings override defaults');
-  assert.equal(decide('initial_scan', {}, { ...base, owner: true, myJobsToday: 99, verified: false }).action, 'queue', 'the owner has no limits');
-  // Under 18: a parent's or guardian's sign-off first (and the birth year has to be known to tell).
-  assert.equal(d('initial_scan', { birthYear: null }).code, 'birth_year');
-  assert.equal(d('more_questions', { chapter: 'Ch 1', birthYear: 2010 }).code, 'parent_consent');
-  assert.equal(d('more_questions', { chapter: 'Ch 1', birthYear: 2010, parentApproved: true }).action, 'queue');
-  assert.equal(decide('initial_scan', { parentConsentUnder: 0 }, { ...base, birthYear: null }).action, 'queue', 'the owner can turn the check off');
-  assert.equal(decide('initial_scan', {}, { ...base, owner: true, birthYear: 2012 }).action, 'queue', 'not for the owner');
-});
-
-test('claude budget: under 18 by birth year alone', () => {
-  assert.equal(isMinor(2009, 2026), true, 'turns 17 this year');
-  assert.equal(isMinor(2008, 2026), false, 'turns 18 this year');
-  assert.equal(isMinor(null, 2026), false);
-  assert.equal(isMinor(2010, 2026, 0), false, 'check off');
-  assert.equal(isMinor(2012, 2026, 16), true);
-});
-
-test('claude budget: turn order is fair and the owner goes first', () => {
-  const q = [
-    { id: 'a1', account_id: 'a', created_at: 1 }, { id: 'a2', account_id: 'a', created_at: 2 },
-    { id: 'b1', account_id: 'b', created_at: 3 }, { id: 'o1', account_id: 'owner', created_at: 4 },
-  ];
-  const ctx = (o) => ({ doneTodayByAccount: new Map(), ownerIds: new Set(['owner']), globalUsedToday: 0, limits: {}, paused: false, ...o });
-  assert.equal(pickNext(q, ctx()).id, 'o1');
-  const others = q.filter((j) => j.account_id !== 'owner');
-  assert.equal(pickNext(others, ctx({ doneTodayByAccount: new Map([['a', 1]]) })).id, 'b1', 'whoever has had fewer jobs today goes first');
-  assert.equal(pickNext(others, ctx({ paused: true })), null);
-  assert.equal(pickNext(q, ctx({ paused: true })).id, 'o1', 'paused: only the owner');
-  assert.equal(pickNext(others, ctx({ globalUsedToday: DEFAULTS.globalDaily })), null);
-});
-
-const DAY = 86400_000;
-
-test('passwords: argon2id hash verifies, wrong and missing fail, hash format', async () => {
-  const hsh = await hashPassword('correct horse battery');
-  assert.match(hsh, /^argon2id\$m=19456,t=2,p=1\$/);
-  assert.equal(await verifyPassword('correct horse battery', hsh), true);
-  assert.equal(await verifyPassword('correct horse batterz', hsh), false);
-  assert.equal(await verifyPassword('anything', null), false);
-  assert.equal(await verifyPassword('anything', 'garbage'), false);
-  assert.notEqual(await hashPassword('same'), await hashPassword('same'));
-  assert.equal(needsRehash(hsh), false);
-  assert.equal(needsRehash('argon2id$m=4096,t=1,p=1$AAAA$BBBB'), true);
-});
-
-test('passwords: scrypt (used inside the desktop app, where Electron has no Argon2) verifies too', async () => {
-  const s = await hashPassword('correct horse battery', { algorithm: 'scrypt' });
-  assert.match(s, /^scrypt\$n=17,r=8,p=1\$/);
-  assert.equal(await verifyPassword('correct horse battery', s), true);
-  assert.equal(await verifyPassword('correct horse batterz', s), false);
-  assert.equal(await verifyPassword('x', 'scrypt$n=40,r=8,p=1$AAAA$BBBB'), false, 'absurd cost is refused, not run');
-  assert.equal(needsRehash('scrypt$n=14,r=8,p=1$AAAA$BBBB'), true);
-});
-
-test('password rules: length, common list, own email/name', () => {
-  assert.match(passwordProblem('short'), /10 characters/);
-  assert.match(passwordProblem('password123'), /common/);
-  assert.match(passwordProblem('aaaaaaaaaaaa'), /repeated|common/);
-  assert.match(passwordProblem('jordan.lee-is-me', { email: 'jordan.lee@example.com' }), /email/);
-  assert.match(passwordProblem('Kaden Walsh 2026', { name: 'Kaden Walsh' }), /name/);
-  assert.equal(passwordProblem('lantern velvet orbit'), null);
-});
-
-test('TOTP matches the RFC 6238 SHA-1 test vector and refuses replays', () => {
-  const secret = base32(Buffer.from('12345678901234567890'));
-  assert.equal(unbase32(secret).toString(), '12345678901234567890');
-  // RFC 6238 Appendix B: T=59s -> 94287082 (8 digits), so the 6-digit code is 287082.
-  assert.equal(codeAt(secret, stepOf(59_000)), '287082');
-  const t = 1_111_111_109_000; // RFC: 07081804
-  assert.equal(codeAt(secret, stepOf(t)), '081804');
-  const s = checkCode(secret, '081804', t);
-  assert.equal(s, stepOf(t));
-  assert.equal(checkCode(secret, '081804', t, s), null, 'same code twice is refused');
-  assert.equal(checkCode(secret, '081804', t + 30_000), stepOf(t), 'one step of drift allowed');
-  assert.equal(checkCode(secret, '081804', t + 90_000), null);
-  assert.equal(checkCode(secret, 'abc', t), null);
-});
+import { cell } from '../../org/logic.mjs';
 
 test('signed tokens: verify, tamper, expiry, audience, wrong key', () => {
   const dir = mkdtempSync(join(tmpdir(), 'kea-hub-key-'));
@@ -144,93 +42,70 @@ test('limiter: windows and doubling lockout', () => {
   assert.equal(lockFor(FREE + 40), MAX_LOCK_MS);
 });
 
-test('study scoring: new, not-due, review, miss then right, spaced intervals', () => {
-  let t = 0;
-  let r = scoreAnswer(null, true, t);
-  assert.deepEqual([r.points, r.state.box, r.state.dueAt], [POINTS.newFirstTry, 1, INTERVAL_DAYS[0] * DAY]);
-  // Again straight away: practice only.
-  const again = scoreAnswer(r.state, true, t + 1000);
-  assert.deepEqual([again.points, again.due], [0, false]);
-  // Due tomorrow: review points, box 2, next in 3 days.
-  t = DAY;
-  r = scoreAnswer(r.state, true, t);
-  assert.deepEqual([r.points, r.state.box, r.state.dueAt - t], [POINTS.reviewFirstTry + POINTS.reviewBoxBonus, 2, INTERVAL_DAYS[1] * DAY]);
-  // Due again: miss, miss, then right -> small points, back to box 0, tomorrow.
-  t += 3 * DAY;
-  r = scoreAnswer(r.state, false, t); assert.equal(r.points, 0);
-  r = scoreAnswer(r.state, false, t); assert.equal(r.points, 0);
-  r = scoreAnswer(r.state, true, t);
-  assert.deepEqual([r.points, r.state.box, r.state.dueAt - t], [POINTS.afterMiss, 0, DAY]);
-  // Wrong on a brand-new question then right: after-miss points.
-  const n = scoreAnswer(scoreAnswer(null, false, 0).state, true, 0);
-  assert.equal(n.points, POINTS.afterMiss);
-  assert.equal(capped(50, DAILY_CAP - 20), 20);
-  assert.equal(capped(50, DAILY_CAP + 5), 0);
-});
-
-test('levels, streaks, week start', () => {
-  assert.deepEqual([0, 99, 100, 299, 300, 600].map((x) => levelOf(x).level), [1, 1, 2, 2, 3, 4]);
-  assert.equal(xpForLevel(2), 100);
-  const now = Date.UTC(2026, 10, 5, 15); // Thursday
-  assert.equal(new Date(weekStart(now)).toISOString(), '2026-11-02T00:00:00.000Z');
-  assert.equal(streak(['2026-11-05', '2026-11-04', '2026-11-03', '2026-11-01'], now), 3);
-  assert.equal(streak(['2026-11-04', '2026-11-03'], now), 2, 'not studied yet today still counts the run');
-  assert.equal(streak(['2026-11-02'], now), 0);
-});
-
 test('backup sealing: round trip, wrong passphrase refused', () => {
   const b = seal(Buffer.from('hello hub'), 'a long recovery phrase');
   assert.equal(open(b, 'a long recovery phrase').toString(), 'hello hub');
   assert.throws(() => open(b, 'the wrong phrase here'), /passphrase/);
 });
 
-test('claude budget: per-account limits, trusted and blocked', () => {
-  const facts = { verified: true, birthYear: 1990, year: 2026, myQueued: 0, myJobsToday: 3, myJobsThisWeek: 3 };
-  assert.equal(decide('initial_scan', limitsFor({}, null), facts).code, 'day_cap');
-  assert.equal(decide('initial_scan', limitsFor({}, { limits: { perAccountDaily: 5 } }), facts).action, 'queue');
-  assert.equal(decide('initial_scan', limitsFor({ perAccountDaily: 9 }, { limits: { perAccountDaily: 2 } }), facts).code, 'day_cap', 'the person’s own number wins');
-  const trusted = limitsFor({}, { trusted: true });
-  assert.equal(trusted.perAccountDaily, Infinity);
-  assert.equal(trusted.globalDaily, DEFAULTS.globalDaily, 'the Hub-wide total still applies');
-  assert.equal(trusted.requestsBeforeSuspend, DEFAULTS.requestsBeforeSuspend, 'abuse checks still apply');
-  assert.equal(decide('initial_scan', trusted, { ...facts, myJobsToday: 99, myJobsThisWeek: 99, myQueued: 50 }).action, 'queue');
-  const blocked = decide('initial_scan', trusted, { ...facts, blocked: true, blockedReason: 'Ask me first.' });
-  assert.deepEqual([blocked.code, /Ask me first/.test(blocked.reason)], ['blocked', true]);
-  assert.equal(decide('initial_scan', {}, { ...facts, owner: true, blocked: true }).action, 'queue', 'the owner is never blocked');
-  // Stored settings are cleaned: unknown keys, negatives and non-integers dropped.
-  assert.deepEqual(cleanOverride({ limits: { perAccountDaily: 2, globalDaily: 1, perAccountWeekly: -1, questionBatchesPerDay: 1.5 }, trusted: 'yes' }), { limits: { perAccountDaily: 2 }, trusted: false, blocked: false, reason: null });
-  assert.ok(ACCOUNT_LIMITS.every((k) => k in DEFAULTS));
+test('a record id is never taken for an SSN (the org tests that failed now and then: about 1% of random ids did)', () => {
+  assert.equal(payrollValue('0f3a2b1c-9d8e-4f7a-8b6c-a123456789bc'), false);
+  assert.equal(payrollValue('see 0f3a2b1c-9d8e-4f7a-8b6c-a123456789bc'), false);
+  // A real one next to an id still counts.
+  assert.equal(payrollValue('0f3a2b1c-9d8e-4f7a-8b6c-a123456789bc 123-45-6789'), true);
+  assert.equal(payrollValue('123456789'), true);
 });
 
-test('claude budget: what changed, in plain words', () => {
-  assert.deepEqual(describeOverride(null, { limits: { perAccountWeekly: 20 } }), ['You can now use Kea’s shared Claude up to 20 times a week (a class scan or a batch of questions each).']);
-  assert.deepEqual(describeOverride({ limits: { perAccountWeekly: 20 } }, null, { perAccountWeekly: 12 }), ['Your weekly limit on Kea’s shared Claude is back to the usual 12.']);
-  assert.deepEqual(describeOverride(null, { trusted: true, limits: { perAccountDaily: 9 } }), ['You can now use Kea’s shared Claude without the usual daily and weekly limits.'], 'a lifted cap isn’t also listed');
-  assert.match(describeOverride(null, { blocked: true, reason: 'Paused while we talk.' })[0], /turned off for your account\. Paused while we talk\./);
-  assert.deepEqual(describeOverride(null, { limits: { refusalsBeforeFlag: 40 } }), ['Your settings for Kea’s shared Claude were adjusted.']);
-  assert.deepEqual(describeOverride({ trusted: true }, { trusted: true }), []);
-  assert.match(describeOverride(null, { limits: { questionBatchesPerDay: 1 } })[0], /up to 1 batch of new practice questions a day/);
+test('client address: only the last X-Forwarded-For entry, only when configured, malformed values ignored', () => {
+  // (X-Forwarded-For counts only on requests Tailscale Funnel marked as its own.)
+  const h = (v) => ({ 'x-forwarded-for': v, 'tailscale-funnel-request': '?1' });
+  const local = clientAddress({ 'x-forwarded-for': '1.2.3.4' }, '127.0.0.1', 'x-forwarded-for');
+  assert.deepEqual(local, { ip: '127.0.0.1', shared: true, forwardedUntrusted: false }, 'a local program can’t pick its own address');
+  assert.equal(clientAddress({ 'x-forwarded-for': '1.2.3.4', 'tailscale-funnel-request': '?0' }, '127.0.0.1', 'x-forwarded-for').ip, '127.0.0.1');
+  // Another proxy's header, configured on purpose, is trusted as configured.
+  assert.equal(clientAddress({ 'cf-connecting-ip': '9.9.9.9' }, '127.0.0.1', 'cf-connecting-ip').ip, '9.9.9.9');
+  assert.deepEqual(clientAddress(h('1.2.3.4'), '127.0.0.1', 'x-forwarded-for'), { ip: '1.2.3.4', shared: false, forwardedUntrusted: false });
+  assert.equal(clientAddress(h('6.6.6.6, 203.0.113.9'), '127.0.0.1', 'x-forwarded-for').ip, '203.0.113.9', 'earlier entries can be faked');
+  assert.equal(clientAddress(h('203.0.113.9, garbage'), '127.0.0.1', 'x-forwarded-for').ip, '127.0.0.1', 'a malformed last entry is not used');
+  assert.equal(clientAddress(h('203.0.113.9, garbage'), '127.0.0.1', 'x-forwarded-for').shared, true);
+  assert.equal(clientAddress(h('1.2.3.4:5678'), '127.0.0.1', 'x-forwarded-for').ip, '127.0.0.1', 'ports are not part of an address');
+  assert.equal(clientAddress(h('[2001:db8::1]'), '127.0.0.1', 'x-forwarded-for').ip, '2001:db8::1');
+  assert.equal(clientAddress(h('::ffff:198.51.100.2'), '127.0.0.1', 'x-forwarded-for').ip, '198.51.100.2');
+  assert.equal(clientAddress({}, '::ffff:127.0.0.1', 'x-forwarded-for').ip, '127.0.0.1');
+  // Not configured: the header is never trusted, and its presence is a setup warning.
+  const u = clientAddress({ 'x-forwarded-for': '1.2.3.4' }, '127.0.0.1', null);
+  assert.deepEqual(u, { ip: '127.0.0.1', shared: true, forwardedUntrusted: true });
+  assert.deepEqual(clientAddress({}, '127.0.0.1', null), { ip: '127.0.0.1', shared: false, forwardedUntrusted: false });
+  assert.equal(clientAddress({ 'tailscale-funnel-request': '?1' }, '127.0.0.1', null).forwardedUntrusted, true);
+  assert.equal(cleanIp('fe80::1%eth0'), null);
+  assert.equal(cleanIp('x'.repeat(100)), null);
+  // IPv6 addresses count by their /64.
+  assert.equal(ipBucket('2001:db8:1:2:aaaa::1'), ipBucket('2001:db8:1:2:bbbb::2'));
+  assert.notEqual(ipBucket('2001:db8:1:2::1'), ipBucket('2001:db8:1:3::1'));
+  assert.equal(ipBucket('203.0.113.9'), '203.0.113.9');
 });
 
-test('account: phone numbers, who sees them, sizes, supporter months', () => {
-  assert.equal(normalizePhone('+1 (719) 555-0100'), '+17195550100');
-  assert.equal(normalizePhone('020 7946 0958'), '02079460958', 'no country assumed without a +');
-  assert.equal(normalizePhone(' 719.555.0100 '), '7195550100');
-  for (const bad of ['', '555', '+0 20 7946 0958', 'call 719 555 0100', '1+2345678', '1234567890123456', '+'.repeat(3)]) assert.throws(() => normalizePhone(bad), /phone number/i, bad);
-  assert.throws(() => normalizePhone(7195550100), /text/);
-  assert.deepEqual(['nobody', 'classes', 'orgs', 'both'].map((v) => [phoneShownIn(v, 'classes'), phoneShownIn(v, 'orgs')]), [[false, false], [true, false], [false, true], [true, true]]);
-  assert.equal(fmtBytes(5000 * 1024 ** 3), '5,000 GB');
-  assert.equal(fmtBytes(5 * 1024 ** 3), '5 GB');
-  assert.equal(fmtBytes(1.5 * 1024 ** 3), '1.5 GB');
-  assert.equal(fmtBytes(300 * 1024 ** 2), '300 MB');
-  assert.equal(fmtBytes(3000), '2.9 KB');
-  assert.equal(fmtBytes(600), '600 bytes');
-  const jan31 = Date.UTC(2027, 0, 31, 12);
-  assert.equal(new Date(addMonthsUtc(jan31, 1)).toISOString(), '2027-02-28T12:00:00.000Z');
-  assert.equal(new Date(addMonthsUtc(Date.UTC(2027, 11, 15), 1)).toISOString().slice(0, 10), '2028-01-15');
-  const now = Date.UTC(2026, 10, 5);
-  assert.equal(supporterUntil(null, now), Date.UTC(2026, 11, 5), 'a month from now');
-  assert.equal(supporterUntil(Date.UTC(2026, 11, 1), now, { months: 2 }), Date.UTC(2027, 1, 1), 'renewing adds to the end');
-  assert.equal(supporterUntil(Date.UTC(2026, 0, 1), now), Date.UTC(2026, 11, 5), 'an old end: from now');
-  assert.equal(supporterUntil(Date.UTC(2026, 11, 1), now, { until: 123 }), 123);
+test('payroll guard: disguised keys, SSN- and bank-shaped values, no depth limit, oversize refused', () => {
+  for (const k of ['ssn', 'SSN', 'ѕѕn', 'ｓｓｎ', 's.s.n', 'S_S_N', 'socialSecurityNumber', 'bank_account', 'ΒankΑccount', 'routingNo', 'w4', 'directDeposit', 'payRuns', 'acct_no',
+    'wage', 'hourlyWages', 'salary', 'annual_salary', 'payRate', 'pay_rates', 'PAYRATE', 'payRateCents', 'hourlyRate'])
+    assert.equal(payrollKey(k), true, k);
+  for (const k of ['className', 'assigned', 'waiting', 'notes', 'account', 'bank', 'route', 'session', 'costRate', 'rate', 'pay', 'payDay', 'hourly'])
+    assert.equal(payrollKey(k), false, k);
+  for (const v of ['123-45-6789', '123456789', 'SSN: 123-45-6789', '123 45 6789', '１２３-４５-６７８９', 'routing 102000021, account 000123456789'])
+    assert.equal(payrollValue(v), true, v);
+  for (const v of ['719-555-0134', '2026-12-01', '80202-1234', '1234567890', 'shift 9-5', '12345678'])
+    assert.equal(payrollValue(v), false, v);
+  const refuse = () => { throw new Error('refused'); };
+  const tooBig = () => { throw new Error('too big'); };
+  let deep = { bankAccount: 1 };
+  for (let i = 0; i < 1000; i++) deep = [deep];
+  assert.throws(() => checkNoPayroll({ x: deep }, refuse, tooBig), /refused/);
+  assert.throws(() => checkNoPayroll({ list: Array.from({ length: MAX_NODES + 1 }, () => 1) }, refuse, tooBig), /too big/);
+  checkNoPayroll({ a: [{ b: 'fine' }] }, refuse, tooBig);
+});
+
+test('design: CSV cells that a spreadsheet could run as a formula are escaped (tab, CR, full-width too)', () => {
+  for (const v of ['=1+1', '+1', '-1', '@x', '\t=1', '\r=1', '＝1+1', '＋1', '－1', '＠x']) assert.ok(cell(v).startsWith(`"'`), JSON.stringify(v));
+  assert.equal(cell('Ana'), 'Ana');
+  assert.equal(cell('a,b'), '"a,b"');
 });

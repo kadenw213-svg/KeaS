@@ -6,9 +6,9 @@ import net from 'node:net';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createHub } from '../../hub/index.mjs';
-import { jsonParts } from '../../hub/lib/flow.mjs';
-import { ownerFetch } from '../../hub/lib/ownerauth.mjs';
+import { createHub } from '../../hub/legacy/index.mjs';
+import { jsonParts } from '../../hub/legacy/lib/flow.mjs';
+import { ownerFetch } from '../../hub/legacy/lib/ownerauth.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

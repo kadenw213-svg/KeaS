@@ -68,6 +68,8 @@ const LOCAL_OFF = 'Signing in with a local password is turned off. The owner can
 const VERIFY_EMAIL = 'Verify your email address in your Kea account first (in the Kea app: Kea account, Verify with Google, or ask your manager to verify it), then open Payroll again.';
 const CODE_NEEDED = 'Enter the two-step code from your authenticator app.';
 const CODE_USED = 'That two-step code was already used or has expired. Wait for the next one and try again.';
+// (On a KeaS server PC there are no passwords to relay: Kea accounts sign in at KeaC.)
+const VIA_APP = 'Payroll signs in through the KeaS app on this computer, with your Kea account. Open Payroll from KeaS.';
 const LOCAL_HUB_UP ='The Kea Hub can be reached, so sign in with your Kea Hub account. A local password only works while the Hub can’t be reached.';
 const isLoopback = (ip) => !ip || ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
 
@@ -124,7 +126,7 @@ export function registerVaultAuth(c) {
     return e;
   }
   /** Pins the Hub's key the first time (a vault set up before keys were pinned trusts the KeaS app's own Hub once). */
-  const savePin = (keys) => vault.setSetting('hubPin', { url: hubUrl(), iss: ISSUER, keys: keys.map((k) => ({ kty: 'OKP', crv: 'Ed25519', x: k.x, kid: k.kid ?? null })), at: iso(now()) });
+  const savePin = (keys, iss = ISSUER) => vault.setSetting('hubPin', { url: hubUrl(), iss, keys: keys.map((k) => ({ kty: 'OKP', crv: 'Ed25519', x: k.x, kid: k.kid ?? null })), at: iso(now()) });
 
   /** Checks the person at the Hub; returns the vault user row, or null when it isn't them. */
   async function identifyAtHub(user, { email, password, code }) {
@@ -188,6 +190,7 @@ export function registerVaultAuth(c) {
     const tz = V.str(o.tz ?? 'America/Denver', 'tz', { min: 3, max: 60 });
     try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); } catch { bad('unknown time zone'); }
     const mode = V.enum(s.mode ?? 'hub', 'signIn.mode', ['hub', 'local']);
+    if (mode === 'hub' && c.serverIssuer?.()) throw new HttpError(410, VIA_APP);
     const strong = (pw) => { const why = checkLocalStrength(pw, { email, passphrase }); if (why) bad(why); return hashLocalPassword(String(pw)); };
     let hubSub = null, localPw = null, keys = null;
     if (mode === 'hub') {
@@ -265,11 +268,15 @@ export function registerVaultAuth(c) {
       const state = V.str(org.state, 'state', { min: 2, max: 2 }).toUpperCase();
       const tz = V.str(org.tz ?? 'America/Denver', 'tz', { min: 3, max: 60 });
       try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); } catch { bad('unknown time zone'); }
-      const keys = (await setupTrust(hubKeyFingerprint)) || (await hub.fetchKeys(hubUrl()).catch((e) => { throw hubError(e, null); }));
-      const p = verifyGrant(hubToken, keys);
+      const iss = c.serverIssuer?.() || null;
+      const own = c.hubTrustKeys?.();
+      if (iss && !own?.length) throw new HttpError(409, 'Payroll can’t read this KeaS server’s key from its data folder. Restart KeaS and try again.');
+      const keys = iss ? own : (await setupTrust(hubKeyFingerprint)) || (await hub.fetchKeys(hubUrl()).catch((e) => { throw hubError(e, null); }));
+      const p = verifyGrant(hubToken, keys, iss || ISSUER);
       if (p.ev !== true) throw new HttpError(403, VERIFY_EMAIL);
       const email = String(p.email || '').toLowerCase();
       const pid = createVault({ passphrase: pass, keys, o: org, state, tz, name: String(p.name || email).slice(0, 120), email, hubSub: p.sub, localPw: null, mode: 'keas' });
+      if (iss) savePin(keys, iss);
       lastUse = now();
       return c.newSession(pid, false);
     },
@@ -278,8 +285,17 @@ export function registerVaultAuth(c) {
       if (c.mode !== 'vault') throw new HttpError(404, 'not found');
       if (!vault.initialized()) throw new HttpError(409, 'Set up the vault first.');
       let p0 = pin();
-      if (p0 && p0.url !== hubUrl()) throw new HttpError(401, KEY_CHANGED, { hubKeyChanged: true });
       const own = c.hubTrustKeys?.();
+      const iss = c.serverIssuer?.() || null;
+      // This PC became a KeaS server (its Kea Hub's accounts moved to KeaC): the server's own key, read from its data
+      // folder on this PC by the KeaS app, takes the old Hub pin's place (the same trust as setting up with this PC's
+      // own Hub).
+      if (iss && own?.length && (!p0 || p0.iss !== iss || keyFingerprint(p0.keys) !== keyFingerprint(own) || p0.url !== hubUrl())) {
+        savePin(own, iss);
+        if (p0) audit(h.get('SELECT id FROM orgs LIMIT 1')?.id ?? null, null, 'vault_repin_local', null, { from: p0.iss, to: iss });
+        p0 = pin();
+      }
+      if (p0 && p0.url !== hubUrl()) throw new HttpError(401, KEY_CHANGED, { hubKeyChanged: true });
       const p = verifyGrant(hubToken, p0?.keys || own || [], p0?.iss || ISSUER);
       const user = userForGrant(p);
       if (!p0 && own?.length) savePin(own);
@@ -319,6 +335,7 @@ export function registerVaultAuth(c) {
     if (!vault.initialized()) throw new HttpError(409, 'Set up the vault first.');
     const email = V.str(body.email, 'email', { min: 3, max: 200 }).trim().toLowerCase();
     const mode = V.enum(body.mode ?? 'hub', 'mode', ['hub', 'local']);
+    if (mode === 'hub' && c.serverIssuer?.()) throw new HttpError(410, VIA_APP);
     const passphrase = V.str(body.passphrase, 'passphrase', { min: 1, max: 500 });
     const password = String(body.password ?? '');
     const where = ipKey(ip), acct = `acct:${email}`;

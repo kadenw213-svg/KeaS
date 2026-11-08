@@ -6,10 +6,10 @@ import http from 'node:http';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createHub } from '../../hub/index.mjs';
-import { ownerFetch } from '../../hub/lib/ownerauth.mjs';
-import { clientAddress, cleanIp, ipBucket } from '../../hub/lib/clientip.mjs';
-import { failures, globalLockFor, GLOBAL_FREE, GLOBAL_IPS, GLOBAL_MAX_LOCK_MS } from '../../hub/lib/limiter.mjs';
+import { createHub } from '../../hub/legacy/index.mjs';
+import { ownerFetch } from '../../hub/legacy/lib/ownerauth.mjs';
+import { clientAddress, cleanIp, ipBucket } from '../../hub/legacy/lib/clientip.mjs';
+import { failures, globalLockFor, GLOBAL_FREE, GLOBAL_IPS, GLOBAL_MAX_LOCK_MS } from '../../hub/legacy/lib/limiter.mjs';
 import { payrollKey, payrollValue, checkNoPayroll, MAX_NODES } from '../../org/payroll.mjs';
 
 test('a record id is never taken for an SSN (the org tests that failed now and then: about 1% of random ids did)', () => {
@@ -19,7 +19,7 @@ test('a record id is never taken for an SSN (the org tests that failed now and t
   assert.equal(payrollValue('0f3a2b1c-9d8e-4f7a-8b6c-a123456789bc 123-45-6789'), true);
   assert.equal(payrollValue('123456789'), true);
 });
-import { openDb } from '../../hub/db.mjs';
+import { openDb } from '../../hub/legacy/db.mjs';
 
 let hub, base, ownerBase, dir;
 let clock = Date.UTC(2026, 10, 6, 15);
@@ -245,7 +245,7 @@ test('payroll guard: disguised keys, SSN- and bank-shaped values, no depth limit
 
 // 2026-11-07 review: a two-step code is used once even when two sign-ins race, and turning two-step on ends the
 // account's other sign-ins (one made with the password alone must not keep working, or become an owner's).
-import { codeAt, stepOf } from '../../hub/lib/totp.mjs';
+import { codeAt, stepOf } from '../../hub/legacy/lib/totp.mjs';
 test('two-step: one code, one sign-in, even sent twice at once; turning it on ends the other sign-ins', async () => {
   const email = 'race-totp@example.com';
   const t1 = await person(email);

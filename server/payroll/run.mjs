@@ -118,7 +118,8 @@ export function registerRun(c) {
     const segs = [...map.values()].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
     for (const s of segs) {
       const code = s.payCodeId ? c.engine.codeOf(s.payCodeId) : null;
-      const r = code ? { cents: code.rateCents, kind: 'hourly' } : rateFor(h, person, s.positionId, s.date);
+      // (Each day at the code's rate in effect that day: rate changes have dates in the org engine.)
+      const r = code ? { cents: c.engine.rateOn(s.payCodeId, s.date), kind: 'hourly' } : rateFor(h, person, s.positionId, s.date);
       s.payCodeName = code?.name ?? null;
       s.rateCents = r?.cents ?? 0;
       s.rateKind = r?.kind ?? 'hourly';
@@ -460,8 +461,40 @@ export function registerRun(c) {
       postAccruals(h, people, period, worked, isoNow(now()));
     });
     audit(org.id, me.id, 'payrun_finalize', id, { period: period.start, totals: pr.totals });
-    return { status: 201, body: { run: { id, period, payDate: pr.payDate, totals: pr.totals } } };
+    const stubs = await publishStubs(org, period, me).catch((e) => ({ error: e.message }));
+    return { status: 201, body: { run: { id, period, payDate: pr.payDate, totals: pr.totals }, stubs } };
   });
+  // Publishing again (KeaS couldn't reach the organization's server when the run was finalized, or a correction).
+  route('POST', '/v1/payrun/publish-stubs', async ({ me, org, body }) => {
+    need(me, 'payroll');
+    const period = c.parsePeriod(org, V.date(body.periodStart, 'periodStart'), null);
+    if (!h.get(`SELECT 1 FROM payruns WHERE org_id = ? AND period_start = ? AND status = 'finalized'`, org.id, period.start)) throw new HttpError(409, 'Only a finalized pay run’s stubs go to people.');
+    try { return { stubs: await publishStubs(org, period, me) }; } catch (e) { throw new HttpError(503, `The stubs didn’t go out: ${e.message}`); }
+  });
+
+  /**
+   * Each person's stub of a finalized run, to them in Kea (org/stubs.mjs, through the KeaS app: c.publishStubs). Only
+   * people linked to a Kea account (people.kea_account_id). What goes: their pay statement (earnings, taxes,
+   * deductions, net, year to date, balances); never an SSN, a bank account or where the pay is deposited.
+   */
+  async function publishStubs(org, period, me) {
+    if (!c.publishStubs) return { published: 0, skipped: 'This vault isn’t connected to an organization server.' };
+    const run = h.get(`SELECT * FROM payruns WHERE org_id = ? AND period_start = ? AND status = 'finalized'`, org.id, period.start);
+    const linked = new Map(h.all('SELECT id, kea_account_id FROM people WHERE org_id = ? AND kea_account_id IS NOT NULL', org.id).map((p) => [p.id, p.kea_account_id]));
+    const out = [];
+    for (const l of runLines(org, period).lines) {
+      const aid = linked.get(l.personId);
+      if (!aid) continue;
+      const s = stub(org, period, l.personId);
+      const line = { ...s.line };
+      for (const k of ['deposits', 'entityId', 'distribution', 'personId']) delete line[k];
+      out.push({ accountId: aid, stub: { org: s.org, person: { name: s.person.name, employeeNumber: s.person.employeeNumber ?? null }, period: s.period, payDate: s.payDate, line, ytd: s.ytd, balances: s.balances } });
+    }
+    if (!out.length) return { published: 0 };
+    const r = await c.publishStubs({ runId: run.id, periodStart: period.start, periodEnd: period.end, payDate: run.pay_date, stubs: out });
+    audit(org.id, me.id, 'stubs_publish', run.id, { people: out.length });
+    return { published: out.length, ...(r && typeof r === 'object' ? { added: r.added ?? null, replaced: r.replaced ?? null } : {}) };
+  }
 
   route('GET', '/v1/payruns', ({ me, org }) => {
     need(me, 'payroll');

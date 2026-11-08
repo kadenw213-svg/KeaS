@@ -1,4 +1,4 @@
-// Encrypted Hub backups. A consistent snapshot of the database (VACUUM INTO) plus the signing key, and optionally the
+// Encrypted KeaS server backups. A consistent snapshot of the database (VACUUM INTO) plus its keys, and optionally the
 // KeaS payroll vault file, sealed with AES-256-GCM under a key derived from a recovery passphrase (scrypt). Safe to keep
 // in OneDrive: without the passphrase it's unreadable. Keep the passphrase offline (printed, or in a password manager).
 //
@@ -80,14 +80,17 @@ export function snapshot(dbFile) {
 /** payrollDb: also back up the KeaS payroll vault (still encrypted with its own passphrase inside). */
 export function createBackup(dataDir, outDir, pass, { payrollDb = null } = {}) {
   if (!pass || nfc(pass).length < 12) throw new Error('Use a recovery passphrase of at least 12 characters.');
-  if (!existsSync(join(dataDir, 'hub.db'))) throw new Error(`${dataDir} has no hub.db.`);
+  const dbs = ['keas.db', 'hub.db'].filter((f) => existsSync(join(dataDir, f)));
+  if (!dbs.length) throw new Error(`${dataDir} has no keas.db or hub.db.`);
   if (payrollDb && !existsSync(payrollDb)) throw new Error(`There is no payroll vault at ${payrollDb}.`);
-  const files = { 'hub.db': snapshot(join(dataDir, 'hub.db')), 'hub-signing-key.pem': readFileSync(join(dataDir, 'hub-signing-key.pem')) };
-  // (Pay code rates in hub.db only open with the org data key.)
-  if (existsSync(join(dataDir, 'org-data.key'))) files['org-data.key'] = readFileSync(join(dataDir, 'org-data.key'));
+  // (keas.db: the KeaS server's; hub.db: a Kea Hub's, kept until it's cleaned up by hand after its accounts moved.)
+  const files = Object.fromEntries(dbs.map((f) => [f, snapshot(join(dataDir, f))]));
+  // The server's identity key (its server id), the org data key (pay code rates and stubs in hub.db only open with
+  // it), and a KeaS 0.5 Hub's signing key if one is still there.
+  for (const f of ['server-identity.pem', 'org-data.key', 'hub-signing-key.pem']) if (existsSync(join(dataDir, f))) files[f] = readFileSync(join(dataDir, f));
   if (payrollDb) files['payroll-vault.db'] = snapshot(payrollDb);
   mkdirSync(outDir, { recursive: true });
-  const file = join(outDir, `kea-hub-${new Date().toISOString().replace(/[:.]/g, '-')}.keabak`);
+  const file = join(outDir, `keas-server-${new Date().toISOString().replace(/[:.]/g, '-')}.keabak`);
   writeFileSync(file, seal(pack(files), pass));
   return file;
 }
@@ -95,7 +98,7 @@ export function createBackup(dataDir, outDir, pass, { payrollDb = null } = {}) {
 /** Restores into an empty data folder. payrollDir: where the payroll vault goes (default: the data folder). */
 export function restoreBackup(file, dataDir, pass, { payrollDir = null } = {}) {
   const files = unpack(open(readFileSync(file), pass));
-  if (existsSync(join(dataDir, 'hub.db'))) throw new Error(`${dataDir} already has a hub.db. Restore into an empty folder.`);
+  for (const f of ['keas.db', 'hub.db']) if (existsSync(join(dataDir, f))) throw new Error(`${dataDir} already has a ${f}. Restore into an empty folder.`);
   const where = (name) => (name === 'payroll-vault.db' && payrollDir ? payrollDir : dataDir);
   for (const name of Object.keys(files)) {
     if (!/^[\w.-]+$/.test(name)) throw new Error('Bad file name in backup.');

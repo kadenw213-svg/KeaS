@@ -1,5 +1,6 @@
-// Who people are comes from the sign-in system the org engine runs under, through an identity adapter. Today that is
-// the Kea Hub's accounts (hub/orgIdentity.mjs); later it can be KeaC passes. The engine keeps only account ids.
+// Who people are comes from the sign-in system the org engine runs under, through an identity adapter. On a KeaS
+// server that is KeaC passes (passIdentity below): people are Kea account ids, with the name and email their last pass
+// carried. The engine keeps only account ids.
 //
 // An adapter is an object with:
 //   who(me)            -> { id, name, email, emailVerified, superuser }  the signed-in caller, from what the host's
@@ -25,5 +26,33 @@ export function staticIdentity(people = []) {
     findByEmail: (email) => [...byId.values()].find((p) => p.email && p.email.toLowerCase() === String(email || '').toLowerCase())?.id ?? null,
     findBySub: (sub) => (byId.has(sub) ? sub : null),
     orgPolicy: () => ({ allowed: true, autoApprove: true }),
+  };
+}
+
+/**
+ * People from KeaC passes (docs/protocol.md section 2). The host keeps one row per Kea account that signed in with a
+ * pass, in `keas_members` (id = the Kea account id, the pass's sub; email and name from the newest pass), and says who
+ * runs the server (operatorId(): the account that claimed it at setup). Every pass carries ev: true, so every member's
+ * email is verified by KeaC. Organizations are made by the operator; anyone else only when the operator allows it
+ * (settings 'orgs': { anyoneCreates, autoApprove }).
+ */
+export function passIdentity({ h, operatorId = () => null, getSetting = () => ({}) }) {
+  const out = (r) => ({ name: r.name || r.email || '', email: r.email ?? null, emailVerified: true });
+  return {
+    who: (me) => ({ id: me.id, name: me.name || me.email || '', email: me.email ?? null, emailVerified: true, superuser: !!me.id && me.id === operatorId() }),
+    profiles(ids) {
+      const m = new Map();
+      for (let i = 0; i < ids.length; i += 500)
+        for (const r of h.all('SELECT id, email, name FROM keas_members WHERE id IN (SELECT value FROM json_each(?))', JSON.stringify(ids.slice(i, i + 500)))) m.set(r.id, out(r));
+      return m;
+    },
+    findByEmail: (email) => (email ? h.get('SELECT id FROM keas_members WHERE email = ?', String(email).trim().toLowerCase())?.id ?? null : null),
+    findBySub: (sub) => (sub ? h.get('SELECT id FROM keas_members WHERE id = ?', String(sub))?.id ?? null : null),
+    orgPolicy(who) {
+      if (who.superuser) return { allowed: true, autoApprove: true };
+      const s = getSetting('orgs', {}) || {};
+      if (s.anyoneCreates === true) return { allowed: true, autoApprove: s.autoApprove === true };
+      return { allowed: false, message: 'Organizations on this KeaS server are made by whoever runs it. Ask them, or join yours with a code.' };
+    },
   };
 }

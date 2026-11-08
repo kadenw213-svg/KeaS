@@ -206,6 +206,7 @@ export function mountRoutes(core, { R, O = null, classes = false, operator = nul
         if ('lateThresholdMin' in k) next.clock.lateThresholdMin = V.int(k.lateThresholdMin, 'Late after (minutes)', { min: 0, max: 120 });
         if ('needShift' in k) next.clock.needShift = V.bool(k.needShift, 'Clocking in needs a shift');
       }
+      if ('filesQuotaGb' in b) { const g = b.filesQuotaGb; if (typeof g !== 'number' || !Number.isFinite(g) || g < 0 || g > 10_000) bad('Files per person must be 0 to 10000 GB.'); next.filesQuotaGb = Math.round(g * 100) / 100; }
       if ('timeOffKinds' in b) next.timeOffKinds = [...new Set(list(b.timeOffKinds, 'Kinds of time off', 20).map((x) => V.str(x, 'Kind', { min: 1, max: 30 }).toLowerCase()))];
     }
     h.run('UPDATE orgs SET name = ?, kind = ?, tz = ?, state = ?, workweek_start = ?, settings = ? WHERE id = ?',

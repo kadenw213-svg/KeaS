@@ -4,11 +4,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateKeyPairSync, sign } from 'node:crypto';
-import { createHub } from '../../hub/index.mjs';
-import { ownerFetch } from '../../hub/lib/ownerauth.mjs';
-import { codeAt, stepOf } from '../../hub/lib/totp.mjs';
-import { verifyToken } from '../../hub/lib/tokens.mjs';
-import { POINTS } from '../../hub/lib/study.mjs';
+import { createHub } from '../../hub/legacy/index.mjs';
+import { ownerFetch } from '../../hub/legacy/lib/ownerauth.mjs';
+import { codeAt, stepOf } from '../../hub/legacy/lib/totp.mjs';
+import { verifyToken } from '../../hub/legacy/lib/tokens.mjs';
+import { POINTS } from '../../hub/legacy/lib/study.mjs';
 
 const DAY = 86400_000;
 let hub, base, ownerBase, dir;

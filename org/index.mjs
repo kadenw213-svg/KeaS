@@ -1,5 +1,5 @@
-// The KeaS org engine: one module for organizations that any KeaS server can mount (the Kea Hub today, a KeaS org
-// server or KeaC later). It brings its own tables (./schema.mjs, upgraded in place from earlier versions), roles with
+// The KeaS org engine: one module for organizations that any KeaS server can mount (the KeaS server, hub/index.mjs;
+// the Kea Hub of KeaS 0.5 while its accounts haven't moved; KeaC for the organizations it hosts). It brings its own tables (./schema.mjs, upgraded in place from earlier versions), roles with
 // abilities (./roles.mjs), the org routes (./routes.mjs), roles routes (./roleRoutes.mjs), the time clock
 // (./clock.mjs) and pay codes (./paycodes.mjs), and imports from an org server's database (./import.mjs).
 //
@@ -24,10 +24,11 @@ import { mountRoleRoutes } from './roleRoutes.mjs';
 import { mountClock } from './clock.mjs';
 import { importServerOrg } from './import.mjs';
 import { dataKeyFrom, makeRateSealer, makePayLogic, mountPayCodes } from './paycodes.mjs';
+import { mountStubs } from './stubs.mjs';
 
 export { ABILITIES, ABILITY_LIST, TEMPLATES } from './roles.mjs';
 export { ORG_SCHEMA, ORG_SCHEMA_VERSION, migrateOrg } from './schema.mjs';
-export { staticIdentity } from './identity.mjs';
+export { staticIdentity, passIdentity } from './identity.mjs';
 export { OrgHttpError } from './kit.mjs';
 export { dataKeyFrom } from './paycodes.mjs';
 
@@ -42,6 +43,9 @@ export function mountOrg({ R, h, now = () => Date.now(), audit = () => {}, notif
   const core = makeCore({ h, now, audit, notify, identity, kit: fullKit });
   const key = dataKeyFrom(dataKey);
   core.pay = makePayLogic(core, key ? makeRateSealer(key) : null);
+  // Pay stubs the payroll vault publishes, each sealed for its member (./stubs.mjs). Not through the payroll guard:
+  // stubs carry pay amounts by design, and stubs.mjs refuses SSN- and bank-shaped values itself.
+  core.stubs = mountStubs(core, { R, dataKey: key });
   const main = mountRoutes(core, { R, O, classes, operator });
   // (Through the same payroll guard as every org route.)
   mountRoleRoutes(core, { R: main.OR, deptRow: main.deptRow });
@@ -70,7 +74,7 @@ export function mountOrg({ R, h, now = () => Date.now(), audit = () => {}, notif
     h.run('DELETE FROM org_punches WHERE account_id = ?', aid);
     h.run('DELETE FROM org_erase WHERE account_id = ?', aid);
     h.run('UPDATE org_shifts SET account_id = NULL WHERE account_id = ?', aid);
-    for (const t of ['org_role_assignments', 'org_member_positions', 'org_member_pay_codes', 'org_punch_requests', 'org_timecard_approvals', 'org_time_off', 'org_certs', 'org_class_assignments', 'org_responses', 'org_response_changes', 'org_nudges', 'org_policy_acks', 'org_todo_snoozes', 'org_members'])
+    for (const t of ['org_stubs', 'org_role_assignments', 'org_member_positions', 'org_member_pay_codes', 'org_punch_requests', 'org_timecard_approvals', 'org_time_off', 'org_certs', 'org_class_assignments', 'org_responses', 'org_response_changes', 'org_nudges', 'org_policy_acks', 'org_todo_snoozes', 'org_members'])
       h.run(`DELETE FROM ${t} WHERE account_id = ?`, aid);
     h.run('DELETE FROM org_swaps WHERE from_account = ? OR claimant = ?', aid, aid);
   }

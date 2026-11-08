@@ -21,6 +21,9 @@ export const ORG_DEFAULTS = {
   // late, and whether clocking in needs a published shift.
   clock: { periodDays: 14, periodAnchor: null, lateThresholdMin: 5, needShift: false },
   timeOffKinds: ['vacation', 'sick', 'personal', 'unpaid', 'other'],
+  // Each member's files area on this KeaS server (documents and classes Kea syncs here), in GB. A member in several
+  // organizations gets the biggest of theirs.
+  filesQuotaGb: 1,
 };
 export { TODO_KINDS };
 

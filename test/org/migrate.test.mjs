@@ -9,6 +9,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { startHub } from './helpers.mjs';
+import { writeMarker } from '../../hub/upgrade.mjs';
 
 const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), '..', 'fixtures', 'hub-0.5.0-orgs.sql');
 const ORG = '4c7bf4bc-c90a-4b73-9e02-29b451f29508';
@@ -20,6 +21,8 @@ before(async () => {
   // What 0.5.0 had: a role column with its CHECK, and two members' positions.
   assert.ok(db.prepare('PRAGMA table_info(org_members)').all().some((c) => c.name === 'role'));
   db.close();
+  // (Its accounts moved to KeaC: without this the folder stays the Kea Hub, see test/hub/upgrade.test.mjs.)
+  writeMarker(dir, { at: Date.UTC(2026, 10, 5, 17), keacUrl: null, keacKeyKid: null });
   H = await startHub({ dataDir: dir, clock: Date.UTC(2026, 10, 5, 18) });
   for (const k of ['boss', 'co', 'adm', 'mgr', 'ana', 'pend']) u[k] = await H.login(`${k}@old.org`);
 });

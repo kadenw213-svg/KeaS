@@ -118,7 +118,7 @@ test('deleting an account takes its punches with it (the only way they go); the 
   const exp = H.ok(await H.call('GET', '/v1/orgs-export', ana.token));
   assert.equal(exp.timeClock.punches.length, 4);
   assert.equal(exp.memberships[0].role, 'member');
-  H.ok(await H.owner('POST', `/owner/accounts/${ana.id}/delete`, { confirm: 'ana@c.org' }));
+  H.ok(await H.owner('POST', `/owner/members/${ana.id}/forget`, { confirm: 'ana@c.org' }));
   assert.equal(H.hub.h.get('SELECT COUNT(*) AS n FROM org_punches WHERE account_id = ?', ana.id).n, 0);
   assert.equal(H.hub.h.get('SELECT COUNT(*) AS n FROM org_time_off WHERE account_id = ?', ana.id).n, 0);
   H.ok(await H.call('POST', O(''), boss.token, { settings: { clock: { needShift: false } } }));

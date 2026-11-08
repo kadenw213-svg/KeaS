@@ -170,7 +170,7 @@ test('codes in use are turned off, not deleted; a turned-off code can’t be giv
 });
 
 test('deleting an account takes its codes and punch switches with it', async () => {
-  H.ok(await H.owner('POST', `/owner/accounts/${ana.id}/delete`, { confirm: 'ana@p.org' }));
+  H.ok(await H.owner('POST', `/owner/members/${ana.id}/forget`, { confirm: 'ana@p.org' }));
   assert.equal(H.hub.h.get('SELECT COUNT(*) AS n FROM org_member_pay_codes WHERE account_id = ?', ana.id).n, 0);
   assert.equal(H.hub.h.get('SELECT COUNT(*) AS n FROM org_punch_codes').n, 0);
 });

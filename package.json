@@ -2,7 +2,7 @@
   "name": "keas",
   "version": "0.5.0",
   "private": true,
-  "description": "KeaS: the Kea Hub (accounts, classes, study, storage and sync for Kea) and a free workforce suite for organizations.",
+  "description": "KeaS: the self-hosted server for organizations (schedules, time clock, pay codes, payroll prep). Kea accounts sign in with passes from KeaC.",
   "type": "module",
   "license": "MIT",
   "scripts": {
@@ -16,10 +16,11 @@
     "test:hub": "node --test \"test/hub/*.test.mjs\"",
     "test:desktop": "node --test \"test/desktop/*.test.mjs\"",
     "test:org": "node --test \"test/org/*.test.mjs\"",
-    "test": "node --test \"test/server/*.test.mjs\" \"test/hub/*.test.mjs\" \"test/org/*.test.mjs\"",
+    "test": "node --test \"test/server/*.test.mjs\" \"test/hub/*.test.mjs\" \"test/org/*.test.mjs\" \"test/legacy/*.test.mjs\"",
     "desktop": "electron .",
     "desktop:build": "npm run web:build && electron-builder --win nsis",
-    "release": "npm run web:build && electron-builder --win nsis --publish always"
+    "release": "npm run web:build && electron-builder --win nsis --publish always",
+    "test:legacy": "node --test \"test/legacy/*.test.mjs\""
   },
   "engines": {
     "node": ">=22.5"

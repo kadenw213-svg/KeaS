@@ -5,9 +5,9 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createHub } from '../../hub/index.mjs';
-import { ownerFetch } from '../../hub/lib/ownerauth.mjs';
-import { codeAt, stepOf } from '../../hub/lib/totp.mjs';
+import { createHub } from '../../hub/legacy/index.mjs';
+import { ownerFetch } from '../../hub/legacy/lib/ownerauth.mjs';
+import { codeAt, stepOf } from '../../hub/legacy/lib/totp.mjs';
 
 let hub, base, ownerBase, dir;
 let clock = Date.UTC(2026, 10, 7, 15);

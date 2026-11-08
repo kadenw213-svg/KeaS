@@ -82,3 +82,28 @@ test('the vault needs a Kea account that may see rates and every timecard', asyn
   const f = await H.call('GET', O(`/pay-feed?from=${period.start}&to=${period.end}`), mgr.token);
   assert.equal(f.status, 403);
 });
+
+test('a rate change in the middle of a pay period: the vault pays each day at the rate in effect that day', async () => {
+  // (Made before the period: a rate dated on or before the day a code was made is its first rate.)
+  H.t.now = zonedToUtc(addDays(period.start, -3), '09:00', 'America/Denver');
+  const desk = H.ok(await H.call('POST', O('/pay-codes'), adm.token, { name: 'Front desk', rate: 12 }), 201).code;
+  H.ok(await H.call('POST', O(`/members/${mgr.id}/pay-codes`), adm.token, { codeId: desk.id, default: true }), 201);
+  // Mo works the desk on the period's 2nd and 3rd days; from the 3rd the rate is 14.
+  const d2 = addDays(period.start, 1), d3 = addDays(period.start, 2);
+  H.ok(await H.call('POST', O(`/pay-codes/${desk.id}`), adm.token, { rate: 14, effectiveFrom: d3 }));
+  for (const d of [d2, d3]) {
+    const t = zonedToUtc(d, '09:00', 'America/Denver');
+    H.t.now = t;
+    H.ok(await H.call('POST', O('/clock'), mgr.token, { type: 'in', payCodeId: desk.id }), 201);
+    H.t.now = t + 5 * 3600_000;
+    H.ok(await H.call('POST', O('/clock'), mgr.token, { type: 'out' }), 201);
+  }
+  H.t.now = VAULT_NOW;
+  H.ok(await H.call('POST', O('/timecards/approve'), boss.token, { accountId: mgr.id, periodStart: period.start }));
+  const run = (await vcall('GET', `/v1/payrun/preview?periodStart=${period.start}`, pay)).body;
+  const l = run.lines.find((x) => x.name === 'Mo Manager');
+  assert.deepEqual(l.earnings.filter((e) => e.code === 'regular').map((e) => [e.payCodeName, e.hours, e.rateCents]), [['Front desk', 5, 1200], ['Front desk', 5, 1400]]);
+  assert.equal(l.gross, 5 * 1200 + 5 * 1400);
+  // Publishing stubs is for finalized runs only.
+  assert.equal((await vcall('POST', '/v1/payrun/publish-stubs', pay, { periodStart: period.start })).status, 409);
+});

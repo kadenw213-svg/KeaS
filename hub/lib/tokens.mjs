@@ -1,5 +1,5 @@
-// Signed identity tokens. The Hub signs { who you are, which orgs/classes } with its Ed25519 key; org servers and Kea
-// check the signature with the Hub's public key (GET /v1/keys), so a password only ever reaches the Hub.
+// Signed tokens with the KeaS server's identity key (Ed25519): the payroll vault's 15-minute sign-in token
+// (hub/index.mjs /owner/payroll-token), checked against this server's public key.
 // Format: base64url(header).base64url(payload).base64url(signature), JWT-shaped with alg EdDSA.
 import { createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify, createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -15,7 +15,11 @@ export function loadOrCreateKey(file) {
     const { privateKey } = generateKeyPairSync('ed25519');
     writeSecretFile(file, privateKey.export({ type: 'pkcs8', format: 'pem' }));
   }
-  const privateKey = createPrivateKey(readFileSync(file));
+  return keyFromPem(readFileSync(file));
+}
+/** { privateKey, publicKey, kid, jwk } from a PEM. kid: the first 16 characters of base64url(SHA-256(x)), as KeaC's. */
+export function keyFromPem(pem) {
+  const privateKey = createPrivateKey(pem);
   const publicKey = createPublicKey(privateKey);
   const jwk = publicKey.export({ format: 'jwk' });
   const kid = createHash('sha256').update(jwk.x).digest('base64url').slice(0, 16);

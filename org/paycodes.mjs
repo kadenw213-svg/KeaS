@@ -9,12 +9,19 @@
 // open. The key is the server's, not the payroll vault's: a KeaS server opens rates while it runs, with no payroll
 // passphrase. The Kea Hub keeps it in its data folder as org-data.key (hub/index.mjs; see docs/DEVELOPING.md).
 //
+// Rate history: a code's rate changes from a date (POST /v1/orgs/:id/pay-codes/:cid { rate, effectiveFrom }, today in
+// the organization's time zone when no date is given). Each change is a row of org_pay_code_rates, sealed like the
+// code's first rate (bound to the code's id and the date). Hours are paid at the rate in effect on the day they were
+// worked: the newest change on or before that day, else the rate the code was made with. A change dated in the future
+// can be taken back before its day.
+//
 // The payroll vault reads the hours to pay from here (payFeed, and GET /v1/orgs/:id/pay-feed): people, punches with
 // their effective codes, the codes' rates, and whether timecards are approved. SSNs, bank details, tax forms, pay
 // runs and stubs stay in the vault.
 import { seal, unseal, isSealed, sealContext } from '../server/lib/vault.mjs';
 import { pairPunches } from '../server/lib/rules.mjs';
 import { localDate, zonedToUtc, addDays, iso, dayNum } from '../server/lib/time.mjs';
+const DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 const MAX_CODES = 500;
 const MAX_RATE = 10_000; // dollars an hour
@@ -31,14 +38,19 @@ export function dataKeyFrom(k) {
 /** Seals and opens pay code rates (whole cents) with the org data key, each bound to its code's id. */
 export function makeRateSealer(key) {
   const ctx = (cid) => sealContext('org_pay_codes', 'rate', [cid]);
+  const ctxAt = (cid, from) => sealContext('org_pay_code_rates', 'rate', [cid, from]);
+  const opened = (cid, v, c) => {
+    if (!isSealed(v)) throw new Error(`The pay rate of code ${cid} isn't sealed. The organization database may have been changed outside KeaS.`);
+    const n = Number(unseal(key, v, c));
+    if (!Number.isSafeInteger(n) || n < 0) throw new Error(`The pay rate of code ${cid} doesn't open as an amount.`);
+    return n;
+  };
   return {
     seal: (cid, cents) => seal(key, String(cents), ctx(cid)),
-    open(cid, v) {
-      if (!isSealed(v)) throw new Error(`The pay rate of code ${cid} isn't sealed. The organization database may have been changed outside KeaS.`);
-      const n = Number(unseal(key, v, ctx(cid)));
-      if (!Number.isSafeInteger(n) || n < 0) throw new Error(`The pay rate of code ${cid} doesn't open as an amount.`);
-      return n;
-    },
+    open: (cid, v) => opened(cid, v, ctx(cid)),
+    /** A rate change from a date (org_pay_code_rates), bound to the code and the date. */
+    sealAt: (cid, from, cents) => seal(key, String(cents), ctxAt(cid, from)),
+    openAt: (cid, from, v) => opened(cid, v, ctxAt(cid, from)),
   };
 }
 
@@ -47,7 +59,18 @@ export function makePayLogic(core, sealer) {
   const { h, bad, notFound, HttpError } = core;
   const noKey = () => { throw new HttpError(503, 'This server has no org data key, so it can’t keep pay rates. Ask whoever runs the server.'); };
   const codeRow = (oid, cid) => h.get('SELECT * FROM org_pay_codes WHERE id = ? AND org_id = ?', cid, oid) ?? notFound('That pay code is not in this organization.');
-  const rateOf = (r) => (sealer ? sealer.open(r.id, r.rate) : noKey());
+  const tzOf = (oid) => core.loadOrg(oid)?.tz ?? 'UTC';
+  /** A code's rates: the one it was made with (from: null), then each change by date. */
+  function ratesOf(r) {
+    if (!sealer) noKey();
+    const out = [{ from: null, rateCents: sealer.open(r.id, r.rate) }];
+    for (const x of h.all('SELECT effective_from, rate FROM org_pay_code_rates WHERE code_id = ? ORDER BY effective_from', r.id)) out.push({ from: x.effective_from, rateCents: sealer.openAt(r.id, x.effective_from, x.rate) });
+    return out;
+  }
+  /** The rate in effect on a local date (YYYY-MM-DD): the newest change on or before it, else the first rate. */
+  const rateOn = (r, date, list = ratesOf(r)) => list.reduce((cur, x) => (x.from == null || x.from <= date ? x.rateCents : cur), list[0].rateCents);
+  /** The rate in effect today, in the organization's time zone. */
+  const rateOf = (r) => rateOn(r, localDate(core.now(), tzOf(r.org_id ?? h.get('SELECT org_id FROM org_pay_codes WHERE id = ?', r.id)?.org_id)));
   const grantRows = (oid, aid) => h.all('SELECT g.*, c.name, c.active, c.color, c.kind, c.rate, c.id AS cid, c.department_id, c.position_id FROM org_member_pay_codes g JOIN org_pay_codes c ON c.id = g.code_id WHERE g.org_id = ? AND g.account_id = ? ORDER BY g.is_default DESC, c.name, c.id', oid, aid);
   const defaultOf = (oid, aid) => (aid ? h.get('SELECT code_id FROM org_member_pay_codes WHERE org_id = ? AND account_id = ? AND is_default = 1', oid, aid)?.code_id ?? null : null);
   const granted = (oid, aid, cid) => !!(aid && cid && h.get('SELECT 1 FROM org_member_pay_codes WHERE org_id = ? AND account_id = ? AND code_id = ?', oid, aid, cid));
@@ -90,17 +113,20 @@ export function makePayLogic(core, sealer) {
     const rows = h.all('SELECT * FROM org_punches WHERE org_id = ? AND account_id = ? AND at >= ? AND at < ? ORDER BY at', o.id, aid, fromMs, toMs);
     const eff = effectiveCodes(o.id, aid, rows);
     const { pairs } = pairPunches(rows.map((p) => ({ id: p.id, type: p.type, at: iso(p.at), code: eff.get(p.id) ?? null })), { now: nowMs });
-    const byCode = new Map();
+    const byCode = new Map(), byCodeDay = new Map();
     for (const pr of pairs) {
       const code = pr.in.code ?? null;
       for (let t = pr.start; t < pr.end; t += 60_000) {
         const d = localDate(t, o.tz);
-        if (d >= from && d <= to) byCode.set(code, (byCode.get(code) || 0) + 1);
+        if (d < from || d > to) continue;
+        byCode.set(code, (byCode.get(code) || 0) + 1);
+        const k = `${code ?? ''}|${d}`;
+        byCodeDay.set(k, (byCodeDay.get(k) || 0) + 1);
       }
     }
-    return { byCode, pairs };
+    return { byCode, byCodeDay, pairs };
   }
-  return { sealer, codeRow, rateOf, grantRows, defaultOf, granted, pickFor, effectiveCodes, workedByCode, hasKey: () => !!sealer, requireKey: () => { if (!sealer) noKey(); } };
+  return { sealer, codeRow, rateOf, rateOn, ratesOf, grantRows, defaultOf, granted, pickFor, effectiveCodes, workedByCode, hasKey: () => !!sealer, requireKey: () => { if (!sealer) noKey(); } };
 }
 
 /**
@@ -122,8 +148,15 @@ export function mountPayCodes(core, { R, Rplain, deptRow, positionRow, clock }) 
   const codeOut = (r, showRate, extra = {}) => ({
     id: r.id, name: r.name, kind: r.kind, color: r.color ?? null, active: !!r.active, departmentId: r.department_id ?? null, positionId: r.position_id ?? null,
     createdAt: r.created_at, updatedAt: r.updated_at ?? null,
-    ...(showRate ? { rateCents: pay.rateOf(r), rate: pay.rateOf(r) / 100 } : {}), ...extra,
+    ...(showRate ? rateFields(r) : {}), ...extra,
   });
+  /** The rate today, every change with its date, and what's coming (changes dated after today). */
+  function rateFields(r) {
+    const list = pay.ratesOf(r);
+    const today = localDate(now(), core.loadOrg(r.org_id)?.tz ?? 'UTC');
+    const cents = pay.rateOn(r, today, list);
+    return { rateCents: cents, rate: cents / 100, rates: list.map((x) => ({ from: x.from, rateCents: x.rateCents, rate: x.rateCents / 100 })), upcoming: list.filter((x) => x.from && x.from > today).map((x) => ({ from: x.from, rateCents: x.rateCents })) };
+  }
   /** May see this code's rate: paycodes.manage, or rates.view where the code belongs (the whole org when nowhere). */
   const seesRate = (x, r) => x.can('paycodes.manage', null) || x.can('rates.view', r.department_id ?? null);
   const seesCodes = (x) => ['paycodes.manage', 'paycodes.assign', 'rates.view', 'schedule.edit', 'timecards.approve'].some((a) => x.can(a));
@@ -161,15 +194,39 @@ export function mountPayCodes(core, { R, Rplain, deptRow, positionRow, clock }) 
       set.name = V.name(body.name, 'Name', { max: 60 });
       if (h.get('SELECT 1 FROM org_pay_codes WHERE org_id = ? AND lower(name) = lower(?) AND active = 1 AND id != ?', x.o.id, set.name, r.id)) bad(`There’s already a pay code called ${set.name}.`);
     }
-    if ('rate' in body) { pay.requireKey(); set.rate = pay.sealer.seal(r.id, rateIn(body.rate)); }
+    let rateChange = null;
+    if ('rate' in body) {
+      pay.requireKey();
+      // A new rate from a date (today when none is given); hours before it keep the rate they were worked at.
+      const from = body.effectiveFrom == null ? localDate(now(), x.o.tz) : String(body.effectiveFrom);
+      if (!DATE.test(from) || Number.isNaN(Date.parse(`${from}T00:00:00Z`))) bad('The date a rate starts looks like 2026-12-01.');
+      rateChange = { from, cents: rateIn(body.rate) };
+      // On or before the day the code was made: that's its first rate (no hours were worked at it before then).
+      if (from <= localDate(r.created_at, x.o.tz)) { set.rate = pay.sealer.seal(r.id, rateChange.cents); rateChange = { ...rateChange, base: true }; }
+    } else if ('effectiveFrom' in body) bad('Send the rate that starts on that date too.');
     if ('color' in body) set.color = colorIn(body.color);
     if ('active' in body) set.active = V.bool(body.active, 'On') ? 1 : 0;
     if ('departmentId' in body) set.department_id = body.departmentId ? deptRow(x.o.id, body.departmentId).id : null;
     if ('positionId' in body) set.position_id = body.positionId ? positionRow(x.o.id, body.positionId).id : null;
-    if (!Object.keys(set).length) bad('Nothing to change.');
+    if (!Object.keys(set).length && !rateChange) bad('Nothing to change.');
     set.updated_at = now();
-    h.run(`UPDATE org_pay_codes SET ${Object.keys(set).map((k) => `${k} = ?`).join(', ')} WHERE id = ?`, ...Object.values(set), r.id);
-    audit(me.id, 'org.paycode_update', x.o.id, { code: r.id, ...(set.name ? { name: set.name } : {}), ...('rate' in set ? { rateChanged: true } : {}), ...('active' in set ? { active: !!set.active } : {}) }, ip);
+    tx(() => {
+      h.run(`UPDATE org_pay_codes SET ${Object.keys(set).map((k) => `${k} = ?`).join(', ')} WHERE id = ?`, ...Object.values(set), r.id);
+      if (rateChange && !rateChange.base) h.run('INSERT INTO org_pay_code_rates (code_id,effective_from,rate,set_by,set_at) VALUES (?,?,?,?,?) ON CONFLICT(code_id,effective_from) DO UPDATE SET rate = excluded.rate, set_by = excluded.set_by, set_at = excluded.set_at',
+        r.id, rateChange.from, pay.sealer.sealAt(r.id, rateChange.from, rateChange.cents), me.id, now());
+    });
+    // (Rates never go into the audit log; the date a change starts does.)
+    audit(me.id, 'org.paycode_update', x.o.id, { code: r.id, ...(set.name ? { name: set.name } : {}), ...(rateChange ? { rateChanged: true, effectiveFrom: rateChange.from } : {}), ...('active' in set ? { active: !!set.active } : {}) }, ip);
+    return { code: codeOut(pay.codeRow(x.o.id, r.id), true) };
+  });
+  // Taking back a rate change that hasn't started yet (one dated today or earlier has paid hours already).
+  R('POST', '/v1/orgs/:id/pay-codes/:cid/rates/:from/delete', ({ me, params, ip }) => {
+    const x = asOrg(params.id, me, 'paycodes.manage', { dept: null });
+    const r = pay.codeRow(x.o.id, params.cid);
+    if (!h.get('SELECT 1 FROM org_pay_code_rates WHERE code_id = ? AND effective_from = ?', r.id, params.from)) notFound('There’s no rate change on that date.');
+    if (params.from <= localDate(now(), x.o.tz)) bad('That rate has started already, so hours were worked at it. Set a new rate from a later date instead.');
+    h.run('DELETE FROM org_pay_code_rates WHERE code_id = ? AND effective_from = ?', r.id, params.from);
+    audit(me.id, 'org.paycode_rate_delete', x.o.id, { code: r.id, effectiveFrom: params.from }, ip);
     return { code: codeOut(pay.codeRow(x.o.id, r.id), true) };
   });
   R('POST', '/v1/orgs/:id/pay-codes/:cid/delete', ({ me, params, ip }) => {
@@ -185,7 +242,7 @@ export function mountPayCodes(core, { R, Rplain, deptRow, positionRow, clock }) 
   // ---------- people's codes ----------
   const memberCodesOut = (oid, aid, showRate) => pay.grantRows(oid, aid).map((g) => ({
     id: g.code_id, name: g.name, kind: g.kind, color: g.color ?? null, active: !!g.active, default: !!g.is_default, grantedAt: g.granted_at,
-    ...(showRate ? { rateCents: pay.rateOf({ id: g.code_id, rate: g.rate }), rate: pay.rateOf({ id: g.code_id, rate: g.rate }) / 100 } : {}),
+    ...(showRate ? (() => { const c = { id: g.code_id, rate: g.rate, org_id: oid }; const v = pay.rateOf(c); const up = pay.ratesOf(c).filter((q) => q.from && q.from > localDate(now(), core.loadOrg(oid)?.tz ?? 'UTC')); return { rateCents: v, rate: v / 100, ...(up.length ? { upcoming: up.map((q) => ({ from: q.from, rateCents: q.rateCents })) } : {}) }; })() : {}),
   }));
   const target = (x, aid) => { if (!memberRow(x.o.id, aid)) notFound('Not a member.'); return { aid, dept: deptOf(x.o.id, aid) }; };
   R('GET', '/v1/orgs/:id/members/:aid/pay-codes', ({ me, params }) => {
@@ -289,17 +346,32 @@ export function mountPayCodes(core, { R, Rplain, deptRow, positionRow, clock }) 
     if (query.periodStart && period.start !== query.periodStart) bad(`That isn’t the first day of a pay period. Try ${period.start}.`);
     const codes = memberCodesOut(o.id, me.id, true);
     const tc = clock.computeTimecard(o, s, me.id, period);
-    const { byCode } = pay.workedByCode(o, me.id, period.start, period.end, now());
+    const { byCodeDay } = pay.workedByCode(o, me.id, period.start, period.end, now());
     const known = new Map(codes.map((c) => [c.id, c]));
-    const hours = [...byCode].map(([cid, min]) => {
-      const c = cid ? known.get(cid) ?? (() => { const r = h.get('SELECT * FROM org_pay_codes WHERE id = ?', cid); return r && { id: r.id, name: r.name, color: r.color, rateCents: pay.rateOf(r), rate: pay.rateOf(r) / 100, granted: false }; })() : null;
-      return { codeId: cid, name: c?.name ?? null, color: c?.color ?? null, rateCents: c?.rateCents ?? null, minutes: min, hours: +(min / 60).toFixed(2), ...(c && c.granted === false ? { noLongerGiven: true } : {}) };
-    }).sort((a, b) => b.minutes - a.minutes);
+    // One line per code and rate: a rate that changed during the period pays each day at the rate of that day.
+    const lines = new Map();
+    const rowsOf = new Map();
+    for (const [k, min] of byCodeDay) {
+      const [cid0, day] = k.split('|');
+      const cid = cid0 || null;
+      let row = cid ? rowsOf.get(cid) : null;
+      if (cid && !rowsOf.has(cid)) { row = h.get('SELECT * FROM org_pay_codes WHERE id = ?', cid) ?? null; rowsOf.set(cid, row); }
+      const cents = row ? pay.rateOn(row, day) : null;
+      const key = `${cid ?? ''}|${cents ?? ''}`;
+      const c = cid ? known.get(cid) : null;
+      const l = lines.get(key) || { codeId: cid, name: c?.name ?? row?.name ?? null, color: c?.color ?? row?.color ?? null, rateCents: cents, minutes: 0, from: day, to: day, ...(row && !c ? { noLongerGiven: true } : {}) };
+      l.minutes += min;
+      if (day < l.from) l.from = day;
+      if (day > l.to) l.to = day;
+      lines.set(key, l);
+    }
+    const hours = [...lines.values()].map((l) => ({ ...l, hours: +(l.minutes / 60).toFixed(2) })).sort((a, b) => b.minutes - a.minutes || (a.from < b.from ? -1 : 1));
     return {
       period, current: cur, codes, defaultCodeId: codes.find((c) => c.default)?.id ?? null, hours,
       totals: { workedMin: tc.totals.workedMin, regularMin: tc.totals.regularMin, overtimeMin: tc.totals.overtimeMin, doubleTimeMin: tc.totals.doubleTimeMin || 0 },
       approved: tc.approved,
-      note: 'Pay stubs come from payroll: open Pay stubs in KeaS Payroll, or ask your payroll admin.',
+      // My own stubs, published by payroll when a pay run is finalized (org/stubs.mjs); the whole stub is /me/stubs/:id.
+      stubs: core.stubs?.listFor(o.id, me.id) ?? [],
     };
   });
 
@@ -324,7 +396,12 @@ export function mountPayCodes(core, { R, Rplain, deptRow, positionRow, clock }) 
     const o = core.loadOrg(oid) ?? notFound('Organization not found.');
     const s = core.orgSettings(o);
     const fromMs = zonedToUtc(addDays(from, -1), '00:00', o.tz), toMs = zonedToUtc(addDays(to, 2), '00:00', o.tz);
-    const codes = h.all('SELECT * FROM org_pay_codes WHERE org_id = ? ORDER BY name, id', oid).map((r) => ({ id: r.id, name: r.name, kind: r.kind, active: !!r.active, rateCents: pay.rateOf(r), departmentId: r.department_id ?? null, positionId: r.position_id ?? null }));
+    // Each code's rate history goes along: the vault pays each day at the rate of that day (rates: [{ from, rateCents }],
+    // the first with from: null). rateCents is the rate on the period's last day.
+    const codes = h.all('SELECT * FROM org_pay_codes WHERE org_id = ? ORDER BY name, id', oid).map((r) => {
+      const rates = pay.ratesOf(r);
+      return { id: r.id, name: r.name, kind: r.kind, active: !!r.active, rateCents: pay.rateOn(r, to, rates), rates, departmentId: r.department_id ?? null, positionId: r.position_id ?? null };
+    });
     const periods = [];
     for (let p = clock.periodOf(o, s, from); p.start <= to; p = clock.periodOf(o, s, addDays(p.end, 1))) periods.push(p.start);
     const members = h.all("SELECT * FROM org_members WHERE org_id = ? AND status = 'active'", oid);

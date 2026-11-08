@@ -1,6 +1,6 @@
 // One-time import of a KeaS org server's people, positions, shifts, punches, missed-punch requests and timecard
-// approvals into an organization on this Kea Hub (org/import.mjs). People are matched to Hub accounts by the account
-// their payroll sign-in is linked to, then by email; the report lists everyone it couldn't match. Running it again
+// approvals into an organization on this KeaS server (org/import.mjs). People are matched to Kea accounts that have signed
+// in here (keas_members) by the account their payroll sign-in is linked to, then by email; the report lists everyone it couldn't match. Running it again
 // brings in only what's missing.
 //
 //   node hub/import-org-server.mjs --server <org.db> --org <orgId> [--hub-data <folder>] [--server-org <id>]
@@ -12,8 +12,7 @@ import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb as openHubDb, DATA_DIR } from './db.mjs';
-import { hubIdentity } from './orgIdentity.mjs';
-import { mountOrg } from '../org/index.mjs';
+import { mountOrg, passIdentity } from '../org/index.mjs';
 import { openDb as openServerDb } from '../server/db.mjs';
 import { makeVault } from '../server/payroll/vaultstate.mjs';
 import { readFileSync } from 'node:fs';
@@ -22,7 +21,7 @@ export function runImport({ hubData = DATA_DIR, server, org, serverOrg = null, m
   if (!server || !existsSync(server)) throw new Error('Name the org server’s database with --server.');
   if (!org) throw new Error('Name the organization to import into with --org (its id is in Kea, Work, or /owner/orgs).');
   const src = openServerDb(server);
-  const h = openHubDb(join(hubData, 'hub.db'));
+  const h = openHubDb(join(hubData, 'keas.db'));
   try {
     const vault = makeVault(src);
     if (!vault.initialized()) throw new Error('That org server database has no vault set up; there is nothing to import.');
@@ -31,7 +30,7 @@ export function runImport({ hubData = DATA_DIR, server, org, serverOrg = null, m
     if (!pass || !vault.unlock(pass)) throw new Error('The org server’s vault didn’t open. Set KEAS_VAULT_PASSPHRASE to its passphrase.');
     const getSetting = (k, d) => { const r = h.get('SELECT value FROM settings WHERE key = ?', k); return r ? JSON.parse(r.value) : d; };
     const audit = (actor, action, target, detail, ip) => h.run('INSERT INTO audit (at,actor,action,target,detail,ip) VALUES (?,?,?,?,?,?)', Date.now(), actor, action, target, detail == null ? null : JSON.stringify(detail), ip ?? null);
-    const engine = mountOrg({ R: () => {}, h, audit, identity: hubIdentity({ h, now: Date.now, extrasFor: () => ({}), getSetting }) });
+    const engine = mountOrg({ R: () => {}, h, audit, identity: passIdentity({ h, operatorId: () => getSetting('operator', null), getSetting }) });
     return engine.importServerOrg({ src, orgId: org, serverOrgId: serverOrg, by, match, dryRun });
   } finally {
     src.close();

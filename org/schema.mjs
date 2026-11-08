@@ -214,6 +214,19 @@ CREATE TABLE IF NOT EXISTS org_pay_codes (
   created_by TEXT, created_at INTEGER NOT NULL, updated_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS org_pay_codes_org ON org_pay_codes(org_id);
+-- A pay code's rate from a date on (org/paycodes.mjs): sealed with the org data key, bound to the code and the date.
+CREATE TABLE IF NOT EXISTS org_pay_code_rates (
+  code_id TEXT NOT NULL REFERENCES org_pay_codes(id) ON DELETE CASCADE, effective_from TEXT NOT NULL, rate TEXT NOT NULL,
+  set_by TEXT, set_at INTEGER NOT NULL, PRIMARY KEY (code_id, effective_from)
+);
+-- Pay stubs published from the payroll vault when a pay run is finalized (org/stubs.mjs): one per member and run, the
+-- whole stub sealed with a key only for that member (derived from the org data key and their account id).
+CREATE TABLE IF NOT EXISTS org_stubs (
+  id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE, account_id TEXT NOT NULL, run_id TEXT NOT NULL,
+  period_start TEXT NOT NULL, period_end TEXT NOT NULL, pay_date TEXT NOT NULL, body TEXT NOT NULL,
+  published_by TEXT, published_at INTEGER NOT NULL, UNIQUE (org_id, run_id, account_id)
+);
+CREATE INDEX IF NOT EXISTS org_stubs_member ON org_stubs(org_id, account_id, pay_date);
 -- Who was given which code; each person has at most one default.
 CREATE TABLE IF NOT EXISTS org_member_pay_codes (
   org_id TEXT NOT NULL, account_id TEXT NOT NULL, code_id TEXT NOT NULL REFERENCES org_pay_codes(id) ON DELETE CASCADE,
