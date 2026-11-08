@@ -200,4 +200,29 @@ function createAccount({ dir, protect, getUrl, setUrl, fetchImpl = fetch, client
   return { url, status, login, orgs, createOrg, joinOrg, updateOrg, orgPeople, orgPayCodes, orgPayFeed, orgApprove, orgVerifyEmail, backupCodes, register, logout, changeUrl, terms, acceptTerms, adopt, payrollToken, freshPayrollToken, cached, signedIn: () => !!readToken(), forget: signOutHere };
 }
 
-module.exports = { createAccount, checkUrl, AccountError, DEFAULT_HUB_URL };
+/**
+ * KeaS 0.5 kept the Hub account's session and summary straight in the profile folder (hub-session.bin, account.json);
+ * 0.6 keeps them in <profile>\hub-account, and account.json in the profile is KeaC's. Moved over once, so the owner
+ * stays signed in for payroll after the update, and KeaC's summary doesn't start as the Hub account's.
+ */
+function adoptOldSession(fromDir, toDir) {
+  const moved = [];
+  const oldToken = path.join(fromDir, 'hub-session.bin');
+  const oldCache = path.join(fromDir, 'account.json');
+  let cache = null;
+  try { cache = JSON.parse(fs.readFileSync(oldCache, 'utf8')); } catch {}
+  // (A 0.5 summary names its Hub; KeaC's names its KeaC.)
+  const hubCache = !!cache && typeof cache === 'object' && 'hub' in cache && !('keac' in cache);
+  const take = (from, name) => {
+    const to = path.join(toDir, name);
+    if (fs.existsSync(to)) return;
+    fs.mkdirSync(toDir, { recursive: true });
+    fs.renameSync(from, to);
+    moved.push(name);
+  };
+  if (fs.existsSync(oldToken)) take(oldToken, 'hub-session.bin');
+  if (hubCache) { take(oldCache, 'account.json'); if (fs.existsSync(oldCache)) fs.rmSync(oldCache, { force: true }); }
+  return moved;
+}
+
+module.exports = { createAccount, checkUrl, AccountError, DEFAULT_HUB_URL, adoptOldSession };

@@ -524,6 +524,7 @@ function registerIpc() {
 
 app.whenReady().then(async () => {
   config = readConfig();
+  try { const moved = require('./legacy-account.cjs').adoptOldSession(app.getPath('userData'), path.join(app.getPath('userData'), 'hub-account')); if (moved.length) log('kept the Kea Hub sign-in from KeaS 0.5:', moved.join(', ')); } catch (e) { log('the Kea Hub sign-in from KeaS 0.5', e.message); }
   nativeTheme.themeSource = config.theme === 'light' || config.theme === 'dark' ? config.theme : 'system';
   startUpdates();
   registerIpc();
