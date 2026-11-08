@@ -228,7 +228,7 @@ function done() {
       h('p', null, h('b', null, 'Your organization’s server is running.')),
       url ? h('p', null, 'Public address: ', h('span', { class: 'url' }, url)) : h('p', { class: 'muted' }, 'Only reachable on this computer.'),
       h('p', null, 'Data: ', h('span', { class: 'url' }, S.config.dataDir), ' ', h('button', { class: 'btn', onclick: () => k.openFolder({ dir: S.config.dataDir }) }, 'Open folder')),
-      h('p', { class: 'muted small' }, 'Your people join with a code you make under People, in Kea (Work) or here.')),
+      h('p', { class: 'muted small' }, 'Your people join in Kea with a join link you make on the home screen here (or with a code from Kea, Work, People).')),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: S.boot !== false, onchange: (e) => (S.boot = e.target.checked) }), 'Start KeaS when Windows starts (it waits in the tray and keeps the server running)'),
     S.error && h('div', { class: 'err' }, S.error),
     h('div', { class: 'actions' }, h('button', { class: 'btn primary', onclick: async () => {
@@ -349,11 +349,34 @@ function rolesPanel() {
           h('select', { onchange: (e) => (S.ra = { ...(S.ra || {}), rid: e.target.value }) }, h('option', { value: '' }, 'Role'), (r.roles || []).map((x) => h('option', { value: x.id }, x.name))),
           h('button', { class: 'btn primary', type: 'submit', disabled: S.busy }, 'Give it')))));
 }
+// A join link for Kea (kea://join?s=<this server's address>&c=<code>): people already in the organization (from the
+// Kea Hub, say) get it back in Kea as they were; anyone new asks, and is let in under Asking to join.
+const joinLinkOf = (url, code) => `kea://join?s=${encodeURIComponent(url)}&c=${encodeURIComponent(code)}`;
+function joinPanel() {
+  const url = S.config.publicUrl || null;
+  const j = S.joinLink;
+  return h('div', { class: 'panel', id: 'joinlink' },
+    h('h2', { style: 'margin-top:0' }, 'Join link for Kea'),
+    h('p', { class: 'muted small' }, 'Send it to your people, and open it yourself on each of your devices. Someone already in the organization (from the Kea Hub too) gets it back in Kea as they were. Anyone new asks to join, and you let them in here or in Kea.'),
+    !url && h('p', { class: 'muted small' }, 'This server is reachable only on this computer, so the link works only here. Make it reachable from anywhere first to send it to others.'),
+    j ? h('div', null, h('p', null, h('span', { class: 'url' }, j)), h('div', { class: 'row' },
+      h('button', { class: 'btn primary', onclick: () => { navigator.clipboard.writeText(j); S.copied = true; render(); } }, S.copied ? 'Copied' : 'Copy the link'),
+      h('button', { class: 'btn', onclick: () => { S.joinLink = null; S.copied = false; render(); } }, 'Done')))
+      : h('button', { class: 'btn', disabled: S.busy, onclick: async () => {
+        S.busy = true; S.oaError = ''; render();
+        try {
+          const r = await call(k.orgApi, { method: 'POST', path: orgPath('/codes'), body: { role: 'member', needsApproval: true, label: 'Join link' } });
+          S.joinLink = joinLinkOf(url || `http://127.0.0.1:${S.port || 4860}`, r.code.code);
+          S.copied = false;
+        } catch (e) { S.oaError = e.message; }
+        S.busy = false; render();
+      } }, 'Make a join link'));
+}
 function orgAdmin() {
   if (!S.cl || !S.cl.org || !['owner', 'admin'].includes(S.cl.org.role)) return null;
   if (!S.oa) { loadOrgAdmin(); return h('div', { class: 'panel' }, h('p', { class: 'muted small' }, 'Loading the organization…')); }
   if (S.oa.error) return h('div', { class: 'err' }, S.oa.error);
-  return [h('h2', { style: 'margin-top:22px' }, S.cl.org.name), S.oaError && h('div', { class: 'err' }, S.oaError), payCodesPanel(), rolesPanel(), peoplePanel()];
+  return [h('h2', { style: 'margin-top:22px' }, S.cl.org.name), S.oaError && h('div', { class: 'err' }, S.oaError), joinPanel(), payCodesPanel(), rolesPanel(), peoplePanel()];
 }
 function loadPeople() {
   if (S.peopleLoading) return;
