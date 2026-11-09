@@ -189,7 +189,7 @@ owner. Kea's sync chooser can instead use Google Drive, OneDrive, Dropbox or any
 
 ## 4. Shared Claude (public summary)
 
-Every online Kea account can use Kea's shared Claude (the Kea owner's Claude plan, run on the owner's PC), always
+Every online Kea account can use Kea's shared Claude (the Kea owner's Claude, run on the owner's PC), always
 within limits. Kea prefers the user's own Claude when it has one. Kea asks KeaC with `/v1/scan` (as Hub 0.5) and, for
 Teach explainers, `/v1/teach`. KeaC enforces:
 
@@ -231,6 +231,10 @@ An older KeaC has no `sharedTeach`: Kea doesn't offer Teach through it. An older
 
 **Usage** (`features` has `usageTracking`): KeaC counts the tokens each shared-Claude job used, per account, day and
 kind, for the daily cap and for the owner. Nothing about it is shown to other accounts.
+
+**Where jobs run** (`features` has `apiBackend`): the owner's PC runs shared-Claude jobs on the owner's Claude API
+credits or on their Claude plan, the owner's choice. Nothing changes for Kea asking: the same routes, limits and
+answers, and a job's answer never says which one ran it.
 
 ## 5. Approvals (public summary)
 
