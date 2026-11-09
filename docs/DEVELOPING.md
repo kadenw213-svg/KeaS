@@ -107,6 +107,33 @@ One module for organizations that any KeaS server mounts: `mountOrg({ R, h, now,
 - **Upgrades:** `org/schema.mjs migrateOrg` upgrades a 0.5 database in place (each fixed role becomes its template), and
   a version 2 database to 3 (pay code columns on shifts and punches; the Admin template gains the pay code abilities). `test/fixtures/hub-0.5.0-orgs.sql` is a Hub database made by 0.5.0's code, for the upgrade test.
 
+## Releasing one app on its own
+
+Kea (PC and phone), KeaS and KeaC are released separately, and each release must keep working with the other apps'
+versions still in use (`docs/protocol.md` section 0 in KeaS and KeaC is the contract).
+
+- **Add, don't change.** A new field, route or `features` entry is fine at any time: older apps ignore it. Read new
+  fields as optional, because the other side may be a release older.
+- **Never drop support for the previous release in the same version.** A route or field an older app uses stays until
+  a later release, after the apps that use it have updated (check the version the servers see in their logs).
+- **Raise `minClients` only when a break is unavoidable**, and only to a version that's already released and has had
+  time to update itself (the defaults are in `clients.mjs`: KeaC `server/lib/`, KeaS `hub/lib/`; keep the two files
+  the same). Apps below it get a plain 426 telling them to update, never a half-working answer. The owner can also
+  change it under Advanced without a release.
+- **Raise `protocol` only for a break no older app can follow** (it's one integer for the whole contract). Ship the
+  apps that understand the new protocol first, then the server that needs it.
+- **Run the compatibility matrix before releasing:** `npm run test:compat` (also part of the normal test run). It
+  runs the current app against the current and previous servers, and the previous app against the current server
+  (the previous releases are read with `git show` from the sibling repos: Kea 0.84.0, KeaS 0.8.0, KeaC 0.3.0 and
+  0.2.0). When you release, move the pinned "previous" commits in `test/compat/harness.mjs` forward in all three
+  repos.
+- The KeaS app shows where updates stand on its home screen (version, the last successful check and the last try)
+  and says plainly when they're stuck: checks failing 3 times in a row (or for 2 days), or a downloaded update not
+  installed after 3 days, with Install now. The times are kept in `keas-config.json` `updateHistory` and the
+  thresholds in `updateWarn` (`{ failures, staleDays, waitDays }`). When the app can't reach its own update feed it
+  still shows an update when its server's `GET /v1/health` advertises a newer `latest.keas`. When KeaC answers this
+  KeaS with 426, the home screen says "KeaC says: Update KeaS to keep signing people in with their Kea accounts."
+
 ## Project layout
 
 ```
