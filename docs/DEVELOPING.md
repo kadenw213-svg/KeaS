@@ -96,10 +96,10 @@ One module for organizations that any KeaS server mounts: `mountOrg({ R, h, now,
     `org_punch_codes` (punches never change) and stops once that timecard is approved. Shifts and punches from before pay
     codes have none and are paid at the person's default.
   - **Rates are sealed**, AES-256-GCM with the server's org data key (`server/lib/vault.mjs` seal), bound to the code's id.
-    The host passes the key to `mountOrg({ dataKey })`. The Kea Hub keeps it in its data folder as `org-data.key` (64 hex
-    characters, made on first start, readable by the Hub's Windows account only, locked down with the folder, listed in
-    `SECRET_FILES` and carried in backups). It's the server's key, not payroll's: the Hub opens rates while it runs, with no
-    payroll passphrase. It's never rotated with the Hub's other keys (rates sealed with it open only with it). A host with
+    The host passes the key to `mountOrg({ dataKey })`. The KeaS server keeps it in its data folder as `org-data.key` (64 hex
+    characters, made on first start, readable by the server's Windows account only, locked down with the folder, listed in
+    `SECRET_FILES` and carried in backups). It's the server's key, not payroll's: the server opens rates while it runs, with
+    no payroll passphrase. It's never rotated with the server's other keys (rates sealed with it open only with it). A host with
     no key runs everything but pay codes.
   - **The payroll guard** (`org/payroll.mjs`): every org route refuses SSNs, bank details, tax ids, W-4s, direct deposits,
     paychecks and pay runs anywhere in a body, and pay rates too. The pay code routes are mounted with `{ rates: true }`:
@@ -110,14 +110,15 @@ One module for organizations that any KeaS server mounts: `mountOrg({ R, h, now,
 ## Project layout
 
 ```
-hub/            the Kea Hub: accounts, terms, classes, study, storage, shared-Claude queue and relay
-hub/lib/        passwords, TOTP, tokens, limits, study scoring, Claude budget, Google sign-in
+hub/            the KeaS server: passes from Kea accounts, sessions, files, the org engine mounted, the owner console
+hub/lib/        Kea account keys and revocations, tokens, limits, names, the server's log
+hub/legacy/     a KeaS 0.5 Kea Hub, run only for a data folder whose accounts haven't moved yet
 org/            the org engine: members, roles and abilities, structure, forms, schedules, swaps, the time clock, pay codes
 desktop/        the KeaS Windows app: setup wizard, Tailscale setup, tray
-server/         the workforce server: schedules, punches, timecards, certifications, pay runs
+server/         the payroll vault (pay runs, HR), and the workforce server for development
 shared/         labor-rule and tax tables (each records whether it's verified for the year)
-web/            the workforce web app (Vite + React), served by the workforce server
-test/           node:test suites for the Hub, the org engine and the workforce server
+web/            the payroll and workforce web app (Vite + React)
+test/           node:test suites for the server, the legacy Hub, the org engine, the vault and the app
 ```
 
 ## The payroll vault
@@ -167,7 +168,7 @@ test/           node:test suites for the Hub, the org engine and the workforce s
   SSN- and bank-shaped values refused). `POST /v1/payrun/publish-stubs` sends them again.
 - **The workforce server** (`npm run dev`) runs the same payroll and HR code on its sample data with its vault opened
   by a passphrase kept next to the database (`<db>.vaultkey`, development only: `devKeyFile`), so every screen can be
-  tried there. The KeaS app passes an organization server's passphrase in memory, kept with Windows DPAPI.
+  tried there.
 - **Code:** `server/payroll/` (one module per area: vault sign-in, approvals, org structure, pay structure, leave,
   pay run, onboarding, documents and expenses, reports, import, year-end, hiring and performance), screens in
   `web/src/screens/`, tests in `test/server/payroll.test.mjs` and `test/server/vault.test.mjs`.
