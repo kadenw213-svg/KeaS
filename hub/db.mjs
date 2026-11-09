@@ -15,10 +15,9 @@ export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS keas_members (
   id TEXT PRIMARY KEY, email TEXT, name TEXT NOT NULL DEFAULT '',
   first_seen INTEGER NOT NULL, last_pass_at INTEGER NOT NULL, pass_iat INTEGER NOT NULL DEFAULT 0,
-  -- The phone number the newest pass carried (only when the person shares it with their organizations), and whether
-  -- they also share it with classmates (the pass's phoneClassmates). Never shown to anyone without people.view, except
-  -- in org class rosters when phone_classmates is 1.
-  phone TEXT, phone_classmates INTEGER NOT NULL DEFAULT 0
+  -- The phone number the newest pass carried (only when the person shares it with someone), and who with: their
+  -- organizations (phoneOrgs: shown to people.view) and classmates (phoneClassmates: shown in org class rosters).
+  phone TEXT, phone_orgs INTEGER NOT NULL DEFAULT 0, phone_classmates INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS keas_members_email ON keas_members(email);
 -- KeaS's own sessions, made from passes. Only a hash of each token is kept.
@@ -82,7 +81,7 @@ CREATE TABLE IF NOT EXISTS member_files (
 export const KEAS_TABLES = ['keas_members', 'keas_sessions', 'keac_revoked', 'audit', 'settings', 'notifications', 'classes', 'class_members', 'invites', 'class_sessions', 'member_files'];
 
 // Columns added after the first KeaS 0.6 release ([table, column, type]); applied to existing databases.
-const COLUMNS = [['keas_members', 'phone', 'TEXT'], ['keas_members', 'phone_classmates', 'INTEGER NOT NULL DEFAULT 0']];
+const COLUMNS = [['keas_members', 'phone', 'TEXT'], ['keas_members', 'phone_orgs', 'INTEGER NOT NULL DEFAULT 0'], ['keas_members', 'phone_classmates', 'INTEGER NOT NULL DEFAULT 0']];
 
 /** Is this a KeaS 0.5 Kea Hub database (it has the accounts table)? */
 export const isHub05 = (db) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'accounts'").get();
@@ -94,7 +93,10 @@ export function openDb(file) {
   if (isHub05(db)) { db.close(); throw Object.assign(new Error(`${file} is a KeaS 0.5 Kea Hub database. Start the KeaS server (it upgrades it) or run node hub/upgrade.mjs first.`), { code: 'HUB05' }); }
   db.exec(SCHEMA);
   for (const [table, col, type] of COLUMNS) {
-    if (!db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+    if (db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === col)) continue;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+    // (A number kept before phone_orgs came from a pass that carried it only when it was shared with organizations.)
+    if (table === 'keas_members' && col === 'phone_orgs') db.exec('UPDATE keas_members SET phone_orgs = 1 WHERE phone IS NOT NULL');
   }
   const cache = new Map();
   const st = (sql) => { let s = cache.get(sql); if (!s) { s = db.prepare(sql); cache.set(sql, s); } return s; };

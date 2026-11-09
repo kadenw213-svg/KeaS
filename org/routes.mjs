@@ -73,8 +73,8 @@ export function mountRoutes(core, { R, O = null, classes = false, operator = nul
     return {
       id: r.account_id, name: r.display_name, role: core.legacyFor(r.org_id, r.account_id, all, x.tree), status: r.status, departmentId: r.department_id, title: r.title, emailVerified: !!r.email_verified,
       positionIds: positionsOf(r.org_id, r.account_id), joinedAt: r.joined_at, you: self,
-      // The phone number (where the person shares it with their organizations): only to themselves and people.view.
-      ...extrasOf(r, { phone: r.status === 'active' && x.m.status === 'active' && (self || x.can('people.view', d)) }),
+      // The phone number: always to the person themselves; to people.view where they share it with organizations.
+      ...extrasOf(r, { phone: self || (r.status === 'active' && x.m.status === 'active' && x.can('people.view', d)), self }),
       ...(self || x.can('people.view', d) ? { email: r.email, desiredMin: r.desired_min, desiredMax: r.desired_max, prefs: J(r.prefs, []), minor: r.birthdate ? ageOn(r.birthdate, localDate(now(), 'UTC')) < 18 : null } : {}),
       ...(self || x.can('people.birthdate', d) ? { birthdate: r.birthdate } : {}),
       ...(x.can('rates.view', d) ? { costRate: r.cost_rate == null ? null : r.cost_rate / 100 } : {}),
@@ -676,7 +676,7 @@ export function mountRoutes(core, { R, O = null, classes = false, operator = nul
     const assigned = nm ? h.all('SELECT * FROM org_class_assignments WHERE class_id = ?', c.class_id) : [];
     // The roster shows a phone number only for someone who shares it with classmates (extras('classes')).
     const prof = nm ? core.profilesOf(assigned.map((a) => a.account_id)) : null;
-    const classExtras = (aid) => prof?.get(aid)?.extras?.('classes', { phone: true }) ?? {};
+    const classExtras = (aid) => prof?.get(aid)?.extras?.('classes', { phone: true, self: aid === x.who.id }) ?? {};
     return {
       id: c.class_id, title: c.title, description: c.description, meetingUrl: c.meeting_url, status: c.status, certTypeId: c.cert_type_id,
       sessions: h.all('SELECT * FROM class_sessions WHERE class_id = ? ORDER BY start_at', c.class_id).map(sessOut),

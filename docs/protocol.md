@@ -58,12 +58,14 @@ There are no Kea passwords. Online, a Kea account signs in with **Google** or **
 | `PATCH /me` | `{ name?, phone? (null clears it), phoneShare?: { orgs?, classmates? } }` | the same as `GET /me` |
 | `POST /auth/logout`, sessions, export | as Hub 0.5 | |
 
-**Phone number** (optional, never public). Stored normalised to E.164 (`+15551234567`). Common US formats are accepted
-(`(555) 123-4567`, `555-123-4567`, `555.123.4567`, `5551234567`, `1 555 123 4567`, `+1 555 123 4567`); anything else
-is 400 `{ error }`. `phoneShare.orgs` (default true) shares it with the organizations the account joins (KeaS servers
-through the pass, section 2, and hosted orgs on KeaC), seen only by people with `people.view`; `phoneShare.classmates`
-(default false) also shares it in class rosters. Leaderboards, the public class list and anything unauthenticated
-never show it.
+**Phone number** (optional, never public). Stored normalised to E.164 (`+15551234567`). Accepted: any E.164 number
+(`+`, a country code, 8 to 15 digits in all, like `+44 20 7946 0958`; spaces, dots, dashes and brackets are dropped;
+a `+1` number has ten digits after the 1), and common US formats without the `+` (`(555) 123-4567`, `555-123-4567`,
+`555.123.4567`, `5551234567`, `1 555 123 4567`), stored as `+1...`. Anything else is 400 `{ error }`.
+`phoneShare.orgs` (default true) shares it with the organizations the account joins (KeaS servers through the pass,
+section 2, and hosted orgs on KeaC), seen only by people with `people.view`; `phoneShare.classmates` (default false)
+shares it in class rosters. The person always sees their own. Leaderboards, the public class list and anything
+unauthenticated never show it.
 
 **410 `{ passwordRetired: true }`** answers an older client's password sign-in or registration, with the sentence "Kea
 accounts now sign in with Google or Microsoft only. Update Kea, then choose Continue with Google or Continue with
@@ -82,22 +84,23 @@ How a Kea account signs in to a KeaS server without KeaS ever seeing a password.
    verified email (and, for the KeaC owner's own account only, a session that passed its two-step code) (403 `{ needsVerify: true }` otherwise: only an
    account moved from the old Hub can lack one, until it signs in with Google or Microsoft). KeaC answers `{ pass, exp }`.
 3. **Pass format.** JWT-shaped, `alg: EdDSA`, header `kid`. Payload:
-   `{ iss: 'kea', aud: 'keas:<serverId>', sub: <account id>, email, name, ev: true, iat, exp, phone?, phoneClassmates? }`.
-   `phone` (E.164, like `+15551234567`) is there only when the account has a phone number and shares it with its
-   organizations (`phoneShare.orgs`); `phoneClassmates: true` only when it shares it with classmates
-   (`phoneShare.classmates`). Each is left out otherwise.
+   `{ iss: 'kea', aud: 'keas:<serverId>', sub: <account id>, email, name, ev: true, iat, exp, phone?, phoneOrgs?, phoneClassmates? }`.
+   `phone` (E.164, like `+15551234567`) is there when the account has a phone number and either sharing switch is
+   on, always with `phoneOrgs: true|false` (`phoneShare.orgs`) and `phoneClassmates: true|false`
+   (`phoneShare.classmates`). With both off, or no number, none of the three is there.
    Lifetime **7 days**. Kea renews it silently once a day while online, so users never see expiry.
    Passes are only for KeaS servers. Organizations hosted on KeaC take no pass (section 5): KeaC is the account
    service, so their routes accept the Kea account's own KeaC session. No `keac-org:` audience is issued.
 4. **Using it.** Kea sends `POST <keas>/v1/auth/pass { pass }`. KeaS checks: signature against KeaC's keys, `iss`,
    `aud` equals its own id, `exp` in the future, `iat` not in the future (2 minutes skew), `sub` not on the
    revocation list. Then it makes its own KeaS session for that `sub` (KeaS session rules are KeaS's own).
-   A newer pass for the same `sub` renews the KeaS session. The name, email, `phone` and `phoneClassmates` of the
-   newest pass are kept on the member; a pass without `phone` or `phoneClassmates` clears them. In the org API a
-   member's `phone` shows only to themselves and to people with `people.view` for their department (the member lists
-   of `GET /v1/orgs/:id/members`, `me` in `GET /v1/orgs/:id`, and member answers), and in an org class roster
-   (`assigned` in `GET /v1/orgs/:id/classes`) only for someone with `phoneClassmates`. A member without `people.view`
-   never sees anyone else's.
+   A newer pass for the same `sub` renews the KeaS session. The name, email, `phone`, `phoneOrgs` and
+   `phoneClassmates` of the newest pass are kept on the member; a pass without them clears them (each switch counts
+   only when exactly `true`). In the org API a member's `phone` always shows to themselves; to people with
+   `people.view` for their department only with `phoneOrgs` (the member lists of `GET /v1/orgs/:id/members`, `me` in
+   `GET /v1/orgs/:id`, and member answers); and in an org class roster (`assigned` in `GET /v1/orgs/:id/classes`)
+   only with `phoneClassmates`. A member without `people.view` never sees anyone else's in member lists. Hosted orgs
+   and classes on KeaC follow the same rules.
    Answer: `{ token, exp }` (`exp` in ms); Kea then sends `Authorization: Bearer <token>`. A refused, expired or
    revoked pass answers 401 `{ error }`. Join links are `kea://join?s=<server url>&c=<join code>`.
 5. **KeaC's keys.** `GET <keac>/v1/keys` → `{ keys: [JWK with kid, alg EdDSA, use sig, status: 'current'|'next'|'retired'] }`.

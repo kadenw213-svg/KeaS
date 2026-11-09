@@ -99,10 +99,13 @@ export function checkPass(token, keys, { aud, nowMs = Date.now() }) {
   if (typeof p.iat !== 'number' || !Number.isFinite(p.iat) || p.iat > t + SKEW_S) fail('future');
   if (p.exp - p.iat > MAX_PASS_S) fail('lifetime');
   if (typeof p.sub !== 'string' || !ID.test(p.sub) || p.ev !== true || (p.email != null && typeof p.email !== 'string') || (p.name != null && typeof p.name !== 'string')) fail('claims');
-  // phone: only when the person shares it with their organizations (KeaC leaves it out otherwise); E.164, else ignored.
-  // phoneClassmates: true only when they also share it with classmates.
+  // phone: when the person shares it with anyone (KeaC leaves it out otherwise); E.164, else ignored. phoneOrgs and
+  // phoneClassmates: who with (each exactly true, or not shared there).
   const phone = typeof p.phone === 'string' && PHONE.test(p.phone) ? p.phone : null;
-  return { sub: p.sub, email: p.email ? String(p.email).trim().toLowerCase().slice(0, 254) : null, name: p.name ? String(p.name).slice(0, 120) : '', phone, phoneClassmates: p.phoneClassmates === true, iat: p.iat, exp: p.exp, kid: head.kid };
+  return {
+    sub: p.sub, email: p.email ? String(p.email).trim().toLowerCase().slice(0, 254) : null, name: p.name ? String(p.name).slice(0, 120) : '',
+    phone, phoneOrgs: !!phone && p.phoneOrgs === true, phoneClassmates: !!phone && p.phoneClassmates === true, iat: p.iat, exp: p.exp, kid: head.kid,
+  };
 }
 
 /**
