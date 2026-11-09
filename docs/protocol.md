@@ -200,7 +200,7 @@ Teach explainers, `/v1/teach`. KeaC enforces:
 | Study questions | 25 at a time; the next 25 only after 20 of the last batch were answered |
 | Assignment guide | one per assignment |
 | Teach explainer (a lesson or a follow-up) | 20 a day, one at a time |
-| Tokens | a daily cap per account (input, output and cache-write tokens; cache reads aren't counted), 4,000,000 by default |
+| Tokens | a daily cap per account (input, output and cache-write tokens; cache reads aren't counted), 500,000 by default. A class's first full scan is outside it (it has its own once-a-term limit) |
 
 Days are UTC. The owner can raise or lower any limit for one account, turn shared Claude off for it, or put it back
 to the defaults.
