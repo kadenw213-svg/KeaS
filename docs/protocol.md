@@ -189,16 +189,48 @@ owner. Kea's sync chooser can instead use Google Drive, OneDrive, Dropbox or any
 
 ## 4. Shared Claude (public summary)
 
-Kea prefers the user's own Claude. When the user has none, Kea can ask KeaC (`/v1/scan`, as Hub 0.5). KeaC enforces:
+Every online Kea account can use Kea's shared Claude (the Kea owner's Claude plan, run on the owner's PC), always
+within limits. Kea prefers the user's own Claude when it has one. Kea asks KeaC with `/v1/scan` (as Hub 0.5) and, for
+Teach explainers, `/v1/teach`. KeaC enforces:
 
-| What | Limit (owner-adjustable) |
+| What | Limit (owner-adjustable, per account too) |
 |---|---|
 | Full class scan | one per class per term; a whole-class rescan needs the user's own Claude |
 | Light check for new work | at most once a day per class |
 | Study questions | 25 at a time; the next 25 only after 20 of the last batch were answered |
 | Assignment guide | one per assignment |
+| Teach explainer (a lesson or a follow-up) | 20 a day, one at a time |
+| Tokens | a daily cap per account (input, output and cache-write tokens; cache reads aren't counted), 4,000,000 by default |
 
-Refusals answer 429 `{ error, limit, retryAt? }` with a plain sentence Kea shows as is.
+Days are UTC. The owner can raise or lower any limit for one account, turn shared Claude off for it, or put it back
+to the defaults.
+
+**Models are fixed** and can't be chosen by the request: Opus for class scans, light checks, study questions and
+guides; Sonnet for Teach explainers (effort medium, no tools). A `model` or `effort` sent with a request is ignored.
+
+Refusals answer 429 `{ error, code, limit, retryAt?, retryAfter?, allowance }` with a plain sentence Kea shows as is.
+`limit` names the limit (`fullScansPerTerm`, `updateCooldownHours`, `questionsAnsweredToUnlock`,
+`guidesPerAssignment`, `explainersPerDay`, `dailyTokenCap`, ...); `retryAt` (ms) is when it opens again, when that's
+known. `allowance` adds `lessonsToday`, `lessonsPerDay`, `tokensToday`, `tokensPerDay` and `resetsAt` (an older KeaC
+has only the scan counts).
+
+### Teach explainers (`features` has `sharedTeach`)
+
+| Method, path | What |
+|---|---|
+| `POST /v1/teach` | `{ question, courseCode?, chapter?, answer?, right?, dunno?, focus?, again?, followup?: { ask, lesson, earlier[] } }`: 202 `{ job: { id, status: 'queued', model } }`, or 429 as above, or 503 `{ code: 'no_worker' \| 'paused' }` when no lesson can be written now |
+| `GET /v1/teach/:id?since=<chars>&wait=<ms>` | `{ job: { id, status, text, length, error } }`: the text after `since` characters; with `wait` (at most 15 s) it answers when there's more, or when it's done |
+| `POST /v1/teach/:id/cancel` | stops it |
+
+`status` is `queued`, `running`, `done`, `failed` or `cancelled`. The text is the lesson as Claude writes it
+(Markdown, then one fenced `check` block of practice questions), so Kea shows it streaming in by asking again with
+`since` set to `length`. A follow-up carries the lesson it follows (there's no conversation to continue). Only the
+question, the answers and the lesson text are sent; never anything else from the user's Kea.
+
+An older KeaC has no `sharedTeach`: Kea doesn't offer Teach through it. An older Kea never asks.
+
+**Usage** (`features` has `usageTracking`): KeaC counts the tokens each shared-Claude job used, per account, day and
+kind, for the daily cap and for the owner. Nothing about it is shown to other accounts.
 
 ## 5. Approvals (public summary)
 
