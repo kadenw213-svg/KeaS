@@ -107,6 +107,8 @@ async function startServer() {
   const { openServer } = await import(pathToFileURL(path.join(ROOT, 'hub', 'index.mjs')).href);
   server = await openServer({
     dataDir: config.dataDir, log: false, ipHeader: config.tailscale ? 'x-forwarded-for' : null, keacUrl: config.keacUrl || null,
+    // The newest Kea and KeaS, read from their public release feeds and told to apps (docs/protocol.md section 0).
+    releaseFeeds: true,
     legacy: { storageDir: config.storageDir || path.join(config.dataDir, 'storage'), defaultQuotaBytes: (config.quotaGb || 5) * 1024 ** 3, googleClientIds: config.googleClientIds || [], googleWebClientId: config.googleWebClientId || null, publicUrl: config.publicUrl || null },
   });
   try { await server.listen({ port: PORT, ownerPort: PORT + 1 }); }
@@ -243,6 +245,8 @@ function refreshTray() {
     { label: 'Payroll', click: () => trayPayroll() },
     ...(config.setupDone || mode === 'legacy' ? [{ type: 'separator' }, { label: 'Start the server before sign-in', type: 'checkbox', checked: installed, click: toggle }, { label: 'Startup and power…', click: () => navigate('settings') }] : []),
     ...(updates?.state().status === 'ready' ? [{ type: 'separator' }, { label: `Restart to update KeaS to ${updates.state().version}`, click: () => installUpdate() }] : []),
+    // (Updates stuck: said here too, so a KeaS that lives in the tray doesn't go stale unseen.)
+    ...(updates?.state().info?.problem ? [{ label: 'KeaS updates are stuck. Open KeaS to see why', click: showWindow }] : []),
     { type: 'separator' },
     { label: serverExternal ? 'Quit KeaS (the server keeps running)' : 'Quit KeaS (stops the server)', click: () => { app.isQuitting = true; app.quit(); } },
   ]));
@@ -317,10 +321,25 @@ const handle = (name, fn) => ipcMain.handle(name, async (_e, arg) => {
 });
 let updates = null;
 const nightlySetting = () => require('./updates.cjs').nightlyOf(config?.nightlyUpdate);
+const warnSetting = () => require('./updates.cjs').warnOf(config?.updateWarn);
+/** The newest KeaS this PC's own server advertises (GET /v1/health latest.keas), or null: a sign of an update even when
+ * the app can't reach its own update feed. Only a server that is ours (running here, or started before sign-in and
+ * proven by its key). */
+async function advertisedKeas() {
+  if (!running()) return null;
+  const r = await fetch(`http://127.0.0.1:${PORT}/v1/health`, { signal: AbortSignal.timeout(3000) });
+  if (!r.ok) return null;
+  const j = await r.json();
+  return typeof j?.latest?.keas === 'string' ? j.latest.keas : null;
+}
 function startUpdates() {
   let told = null;
   updates = createUpdates({
-    enabled: app.isPackaged, log,
+    enabled: app.isPackaged, log, current: app.getVersion(),
+    warn: () => warnSetting(),
+    // The times of the last checks, kept in keas-config.json so a restart doesn't hide how long it has been stuck.
+    memory: { load: () => config.updateHistory || {}, save: (h) => { config = writeConfig({ ...config, updateHistory: h }); } },
+    askServer: () => advertisedKeas(),
     send: (s) => {
       send('update', s);
       refreshTray();
@@ -356,6 +375,16 @@ const ORG_API = /^\/v1\/orgs\/[\w-]{1,80}(\/(pay-codes|roles|members|departments
 
 function registerIpc() {
   handle('update:state', () => updates.state());
+  // When to say updates are stuck (the Updates panel's Advanced): { failures, staleDays, waitDays }.
+  handle('update:warn', (w = {}) => {
+    const cur = warnSetting();
+    const num = (v, d) => (v === undefined ? d : Number(v));
+    config = writeConfig({ ...config, updateWarn: require('./updates.cjs').warnOf({ failures: num(w.failures, cur.failures), staleDays: num(w.staleDays, cur.staleDays), waitDays: num(w.waitDays, cur.waitDays) }) });
+    const s = updates.state();
+    send('update', s);
+    refreshTray();
+    return s;
+  });
   handle('update:check', () => updates.check());
   handle('update:install', () => updates.install());
   handle('update:nightly', ({ on, from, to } = {}) => {

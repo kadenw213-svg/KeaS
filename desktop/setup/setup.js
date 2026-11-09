@@ -251,6 +251,7 @@ function legacy() {
   if (!la) call(k.legacyStatus).then((v) => { S.legacyAcct = v; render(); }).catch(() => {});
   return [
     h('h1', null, 'Kea Hub'),
+    updateLine(),
     h('div', { class: 'panel' },
       h('p', null, h('b', null, S.legacyMessage)),
       h('p', { class: 'muted small' }, 'Until then this PC keeps running the Kea Hub as before, so Kea keeps working. When the accounts have moved to the Kea account server (the move copies them from this folder), say so here: KeaS then makes this organization’s server from a copy of the Hub’s data, and leaves the Hub’s own files as they were.'),
@@ -413,6 +414,7 @@ function home() {
   const c = S.config;
   return [
     h('h1', null, (S.cl && S.cl.org && S.cl.org.name) || 'KeaS'),
+    updateLine(),
     checklistPanel(),
     h('div', { class: 'panel' },
       h('p', null, h('span', { class: `dot ${S.running ? 'ok' : 'bad'}`, style: 'display:inline-block;vertical-align:-4px;margin-right:8px' }), S.running ? 'The server is running' : 'Not running'),
@@ -450,6 +452,8 @@ function loadChecklist() {
 const typingNow = () => !!document.activeElement && ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName);
 window.addEventListener('focus', () => { if (S.step === 'home') { loadChecklist(); S.people = null; } });
 setInterval(() => { if (S.step === 'home' && !document.hidden && S.cl && !S.cl.allSet) loadChecklist(); }, 30_000);
+// ("Checked 5 minutes ago" and "stuck" change with time alone: ask again every minute while the window shows them.)
+setInterval(() => { if (['home', 'legacy'].includes(S.step) && !document.hidden) call(k.updateState).then((u) => { S.update = u; if (!S.busy && !typingNow()) render(); }).catch(() => {}); }, 60_000);
 async function stepAction(s) {
   switch (s.action) {
     case 'status': case 'welcome': return go(s.action === 'welcome' ? 'welcome' : 'home');
@@ -732,46 +736,97 @@ async function setNightly(change) {
   } catch (e) { fail(e); }
 }
 
-/** The Updates panel: the version, what the updater is doing, and the buttons. */
+/** When to say updates are stuck, as saved (desktop/updates.cjs warnOf has the same defaults). */
+function warnSaved() {
+  const w = (S.config && S.config.updateWarn) || {};
+  const num = (v, d, max) => (Number.isInteger(v) && v >= 1 && v <= max ? v : d);
+  return { failures: num(w.failures, 3, 50), staleDays: num(w.staleDays, 2, 60), waitDays: num(w.waitDays, 3, 60) };
+}
+async function setWarn(change) {
+  try {
+    const next = { ...warnSaved(), ...change };
+    S.update = await call(k.setUpdateWarn, next);
+    S.config = { ...S.config, updateWarn: next };
+    render();
+  } catch (e) { fail(e); }
+}
+const RELEASES = 'https://github.com/kadenw213-svg/KeaS/releases/latest';
+const TONE_DOT = { ok: 'ok', busy: 'run', new: 'run-static', bad: 'bad', off: '' };
+/** "Nov 9, 3:05 PM" for the details; "never" when it hasn't happened. */
+const when = (t) => (t ? new Date(t).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'never');
+async function updateNow(u) {
+  // (Payroll open: restarting locks it and loses whatever isn't saved there.)
+  const st = await call(k.state).catch(() => ({}));
+  if (!(await askInPage(`Restart KeaS now to install ${u.version}?`, st.payrollOpen ? 'Payroll is open: restarting locks it, and anything not saved there is lost. Save your work first.' : '', 'Install now'))) return;
+  try { await call(k.installUpdate); } catch (e) { S.update = { ...u, status: 'error', message: e.message }; render(); }
+}
+async function checkNow() {
+  // (A failed check shows in the Updates panel only, not twice.)
+  try { S.update = { ...(S.update || {}), status: 'checking', info: { ...((S.update && S.update.info) || {}), status: 'checking', line: 'Checking for updates…', tone: 'busy', action: null } }; render(); S.update = await call(k.checkUpdates); render(); }
+  catch (e) { S.update = { status: 'error', message: e.message }; render(); }
+}
+/** The button that fits: Install now when a download is ready, else Check now (none while checking). */
+function updateButton(i, primary) {
+  if (i.action === 'install') return h('button', { class: 'btn primary', onclick: () => updateNow(S.update) }, 'Install now');
+  if (i.action === 'check') return h('button', { class: primary ? 'btn primary' : 'btn', onclick: () => checkNow() }, 'Check now');
+  return null;
+}
+const updateInfoOf = () => (S.update && S.update.info) || { status: 'idle', line: '', tone: 'off', action: 'check', problem: null };
+/** The home screen's line: where updates stand, in one sentence, and, when stuck or KeaC wants a newer KeaS, said plainly. */
+function updateLine() {
+  const i = updateInfoOf();
+  const kr = S.server && S.server.keac && S.server.keac.updateRequired;
+  const loud = !!(kr || i.problem);
+  const why = (t) => String(t || '').replace(/[.\s]+$/, '');
+  return [
+    h('p', { class: 'small', style: 'display:flex;align-items:center;gap:8px;flex-wrap:wrap' },
+      h('span', { class: `dot ${TONE_DOT[i.tone] || ''}` }), h('span', null, i.line || `KeaS ${S.version || ''}`), !loud && updateButton(i, false),
+      h('a', { href: '#updates', class: 'muted small', onclick: (e) => { e.preventDefault(); document.getElementById('updates')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); } }, 'Details')),
+    // (Stuck, or KeaC refusing this KeaS: one panel, said plainly, with one button.)
+    loud && h('div', { class: 'panel' },
+      kr && h('p', { class: 'err' }, h('b', null, 'KeaC says: Update KeaS to keep signing people in with their Kea accounts.'), kr.error ? ` ${why(kr.error)}${kr.minVersion ? ` (needs KeaS ${kr.minVersion} or newer)` : ''}.` : ''),
+      i.problem && h('p', { class: 'err' }, h('b', null, i.problem.kind === 'waiting' ? 'An update is waiting. ' : 'Updates are stuck. '), i.problem.text),
+      h('div', { class: 'row' }, updateButton(i, true),
+        kr && kr.updateUrl && /^https:/.test(kr.updateUrl) ? h('a', { href: kr.updateUrl, target: '_blank', class: 'btn' }, 'Get it')
+          : i.action !== 'install' && h('a', { href: RELEASES, target: '_blank', class: 'btn' }, 'Download it by hand'))),
+  ];
+}
+
+/** The Updates panel: the version, what the updater is doing, when it last checked, and the buttons. */
 function updatePanel() {
   const u = S.update || { status: 'idle' };
-  const busy = u.status === 'checking' || u.status === 'downloading';
+  const i = updateInfoOf();
   const n = nightlySaved();
+  const w = warnSaved();
   const hourOptions = (sel) => Array.from({ length: 24 }, (_, x) => h('option', { value: String(x), selected: x === sel }, nightlyHours({ from: x, to: x }).split(' and ')[0]));
-  const line = {
-    idle: '',
-    dev: 'Updates work in the installed KeaS.',
-    checking: 'Checking for updates…',
-    latest: 'KeaS is up to date.',
-    downloading: `Downloading KeaS ${u.version || ''}… ${u.percent || 0}%`,
-    ready: n.on ? `KeaS ${u.version} is downloaded. Installs tonight between ${nightlyHours(n)}.` : `KeaS ${u.version} is downloaded and ready to install.`,
-    error: u.message || 'The update check didn’t work.',
-  }[u.status] || '';
-  return h('div', { class: 'panel' },
+  const numField = (label, key, max, hint) => h('label', { class: 'small', style: 'display:flex;align-items:center;gap:8px;margin:6px 0' },
+    h('input', { type: 'number', min: '1', max: String(max), value: String(w[key]), style: 'width:72px', onchange: (e) => setWarn({ [key]: Number(e.target.value) }) }),
+    h('span', null, label, hint && h('span', { class: 'muted' }, ` ${hint}`)));
+  return h('div', { class: 'panel', id: 'updates' },
     h('p', null, h('b', null, 'Updates'), h('span', { class: 'muted small' }, `  KeaS ${S.version || ''}`)),
-    line && h('p', { class: u.status === 'error' ? 'err' : 'muted small' }, line),
+    i.line && h('p', { class: i.tone === 'bad' ? 'err' : 'muted small' }, i.line),
+    u.status === 'error' && u.message && !i.problem && h('p', { class: 'err' }, u.message),
+    i.problem && h('p', { class: 'err' }, i.problem.text),
+    u.status !== 'dev' && h('p', { class: 'muted small' },
+      `Last successful check: ${when(i.lastOk)}. Last try: ${when(i.lastTry)}${i.failures ? ` (${i.failures} failed in a row)` : ''}.`,
+      i.readyAt && u.status === 'ready' ? ` Downloaded: ${when(i.readyAt)}.` : '',
+      i.from === 'server' ? ' This PC’s KeaS server knows of the newer version.' : ''),
     u.status === 'ready' && h('p', { class: 'muted small' }, S.hubExternal
       ? 'KeaS restarts to install it, and starts the server again by itself. The installer stops the server that started before sign-in too, so KeaS runs the server itself until Windows next starts, when the start-up task runs the new version. The server is offline for about a minute.'
       : 'KeaS restarts to install it and starts the server again by itself; the server is offline for about a minute.'),
     u.status === 'ready' && n.on && h('p', { class: 'muted small' }, 'Not while Payroll is open or in use: then it waits for the next night.'),
-    h('div', { class: 'row' },
-      u.status === 'ready'
-        ? h('button', { class: 'btn primary', onclick: async () => {
-          // (Payroll open: restarting locks it and loses whatever isn't saved there.)
-          const st = await call(k.state).catch(() => ({}));
-          if (!(await askInPage(`Restart KeaS now to install ${u.version}?`, st.payrollOpen ? 'Payroll is open: restarting locks it, and anything not saved there is lost. Save your work first.' : '', 'Install now'))) return;
-          try { await call(k.installUpdate); } catch (e) { S.update = { ...u, status: 'error', message: e.message }; render(); }
-        } }, 'Install now')
-        : h('button', { class: 'btn', disabled: busy || u.status === 'dev', onclick: async () => {
-          // (A failed check shows in this panel only, not twice.)
-          try { S.update = { status: 'checking' }; render(); S.update = await call(k.checkUpdates); render(); } catch (e) { S.update = { status: 'error', message: e.message }; render(); }
-        } }, 'Check for updates')),
+    h('div', { class: 'row' }, updateButton(i, false) || h('button', { class: 'btn', disabled: true }, i.status === 'checking' ? 'Checking…' : 'Check now'),
+      (i.from === 'server' || (i.problem && i.problem.kind !== 'waiting')) && h('a', { href: RELEASES, target: '_blank', class: 'btn' }, 'Download it by hand')),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: n.on, onchange: (e) => setNightly({ on: e.target.checked }) }), `Install updates by themselves at night (between ${nightlyHours(n)})`),
     h('details', { open: !!S.updAdv, ontoggle: (e) => (S.updAdv = e.target.open) }, h('summary', null, 'Advanced'),
-      h('p', { class: 'muted small' }, 'The hours for installing at night (this computer’s time). KeaS looks every few minutes inside them.'),
+      h('p', { class: 'muted small' }, 'The hours for installing at night (this computer’s time). KeaS looks every few minutes inside them, and checks for updates every 4 hours.'),
       h('div', { class: 'row' },
         h('label', null, 'From ', h('select', { onchange: (e) => setNightly({ from: Number(e.target.value) }) }, ...hourOptions(n.from))),
-        h('label', null, ' to ', h('select', { onchange: (e) => setNightly({ to: Number(e.target.value) }) }, ...hourOptions(n.to))))));
+        h('label', null, ' to ', h('select', { onchange: (e) => setNightly({ to: Number(e.target.value) }) }, ...hourOptions(n.to)))),
+      h('p', { class: 'muted small', style: 'margin-top:12px' }, 'When to say on the home screen that updates are stuck:'),
+      numField('Failed checks in a row', 'failures', 50, 'Default 3 (about half a day).'),
+      numField('Or days since the last successful check, once a check fails', 'staleDays', 60, 'Default 2.'),
+      numField('Days a downloaded update may wait to install', 'waitDays', 60, 'Default 3: the nightly install should have happened by then.')));
 }
 
 // ---------- Payroll: opened with the signed-in Kea account; the passphrase asked once per run ----------

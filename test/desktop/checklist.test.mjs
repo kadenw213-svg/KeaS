@@ -53,3 +53,11 @@ test('everything done: all set (start before sign-in is optional)', () => {
   assert.equal(r.allSet, true);
   assert.equal(get(r, 'org').text, 'Pool (you’re an admin).');
 });
+
+test('"KeaS is up to date" is not done while updates are stuck, and says why', () => {
+  const stuck = { status: 'error', info: { problem: { kind: 'failing', text: 'KeaS can’t check for updates: 4 failed checks in a row.' } } };
+  const s = get(keasSteps({ ...base, update: stuck }), 'updates');
+  assert.equal(s.done, false);
+  assert.match(s.detail ?? s.text ?? JSON.stringify(s), /4 failed checks in a row/);
+  assert.equal(get(keasSteps({ ...base, update: { status: 'latest', info: { problem: null } } }), 'updates').done, true);
+});

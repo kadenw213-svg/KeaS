@@ -44,6 +44,7 @@ contextBridge.exposeInMainWorld('keas', {
   checkUpdates: call('update:check'),
   installUpdate: call('update:install'),
   setNightlyUpdate: call('update:nightly'),
+  setUpdateWarn: call('update:warn'),
   setTheme: call('setTheme'),
   openFolder: call('openFolder'),
   bootStatus: call('boot:status'),

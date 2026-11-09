@@ -88,8 +88,9 @@ function keasSteps(f = {}) {
 }
 const reachStep = (c) => step('reach', 'Reachable from anywhere', !!c.publicUrl,
   c.publicUrl ? c.publicUrl : 'Only this computer can reach the server. Set up Tailscale Funnel so people can clock in and see schedules from anywhere.', 'reach');
-const updatesStep = (f) => step('updates', 'KeaS is up to date', f.update?.status !== 'ready',
-  f.update?.status === 'ready' ? (f.update.nightly?.on ? `KeaS ${f.update.version} is downloaded. It installs tonight between ${f.update.nightly.hours}, or install it now.` : `KeaS ${f.update.version} is downloaded. Restart to install it.`) : 'KeaS checks for updates by itself.', 'update');
+// (Not done while an update waits, or while updates are stuck: checks failing, a download stalled.)
+const updatesStep = (f) => step('updates', 'KeaS is up to date', f.update?.status !== 'ready' && !f.update?.info?.problem,
+  f.update?.info?.problem ? f.update.info.problem.text : f.update?.status === 'ready' ? (f.update.nightly?.on ? `KeaS ${f.update.version} is downloaded. It installs tonight between ${f.update.nightly.hours}, or install it now.` : `KeaS ${f.update.version} is downloaded. Restart to install it.`) : 'KeaS checks for updates by itself.', 'update');
 
 /** { steps, left, allSet }: allSet once every required step is done (a waiting one doesn't hold it up). */
 function finish(steps) {
