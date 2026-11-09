@@ -12,6 +12,73 @@ Version 1. This document is the contract between the three apps (the public part
 
 Users never see the name KeaC. In Kea and KeaS it is "your Kea account"; its address shows only under Advanced.
 
+## 0. Versions: every app updates on its own (public)
+
+Kea on the PC, Kea on the phone, KeaS and KeaC are released separately. Every release keeps working with the other
+apps' versions still in use; a server tells an app plainly when it's too old; and an app that can't update says so
+instead of staying old quietly.
+
+**The client header.** Every request an app makes to a server says which app and version it is:
+
+```
+X-Kea-Client: <app>/<version>
+```
+
+| App | Value | Since |
+|---|---|---|
+| Kea on the PC | `Kea/0.85.0` | account requests already; KeaS requests in the release after 0.84.1 |
+| Kea on the phone | `Kea-Phone/0.85.0` | the release after 0.84.1 (before: `Kea for Android`, no version) |
+| KeaS (to KeaC) | `KeaS/0.9.0` | the release after KeaS 0.8.1 |
+
+Servers also read `Kea-Client`. The name is case-insensitive and anything after the version and a space is ignored.
+**A request without the header, or without a version, is served exactly as before**: only an app that says it is
+older than the minimum can be turned away.
+
+**Health.** `GET /v1/health` on KeaC and on KeaS keeps everything it had (`ok`, `service`, `version`, `features`, ...)
+and adds:
+
+```json
+{
+  "protocol": 1,
+  "minClients": { "kea": "0.80.0", "keaPhone": "0.80.0", "keas": "0.6.0" },
+  "latest": { "kea": "0.85.0", "keas": "0.9.0" },
+  "updateUrls": { "kea": "https://github.com/kadenw213-svg/kea/releases/latest", "keaPhone": "…", "keas": "https://github.com/kadenw213-svg/KeaS/releases/latest" }
+}
+```
+
+- `protocol`: one integer for the whole contract. It goes up only for a break no older app can follow (see each
+  repo's DEVELOPING doc), never for an addition: additions are new optional fields and new `features`.
+- `minClients`: the oldest version of each app this server serves. The defaults are in `clients.mjs` (KeaC
+  `server/lib/`, KeaS `hub/lib/`; the two files are the same); the owner can change them under Advanced
+  (`POST /owner/settings { clients: { minClients: { kea: "0.85.0" } } }`, `""` or `null` puts one back).
+- `latest`: the newest released Kea and KeaS the server knows of, or `null`. Servers read electron-updater's
+  `latest.yml` on each app's latest GitHub release every 6 hours (`KEAC_RELEASE_FEEDS=0` / `KEAS_RELEASE_FEEDS=0` turn
+  that off); a feed that fails keeps the last version found. The owner can add a version by hand
+  (`clients: { latest: { kea } }`), and a KeaS server counts its own version for `keas`. Apps use it to say
+  "Update available" even when their own update feed can't be reached.
+- An older server has none of these fields; apps then behave as before.
+
+**Too old: 426.** Any request other than `/v1/health` from an app whose version is below `minClients[app]` gets
+
+```json
+426 { "error": "Update Kea to keep using your Kea account.", "upgradeRequired": true, "app": "kea", "version": "0.79.0", "minVersion": "0.80.0", "updateUrl": "https://github.com/kadenw213-svg/kea/releases/latest" }
+```
+
+The `error` is for people, in the app's own words: KeaC tells Kea "Update Kea to keep using your Kea account.", KeaS
+tells Kea "Update Kea to keep using this organization’s server.", KeaC tells KeaS "Update KeaS to keep signing people in
+with their Kea accounts." Nothing else about the request is looked at first.
+
+**What apps do with it.**
+
+- Kea (PC and phone) shows the `error` with an **Update** button (it checks for, downloads and installs the update;
+  a copy that can't update itself opens `updateUrl`). Nothing on the device is lost, and the notice goes away by
+  itself once the server answers normally again. An older Kea shows the `error` text as it shows any server error.
+- Kea notes `latest.kea` from every health check, and the PC writes its own version into what it syncs to the phone
+  (`kea-data.json` `keaVersion`), so the phone can say "Your PC has Kea 0.85.0; this phone has 0.84.1."
+- KeaS keeps KeaC's 426 and shows it in the KeaS app; passes already checked keep working on the last key list.
+- Every app says plainly when its own update checks keep failing or an update has waited days to install, with the
+  last successful check.
+
 ## 1. Kea accounts (public)
 
 There are no Kea passwords. Online, a Kea account signs in with **Google** or **Microsoft** only.

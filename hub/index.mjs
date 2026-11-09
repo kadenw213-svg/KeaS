@@ -35,6 +35,7 @@ import { Windows, Buckets } from './lib/limiter.mjs';
 import { createHubLog } from './lib/hublog.mjs';
 import { clientAddress, ipBucket, isLoopback } from './lib/clientip.mjs';
 import { mountOrg, passIdentity } from '../org/index.mjs';
+import { PROTOCOL, UPDATE_URLS, clientOf as appOf, tooOld, tooOldBody, mergeMins, newer, releaseWatcher, cleanVersion } from './lib/clients.mjs';
 
 function readVersion() {
   for (const f of ['../package.json', '../version.txt']) {
@@ -171,12 +172,21 @@ export function createHub({
   maxFileBytes = 64 * 1024 ** 2,
   maxFilesPerAccount = 20_000,
   minFreeBytes = null,
+  // Versions (docs/protocol.md section 0): the oldest Kea, Kea phone and KeaS served (hub/lib/clients.mjs MIN_CLIENTS
+  // unless given; the operator's setting wins), the newest versions to tell apps about ({ kea, keas }, added to what
+  // the release feeds say), and whether to read the public release feeds (on when KeaS runs for real; off in tests or
+  // with KEAS_RELEASE_FEEDS=0). `releaseFeeds` can also be { kea, keas } feed addresses.
+  minClients = {},
+  latest = {},
+  releaseFeeds = false,
+  releaseFetch = fetch,
 } = {}) {
   mkdirSync(dataDir, { recursive: true });
   // A KeaS 0.5 Kea Hub folder: still the Kea Hub until its accounts moved to KeaC (openServer runs it); once moved,
   // keas.db is made from a copy of it (hub/upgrade.mjs), and hub.db stays as it was.
   if (folderState(dataDir) === 'legacy') throw Object.assign(new Error(LEGACY_MESSAGE), { code: 'LEGACY_HUB' });
   const upgraded = upgradeHub05(dataDir, { now: now() });
+  const releases = releaseWatcher({ feeds: releaseFeeds && process.env.KEAS_RELEASE_FEEDS !== '0' ? (releaseFeeds === true ? undefined : releaseFeeds) : null, fetchImpl: releaseFetch, now });
   const h = openDb(dbFile);
   const identityKey = loadOrCreateKey(join(dataDir, IDENTITY_KEY_FILE));
   const serverId = serverIdOf(identityKey.jwk);
@@ -204,6 +214,14 @@ export function createHub({
   const audit = (actor, action, target, detail, ip) =>
     h.run('INSERT INTO audit (at,actor,action,target,detail,ip) VALUES (?,?,?,?,?,?)', now(), actor ?? null, action, target ?? null, detail == null ? null : JSON.stringify(detail), ip ?? null);
   const operatorId = () => getSetting('operator', null);
+  // Versions (docs/protocol.md section 0; the operator's setting, under Advanced in the KeaS app, wins).
+  const versionSettings = () => getSetting('clients', { minClients: {}, latest: {} });
+  const minsNow = () => mergeMins(minClients, versionSettings().minClients);
+  const latestNow = () => {
+    const feed = releases.latest(), own = versionSettings().latest || {};
+    // (This server's own version counts: the newest KeaS is at least this one.)
+    return { kea: newer(newer(feed.kea, latest.kea), own.kea), keas: newer(newer(newer(feed.keas, latest.keas), own.keas), VERSION) };
+  };
 
   // ---------- the one-time setup code (claiming the server; see /owner/claim) ----------
   const setupFile = join(dataDir, SETUP_FILE);
@@ -250,6 +268,7 @@ export function createHub({
     onRevoked: endSessionsOf,
     fetchImpl: keacFetch, now,
     log: (m) => { if (log) console.warn(`KeaS: ${m}`); },
+    client: `KeaS/${VERSION}`,
   });
   const AUD = `keas:${serverId}`;
   /** A pass checked (or an HttpError 401 saying why), and its member row brought up to date. */
@@ -323,7 +342,8 @@ export function createHub({
   // address are told where (they follow only when that address lists the same key kid at /v1/keys).
   const moved = readMarker(dataDir);
   const movedTo = () => (moved ? moved.keacUrl || keacAddress() || null : null);
-  R('GET', '/v1/health', () => ({ ok: true, service: 'keas', version: VERSION, serverId, features: FEATURES, claimed: !!operatorId(), ...(moved ? { movedTo: movedTo(), keacKeyKid: moved.keacKeyKid } : {}) }), { auth: false });
+  // protocol, minClients, latest and updateUrls: docs/protocol.md section 0 (an older KeaS has none of them).
+  R('GET', '/v1/health', () => ({ ok: true, service: 'keas', version: VERSION, serverId, features: FEATURES, claimed: !!operatorId(), protocol: PROTOCOL, minClients: minsNow(), latest: latestNow(), updateUrls: UPDATE_URLS, ...(moved ? { movedTo: movedTo(), keacKeyKid: moved.keacKeyKid } : {}) }), { auth: false });
   // Proves this server holds the key its id is made from: signs `kea-server-identity:<serverId>:<nonce>`.
   R('GET', '/v1/identity', ({ query }) => {
     const n = String(query.nonce ?? '');
@@ -457,12 +477,32 @@ export function createHub({
     const n = newSession(p, 'KeaS app');
     return { token: n.token, exp: n.exp, me: meOut(memberOf(p.sub)) };
   });
+  const versionsOut = () => ({ minClients: minsNow(), latest: latestNow(), set: versionSettings(), feeds: { checkedAt: releases.latest().checkedAt, error: releases.latest().error }, protocol: PROTOCOL, keacSays: keac.status().updateRequired });
+  O('GET', '/owner/settings', () => ({ orgs: getSetting('orgs', {}), clients: versionsOut() }));
   O('POST', '/owner/settings', ({ body }) => {
     if (body.orgs != null) {
       const o = V.obj(body.orgs), cur = getSetting('orgs', {});
       setSetting('orgs', { ...cur, ...('anyoneCreates' in o ? { anyoneCreates: V.bool(o.anyoneCreates, 'anyoneCreates') } : {}), ...('autoApprove' in o ? { autoApprove: V.bool(o.autoApprove, 'autoApprove') } : {}) });
     }
-    return { orgs: getSetting('orgs', {}) };
+    // Versions (Advanced): the oldest app versions served and the newest to announce. Raise a minimum only for a break
+    // older apps can't follow (docs/DEVELOPING.md); null or '' puts one back to the default.
+    if (body.clients != null) {
+      const c = V.obj(body.clients);
+      const next = { minClients: { ...(versionSettings().minClients || {}) }, latest: { ...(versionSettings().latest || {}) } };
+      for (const [part, keys] of [['minClients', ['kea', 'keaPhone', 'keas']], ['latest', ['kea', 'keas']]]) {
+        if (c[part] == null) continue;
+        for (const [k, v] of Object.entries(V.obj(c[part]))) {
+          if (!keys.includes(k)) bad(`Unknown app in ${part}: ${k}`);
+          if (v == null || v === '') { delete next[part][k]; continue; }
+          const clean = cleanVersion(v);
+          if (!clean) bad(`${part}.${k} must be a version like 0.85.0.`);
+          next[part][k] = clean;
+        }
+      }
+      setSetting('clients', next);
+      audit('owner', 'owner.client_versions', null, next, 'local');
+    }
+    return { orgs: getSetting('orgs', {}), clients: versionsOut() };
   });
   // The payroll vault's sign-in (server/payroll/hub.mjs): a 15-minute token for the audience 'keas-payroll', signed by
   // this server's identity key, for the KeaS session the KeaS app holds. Only here (owner key, loopback), never on the
@@ -523,6 +563,12 @@ export function createHub({
     const url = new URL(req.url, 'http://localhost');
     if (req.method !== 'PUT') { const tm = setTimeout(() => { if (!req.complete) req.socket.destroy(); }, 30_000); tm.unref?.(); res.once('close', () => clearTimeout(tm)); }
     let status = 200, payload;
+    // An app that says it's older than this server serves gets 426 and where to update, never a half-working answer
+    // (the health check still answers, so it can see why). An app that doesn't say its version is served as before.
+    if (url.pathname !== '/v1/health') {
+      const old = tooOld(appOf(req.headers), minsNow());
+      if (old) { send(res, 426, tooOldBody(old, 'keas')); hlog.request(req.method, url.pathname, 426, Date.now() - t0); return; }
+    }
     // The Kea Hub's account routes, after its accounts moved: where they went.
     if (moved && LEGACY_ROUTE.test(url.pathname)) {
       const to = movedTo();
@@ -734,8 +780,12 @@ export function createHub({
       catch (e) { await new Promise((r) => apiServer.close(() => r())); throw e; }
     },
     log: hlog,
+    /** The app versions now (minimums and newest), and a fresh read of the release feeds (when they're on). */
+    versions: () => ({ minClients: minsNow(), latest: latestNow() }),
+    refreshReleases: () => releases.refresh(),
     close() {
       clearInterval(sweep);
+      releases.stop();
       keac.stop();
       hlog.close();
       return Promise.all([apiServer, ownerServer].map((s) => new Promise((r) => { if (!s.listening) return r(); s.close(() => r()); s.closeAllConnections?.(); }))).then(() => h.close());
@@ -765,7 +815,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     console.error('The KeaS server won’t start: KeaS found this data folder was open to other accounts and hasn’t finished checking it. Open KeaS to see what to clean up.');
     process.exit(3);
   }
-  const hub = await openServer({ logFile: join(DATA_DIR, 'logs', 'hub.log'), log: false });
+  const hub = await openServer({ logFile: join(DATA_DIR, 'logs', 'hub.log'), log: false, releaseFeeds: true });
   for (const level of ['error', 'warn']) console[level] = (...a) => hub.log.line(`${new Date().toISOString()} ${level.toUpperCase()} ${a.map((x) => (x instanceof Error ? x.stack : String(x))).join(' ')}`);
   let ports;
   try { ports = await hub.listen(); } catch (e) { console.error(e.message); await hub.close().catch(() => {}); process.exit(1); }

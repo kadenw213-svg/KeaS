@@ -114,11 +114,24 @@ export function checkPass(token, keys, { aud, nowMs = Date.now() }) {
  * good key list and the revocation cursor. revoked: { set(ids), add(ids), has(id), count() } (a table in the host).
  * onRevoked(ids): accounts just listed (their sessions end).
  */
-export function createKeac({ url = () => KEAC_URL, builtIn = KEAC_KEYS, store, revoked, onRevoked = () => {}, fetchImpl = fetch, now = () => Date.now(), timeoutMs = 8000, log = () => {} }) {
+export function createKeac({ url = () => KEAC_URL, builtIn = KEAC_KEYS, store, revoked, onRevoked = () => {}, fetchImpl = fetch, now = () => Date.now(), timeoutMs = 8000, log = () => {}, client = null }) {
+  // (Every request says which KeaS it is: `X-Kea-Client: KeaS/<version>`, docs/protocol.md section 0.)
+  const headers = { accept: 'application/json', ...(client ? { 'x-kea-client': client } : {}) };
   const st = {
     keysAt: store.get('keac.keysAt', null), keysError: null, keysTriedAt: 0,
     revokedAt: store.get('keac.revokedAt', null), fullAt: store.get('keac.fullAt', null), since: store.get('keac.since', 0), revokedError: null,
+    // KeaC said this KeaS is too old (426): { error, minVersion, updateUrl, at }, until it answers normally again.
+    updateRequired: null,
   };
+  /** Notes KeaC's 426 (too old), or that it answered normally again. */
+  async function noteAnswer(r) {
+    if (r.status === 426) {
+      let j = {};
+      try { j = await r.clone().json(); } catch {}
+      st.updateRequired = { error: String(j.error || 'Update KeaS to keep signing people in with their Kea accounts.'), minVersion: j.minVersion ?? null, updateUrl: j.updateUrl ?? null, at: now() };
+      log(st.updateRequired.error);
+    } else if (r.ok) st.updateRequired = null;
+  }
   let fetched = cleanKeys(store.get('keac.keys', []));
   const base = () => { const u = url(); return u ? String(u).replace(/\/+$/, '') : null; };
   const anchors = () => cleanKeys(typeof builtIn === 'function' ? builtIn() : builtIn, { status: false });
@@ -131,7 +144,9 @@ export function createKeac({ url = () => KEAC_URL, builtIn = KEAC_KEYS, store, r
   async function getJson(path) {
     const b = base();
     if (!b) throw new Error('No Kea account server (KEAC_URL) is set.');
-    const r = await fetchImpl(b + path, { redirect: 'error', signal: AbortSignal.timeout(timeoutMs), headers: { accept: 'application/json' } });
+    const r = await fetchImpl(b + path, { redirect: 'error', signal: AbortSignal.timeout(timeoutMs), headers });
+    await noteAnswer(r);
+    if (r.status === 426) throw new Error(st.updateRequired.error);
     if (!r.ok) throw new Error(`The Kea account server said ${r.status}.`);
     return r.json();
   }
@@ -215,7 +230,9 @@ export function createKeac({ url = () => KEAC_URL, builtIn = KEAC_KEYS, store, r
     /** KeaC's keys as it lists them now, with fingerprints, for the owner to compare with KeaC's Keys screen. */
     async offer(url = base()) {
       if (!url) throw new Error('Enter the Kea account server’s address first.');
-      const r = await fetchImpl(String(url).replace(/\/+$/, '') + '/v1/keys', { redirect: 'error', signal: AbortSignal.timeout(timeoutMs), headers: { accept: 'application/json' } });
+      const r = await fetchImpl(String(url).replace(/\/+$/, '') + '/v1/keys', { redirect: 'error', signal: AbortSignal.timeout(timeoutMs), headers });
+      await noteAnswer(r);
+      if (r.status === 426) throw new Error(st.updateRequired.error);
       if (!r.ok) throw new Error(`The Kea account server said ${r.status}.`);
       return cleanKeys((await r.json())?.keys).map((k) => ({ ...k, fingerprint: keyFingerprint(k) }));
     },
@@ -224,6 +241,7 @@ export function createKeac({ url = () => KEAC_URL, builtIn = KEAC_KEYS, store, r
     status: () => ({
       url: base(), keys: keys().map((k) => ({ kid: k.kid, status: k.status, fingerprint: keyFingerprint(k) })), trusted: anchors().length,
       keysAt: st.keysAt, keysError: st.keysError, revokedAt: st.revokedAt, fullAt: st.fullAt, revokedError: st.revokedError, revoked: revoked.count(),
+      updateRequired: st.updateRequired,
     }),
   };
 }
