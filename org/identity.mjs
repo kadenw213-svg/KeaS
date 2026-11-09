@@ -7,6 +7,9 @@
 //                         router hands each route as ctx.me. superuser: the operator of the whole server (the Kea Hub's
 //                         owner), who may make organizations without waiting and verify anyone's email.
 //   profiles(ids)      -> Map(id -> { name, email, emailVerified, extras?(where, { phone }) })  for people in lists.
+//                         extras('orgs') may hold { phone } where the person shares it with their organizations (the
+//                         engine shows it only to themselves and people.view); extras('classes') where they share it
+//                         with classmates (org class rosters).
 // and, optionally:
 //   findByEmail(email) -> account id or null           (the one-time import from an org server)
 //   findBySub(sub)     -> account id or null           (the same, by the Kea account id the server saw at sign-in)
@@ -37,13 +40,19 @@ export function staticIdentity(people = []) {
  * (settings 'orgs': { anyoneCreates, autoApprove }).
  */
 export function passIdentity({ h, operatorId = () => null, getSetting = () => ({}) }) {
-  const out = (r) => ({ name: r.name || r.email || '', email: r.email ?? null, emailVerified: true });
+  // extras: the phone number from the newest pass (it carries one only when the person shares it with their
+  // organizations). 'orgs' lists get it (the engine shows it only to people.view), 'classes' rosters only with
+  // phoneClassmates.
+  const out = (r) => ({
+    name: r.name || r.email || '', email: r.email ?? null, emailVerified: true,
+    extras: (where, { phone = true } = {}) => (phone && r.phone && (where === 'orgs' || (where === 'classes' && r.phone_classmates)) ? { phone: r.phone } : {}),
+  });
   return {
     who: (me) => ({ id: me.id, name: me.name || me.email || '', email: me.email ?? null, emailVerified: true, superuser: !!me.id && me.id === operatorId() }),
     profiles(ids) {
       const m = new Map();
       for (let i = 0; i < ids.length; i += 500)
-        for (const r of h.all('SELECT id, email, name FROM keas_members WHERE id IN (SELECT value FROM json_each(?))', JSON.stringify(ids.slice(i, i + 500)))) m.set(r.id, out(r));
+        for (const r of h.all('SELECT id, email, name, phone, phone_classmates FROM keas_members WHERE id IN (SELECT value FROM json_each(?))', JSON.stringify(ids.slice(i, i + 500)))) m.set(r.id, out(r));
       return m;
     },
     findByEmail: (email) => (email ? h.get('SELECT id FROM keas_members WHERE email = ?', String(email).trim().toLowerCase())?.id ?? null : null),

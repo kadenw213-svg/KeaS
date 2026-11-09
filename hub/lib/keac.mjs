@@ -40,6 +40,8 @@ export const REVOKED_EVERY_MS = HOUR;
 export const FULL_EVERY_MS = 24 * HOUR;
 const KID_REFRESH_MS = 60_000;
 const ID = /^[A-Za-z0-9_-]{1,80}$/;
+// A phone number as KeaC sends it in a pass: + and 8 to 15 digits (E.164).
+const PHONE = /^\+[1-9]\d{7,14}$/;
 /** A key's fingerprint as people compare it (KeaC's Keys screen, `node server/owner.mjs key-fingerprint`): SHA-256 of x, in groups of four. */
 export const keyFingerprint = (k) => createHash('sha256').update(String(k.x)).digest('hex').toUpperCase().match(/.{4}/g).join(' ');
 
@@ -97,7 +99,10 @@ export function checkPass(token, keys, { aud, nowMs = Date.now() }) {
   if (typeof p.iat !== 'number' || !Number.isFinite(p.iat) || p.iat > t + SKEW_S) fail('future');
   if (p.exp - p.iat > MAX_PASS_S) fail('lifetime');
   if (typeof p.sub !== 'string' || !ID.test(p.sub) || p.ev !== true || (p.email != null && typeof p.email !== 'string') || (p.name != null && typeof p.name !== 'string')) fail('claims');
-  return { sub: p.sub, email: p.email ? String(p.email).trim().toLowerCase().slice(0, 254) : null, name: p.name ? String(p.name).slice(0, 120) : '', iat: p.iat, exp: p.exp, kid: head.kid };
+  // phone: only when the person shares it with their organizations (KeaC leaves it out otherwise); E.164, else ignored.
+  // phoneClassmates: true only when they also share it with classmates.
+  const phone = typeof p.phone === 'string' && PHONE.test(p.phone) ? p.phone : null;
+  return { sub: p.sub, email: p.email ? String(p.email).trim().toLowerCase().slice(0, 254) : null, name: p.name ? String(p.name).slice(0, 120) : '', phone, phoneClassmates: p.phoneClassmates === true, iat: p.iat, exp: p.exp, kid: head.kid };
 }
 
 /**

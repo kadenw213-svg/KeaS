@@ -260,10 +260,14 @@ export function createHub({
       if (e instanceof PassError) { audit(null, 'pass.refused', null, { reason: e.reason }, ip); throw new HttpError(401, e.message, { reason: e.reason }); }
       throw e;
     }
-    h.run(`INSERT INTO keas_members (id,email,name,first_seen,last_pass_at,pass_iat) VALUES (?,?,?,?,?,?)
+    // The phone number and phoneClassmates follow the newest pass too: a pass without them clears them (the person
+    // stopped sharing, or removed the number).
+    h.run(`INSERT INTO keas_members (id,email,name,first_seen,last_pass_at,pass_iat,phone,phone_classmates) VALUES (?,?,?,?,?,?,?,?)
       ON CONFLICT(id) DO UPDATE SET email = CASE WHEN excluded.pass_iat >= pass_iat THEN COALESCE(excluded.email, email) ELSE email END,
         name = CASE WHEN excluded.pass_iat >= pass_iat AND excluded.name != '' THEN excluded.name ELSE name END,
-        last_pass_at = excluded.last_pass_at, pass_iat = MAX(pass_iat, excluded.pass_iat)`, p.sub, p.email, p.name, now(), now(), p.iat);
+        phone = CASE WHEN excluded.pass_iat >= pass_iat THEN excluded.phone ELSE phone END,
+        phone_classmates = CASE WHEN excluded.pass_iat >= pass_iat THEN excluded.phone_classmates ELSE phone_classmates END,
+        last_pass_at = excluded.last_pass_at, pass_iat = MAX(pass_iat, excluded.pass_iat)`, p.sub, p.email, p.name, now(), now(), p.iat, p.phone ?? null, p.phoneClassmates ? 1 : 0);
     return p;
   }
   const memberOf = (id) => h.get('SELECT id, email, name FROM keas_members WHERE id = ?', id);

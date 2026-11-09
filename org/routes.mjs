@@ -73,7 +73,8 @@ export function mountRoutes(core, { R, O = null, classes = false, operator = nul
     return {
       id: r.account_id, name: r.display_name, role: core.legacyFor(r.org_id, r.account_id, all, x.tree), status: r.status, departmentId: r.department_id, title: r.title, emailVerified: !!r.email_verified,
       positionIds: positionsOf(r.org_id, r.account_id), joinedAt: r.joined_at, you: self,
-      ...extrasOf(r, { phone: r.status === 'active' && x.m.status === 'active' }),
+      // The phone number (where the person shares it with their organizations): only to themselves and people.view.
+      ...extrasOf(r, { phone: r.status === 'active' && x.m.status === 'active' && (self || x.can('people.view', d)) }),
       ...(self || x.can('people.view', d) ? { email: r.email, desiredMin: r.desired_min, desiredMax: r.desired_max, prefs: J(r.prefs, []), minor: r.birthdate ? ageOn(r.birthdate, localDate(now(), 'UTC')) < 18 : null } : {}),
       ...(self || x.can('people.birthdate', d) ? { birthdate: r.birthdate } : {}),
       ...(x.can('rates.view', d) ? { costRate: r.cost_rate == null ? null : r.cost_rate / 100 } : {}),
@@ -672,13 +673,17 @@ export function mountRoutes(core, { R, O = null, classes = false, operator = nul
   const orgClassOut = (c, x) => {
     const mine = h.get('SELECT * FROM org_class_assignments WHERE class_id = ? AND account_id = ?', c.class_id, x.who.id);
     const nm = x.can('classes.manage') ? names(c.org_id) : null;
+    const assigned = nm ? h.all('SELECT * FROM org_class_assignments WHERE class_id = ?', c.class_id) : [];
+    // The roster shows a phone number only for someone who shares it with classmates (extras('classes')).
+    const prof = nm ? core.profilesOf(assigned.map((a) => a.account_id)) : null;
+    const classExtras = (aid) => prof?.get(aid)?.extras?.('classes', { phone: true }) ?? {};
     return {
       id: c.class_id, title: c.title, description: c.description, meetingUrl: c.meeting_url, status: c.status, certTypeId: c.cert_type_id,
       sessions: h.all('SELECT * FROM class_sessions WHERE class_id = ? ORDER BY start_at', c.class_id).map(sessOut),
       mine: mine ? { dueOn: mine.due_on, completedOn: mine.completed_on } : null,
       ...(nm ? {
-        assigned: h.all('SELECT * FROM org_class_assignments WHERE class_id = ?', c.class_id).map((a) => ({ ...a, display_name: nm.get(a.account_id) ?? '' })).sort((a, b) => (a.display_name < b.display_name ? -1 : a.display_name > b.display_name ? 1 : 0))
-          .map((x) => ({ accountId: x.account_id, name: x.display_name, dueOn: x.due_on, completedOn: x.completed_on })),
+        assigned: assigned.map((a) => ({ ...a, display_name: nm.get(a.account_id) ?? '' })).sort((a, b) => (a.display_name < b.display_name ? -1 : a.display_name > b.display_name ? 1 : 0))
+          .map((x) => ({ accountId: x.account_id, name: x.display_name, dueOn: x.due_on, completedOn: x.completed_on, ...classExtras(x.account_id) })),
       } : {}),
     };
   };
