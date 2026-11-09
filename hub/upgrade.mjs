@@ -150,9 +150,9 @@ export function upgradeHub05(dataDir, { now = Date.now() } = {}) {
       if (owner) { put('operator', owner.id); report.operator = { id: owner.id, email: owner.email }; }
       for (const t of tables.filter((x) => keptTable(x.name) && x.name !== 'sqlite_sequence')) report.kept[t.name] = count(t.name);
       report.notes.push(
-        `The Kea Hub’s own files are untouched: ${resolve(src)}, hub-signing-key.pem and the storage folder stay as they were (remove them by hand once KeaC runs well). A copy of hub.db is also in ${report.archive.db}.`,
+        `The Kea Hub’s own files are untouched: ${resolve(src)}, hub-signing-key.pem and the storage folder stay as they were (remove them by hand once the Kea account server runs well). A copy of hub.db is also in ${report.archive.db}.`,
         `This KeaS server now uses ${KEAS_DB}, with the organizations, their members (${rows.length}), roles, schedules, time clock and pay codes.`,
-        report.keac.pinned ? `KeaC’s key (kid ${own.kid}) is this folder’s own Hub signing key, so it is trusted without asking.` : 'KeaC’s key isn’t trusted yet: confirm its fingerprint in the KeaS app (Kea account server) before anyone can sign in.',
+        report.keac.pinned ? `The Kea account server’s key (kid ${own.kid}) is this folder’s own Hub signing key, so it is trusted without asking.` : 'The Kea account server’s key isn’t trusted yet: confirm its fingerprint in the KeaS app (Kea account server) before anyone can sign in.',
         'Organization members keep their Kea account ids and sign in again once with Kea (a pass from their Kea account).',
         owner ? `${owner.email} ran the Hub, so they run this KeaS server (they may make organizations).` : 'The Hub had no owner account, so nobody runs this server yet: set it up from the KeaS app on this PC.',
       );

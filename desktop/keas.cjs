@@ -113,7 +113,6 @@ function createKeasLink({ dir, protect, base, owner, serverId, account, fetchImp
     signedIn: () => !!read() && account.signedIn(), session: () => read(), cached: () => account.cached(),
     orgs,
     createOrg: ({ name, state, tz }) => api('POST', '/v1/orgs', { name: String(name || '').trim(), kind: 'private', state: state || null, tz: tz || 'America/Denver' }),
-    joinOrg: ({ code }) => api('POST', '/v1/orgs/join', { code: String(code || '').trim() }),
     updateOrg: ({ id, ...b }) => api('POST', `/v1/orgs/${oid(id)}`, b),
     orgPeople, orgPayCodes,
     orgApprove: ({ id, accountId, approve }) => api('POST', `/v1/orgs/${oid(id)}/members/${oid(accountId)}/approve`, { approve: approve !== false }),

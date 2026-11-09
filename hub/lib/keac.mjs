@@ -150,7 +150,7 @@ export function createKeac({ url = () => KEAC_URL, builtIn = KEAC_KEYS, store, r
         // keys of their own. With no trusted key at all, nothing is taken: the owner confirms one first (pin).
         const trusted = keys();
         if (!trusted.length) throw new Error('No Kea account server key is trusted yet. Confirm its fingerprint in the KeaS app first.');
-        if (!list.some((k) => trusted.some((t) => same(k, t)))) throw new Error('The Kea account server’s key list has none of the keys this server trusts, so it wasn’t taken. If KeaC was set up again, confirm its new key in the KeaS app.');
+        if (!list.some((k) => trusted.some((t) => same(k, t)))) throw new Error('The Kea account server’s key list has none of the keys this server trusts, so it wasn’t taken. If the Kea account server was set up again, confirm its new key in the KeaS app.');
         fetched = list;
         st.keysAt = now(); st.keysError = null;
         store.set('keac.keys', list); store.set('keac.keysAt', st.keysAt);

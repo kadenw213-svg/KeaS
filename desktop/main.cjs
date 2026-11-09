@@ -382,10 +382,8 @@ function registerIpc() {
   handle('account:status', () => account().status());
   // Continue with Google or Microsoft (the system browser), and the owner's two-step code when KeaC asks for it.
   handle('account:oauth', ({ provider }) => account().oauth({ provider: provider === 'microsoft' ? 'microsoft' : 'google' }));
-  handle('account:google', () => account().oauth({ provider: 'google' }));
   handle('account:continue', ({ code }) => account().continueSignIn({ code }));
   handle('account:logout', async () => { payrollApi?.forget?.(); await link().logout().catch(() => {}); return account().logout(); });
-  handle('account:setUrl', async ({ url }) => { payrollApi?.forget?.(); link().forget(); return account().changeUrl(url); });
   // Trusting KeaC's key: what it lists, with fingerprints (and which one is this PC's own old Hub key), then pinning.
   handle('keac:offer', async ({ url }) => {
     const r = await owner('GET', `/owner/keac/offer${url ? `?url=${encodeURIComponent(url)}` : ''}`);
@@ -403,7 +401,6 @@ function registerIpc() {
   handle('server:claim', ({ secret }) => link().claim(secret || setupSecret()));
   handle('server:signIn', () => link().signIn());
   handle('org:create', (a) => link().createOrg(a));
-  handle('org:join', (a) => link().joinOrg(a));
   handle('org:update', (a) => link().updateOrg(a));
   handle('org:people', () => link().orgPeople());
   handle('org:approve', (a) => link().orgApprove(a));
@@ -505,7 +502,6 @@ function registerIpc() {
     return publicConfig();
   });
   handle('setTheme', ({ theme }) => { config = writeConfig({ ...config, theme }); nativeTheme.themeSource = theme === 'light' || theme === 'dark' ? theme : 'system'; return theme; });
-  handle('openExternal', ({ url }) => { if (/^https?:\/\//.test(url)) shell.openExternal(url); return true; });
   handle('openFolder', async ({ dir }) => {
     const real = bootstart.folderInside(config.dataDir, dir);
     if (!real) throw new Error('KeaS only opens its own data folder.');

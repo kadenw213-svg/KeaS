@@ -253,9 +253,9 @@ function legacy() {
     h('h1', null, 'Kea Hub'),
     h('div', { class: 'panel' },
       h('p', null, h('b', null, S.legacyMessage)),
-      h('p', { class: 'muted small' }, 'Until then this PC keeps running the Kea Hub as before, so Kea keeps working. When KeaC’s move has run (it copies the accounts from this folder), say so here: KeaS then makes this organization’s server from a copy of the Hub’s data, and leaves the Hub’s own files as they were.'),
+      h('p', { class: 'muted small' }, 'Until then this PC keeps running the Kea Hub as before, so Kea keeps working. When the accounts have moved to the Kea account server (the move copies them from this folder), say so here: KeaS then makes this organization’s server from a copy of the Hub’s data, and leaves the Hub’s own files as they were.'),
       form(async () => {
-        if (!(await askInPage('Have the Kea accounts moved to your Kea account server?', 'Only once KeaC’s move has run. After this, Kea apps that still use this address are sent to the Kea account server.', 'They have moved'))) return;
+        if (!(await askInPage('Have the Kea accounts moved to your Kea account server?', 'Only once the move has run. After this, Kea apps that still use this address are sent to the Kea account server.', 'They have moved'))) return;
         S.busy = true; S.error = ''; render();
         try { const r = await call(k.legacyMoved, { keacUrl: S.moveUrl || '' }); S.moved = r.upgraded; S.busy = false; await load(); go('keac'); } catch (e) { fail(e); }
       },
@@ -551,7 +551,7 @@ setInterval(async () => {
 
 const TS_STEPS = [
   ['install', 'Install Tailscale', 'Free. Windows asks once for permission.'],
-  ['login', 'Sign in to Tailscale', 'Your browser opens. Any Google, Microsoft or Gitserver account works.'],
+  ['login', 'Sign in to Tailscale', 'Your browser opens. Any Google, Microsoft or GitHub account works.'],
   ['funnel', 'Turn on Funnel', 'Gives this computer a public https address. The first time, Tailscale asks you to allow it in the browser.'],
 ];
 function tsDone(id) {
@@ -840,7 +840,7 @@ function payrollPanel() {
     const zones = TIME_ZONES.includes(d.tz) ? TIME_ZONES : [d.tz, ...TIME_ZONES];
     const a = S.acct || {};
     const tables = (p.taxStates || []);
-    const confirmKey = !f.ownserver && f.fingerprint;
+    const confirmKey = !f.ownHub && f.fingerprint;
     body = form(async () => {
       const why = !(d.orgName || '').trim() ? 'Enter the organization’s name.' : !d.state ? 'Pick the state.' : (d.passphrase || '').length < 12 ? 'The passphrase needs 12 or more characters.' : d.passphrase !== d.passphrase2 ? 'The two passphrases don’t match.' : confirmKey && !d.keyOk ? 'Compare the KeaS server’s key fingerprint first.' : '';
       if (why) { S.payError = why; render(); return; }
@@ -926,7 +926,7 @@ function hubKeyPanel(s) {
     h('p', null, h('b', null, s.pinned ? 'The KeaS server is offering a different key from the one payroll trusts.' : 'Payroll doesn’t trust a KeaS server key yet.')),
     h('p', { class: 'small' }, 'New key: ', fp(s.current.fingerprint)),
     s.pinned && h('p', { class: 'small' }, `Trusted since ${new Date(s.pinned.at).toLocaleString()}: `, fp(s.pinned.fingerprint)),
-    s.localserver && h('p', { class: s.localHub.matches ? 'small ok' : 'err' }, s.localHub.matches ? 'It matches this PC’s own KeaS server key file.' : 'It does NOT match this PC’s own KeaS server key file. Don’t accept it.'),
+    s.localHub && h('p', { class: s.localHub.matches ? 'small ok' : 'err' }, s.localHub.matches ? 'It matches this PC’s own KeaS server key file.' : 'It does NOT match this PC’s own KeaS server key file. Don’t accept it.'),
     h('p', { class: 'small' }, 'A server’s key changes when:'),
     h('ul', { class: 'small' }, ...s.reasons.map((r) => h('li', null, r))),
     h('p', { class: 'small' }, s.warning, ' Compare the new key with the fingerprint shown on this PC before accepting it.'),

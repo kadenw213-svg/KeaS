@@ -59,13 +59,6 @@ input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accen
 .err { color: var(--bad); font-size: 14px; margin: 8px 0; }
 .ok { color: var(--ok); }
 .url { font: 14px Consolas, monospace; background: var(--surface-2); padding: 6px 10px; border-radius: 8px; user-select: all; word-break: break-all; }
-.terms { display: grid; gap: 10px; max-height: 50vh; overflow: auto; padding-right: 4px; margin: 12px 0; }
-.term { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; font-size: 13px; }
-.term.agreed { border-color: var(--accent); }
-.term h3 { font-size: 14px; margin: 0 0 6px; }
-.term ul { margin: 4px 0; padding-left: 20px; }
-.term p { margin: 4px 0; color: var(--text-2); }
-.term li { color: var(--text-2); }
 .check { display: flex; gap: 8px; align-items: center; cursor: pointer; margin-top: 8px; font-size: 13px; }
 .check input { accent-color: var(--accent); width: 16px; height: 16px; }
 details summary { cursor: pointer; color: var(--accent); font-size: 14px; margin: 8px 0; }
@@ -73,7 +66,6 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; margin
 @media (max-width: 560px) { .progress { display: none; } h1 { font-size: 22px; } }
 dialog.ask { border: 1px solid var(--border); border-radius: 14px; background: var(--surface); color: var(--text); padding: 18px 20px; max-width: 420px; }
 dialog.ask::backdrop { background: rgba(0,0,0,.35); }
-.qr { display: block; width: 200px; height: 200px; background: #fff; padding: 10px; border-radius: 10px; margin: 8px 0; image-rendering: pixelated; }
 .dot.run-static { border-color: var(--accent); }
 main select { background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font: inherit; font-size: 15px; }
 .codes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 24px; margin: 0; padding-left: 28px; user-select: all; }
