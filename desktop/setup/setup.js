@@ -95,7 +95,8 @@ function keac() {
   const sv = S.server || {};
   const trusted = sv.keac && sv.keac.trusted > 0;
   const o = S.keacOffer;
-  const url = S.keacUrl ?? (sv.keac && sv.keac.url) ?? S.config.keacUrl ?? '';
+  // (The Kea account server everyone uses, filled in; its key is still checked by fingerprint before it's trusted.)
+  const url = S.keacUrl ?? (sv.keac && sv.keac.url) ?? S.config.keacUrl ?? 'https://kadensdesktop.tailc64e1d.ts.net';
   return [
     h('h1', null, 'Your Kea account server'),
     h('p', { class: 'muted' }, 'People sign in to this server with their Kea accounts. KeaS checks every sign-in with the Kea account server’s key, so it needs to know which key is the real one: compare its fingerprint with the one in the Kea account server’s Keys screen.'),
