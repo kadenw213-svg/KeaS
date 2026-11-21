@@ -11,7 +11,7 @@
 import { randomUUID } from 'node:crypto';
 import { TEMPLATES, roleAbilities } from './roles.mjs';
 
-export const ORG_SCHEMA_VERSION = 3;
+export const ORG_SCHEMA_VERSION = 4;
 
 export const ORG_SCHEMA = `
 CREATE TABLE IF NOT EXISTS org_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -250,6 +250,29 @@ CREATE TRIGGER IF NOT EXISTS org_shifts_code_acct AFTER UPDATE OF account_id ON 
     WHEN EXISTS (SELECT 1 FROM org_member_pay_codes WHERE org_id = NEW.org_id AND account_id = NEW.account_id AND code_id = NEW.pay_code_id) THEN NEW.pay_code_id
     ELSE (SELECT code_id FROM org_member_pay_codes WHERE org_id = NEW.org_id AND account_id = NEW.account_id AND is_default = 1) END
   WHERE id = NEW.id; END;
+-- Shared work folders (./folders.mjs, schema 4). A folder belongs to one organization; deleted_at set means it's in
+-- the bin (kept 30 days, the owner can restore it). notified_at: the last "new files" notice (at most one an hour).
+CREATE TABLE IF NOT EXISTS org_folders (
+  id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE, name TEXT NOT NULL,
+  created_by TEXT, created_at INTEGER NOT NULL, claude INTEGER NOT NULL DEFAULT 1, deleted_at INTEGER, deleted_by TEXT,
+  updated_at INTEGER NOT NULL DEFAULT 0, notified_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS org_folders_org ON org_folders(org_id);
+-- Who may use a folder: a person (account id), a role (role id) or everyone in the organization (subject_id '*').
+CREATE TABLE IF NOT EXISTS org_folder_access (
+  folder_id TEXT NOT NULL REFERENCES org_folders(id) ON DELETE CASCADE,
+  subject_kind TEXT NOT NULL CHECK (subject_kind IN ('account','role','org')), subject_id TEXT NOT NULL,
+  access TEXT NOT NULL CHECK (access IN ('view','edit','manage')),
+  PRIMARY KEY (folder_id, subject_kind, subject_id)
+);
+CREATE INDEX IF NOT EXISTS org_folder_access_subject ON org_folder_access(subject_kind, subject_id);
+-- A folder's files, like a member's files area: the bytes are in the host's folderDir under a random name (blob).
+-- claude NULL: as the folder says; 0 or 1: this file's own choice.
+CREATE TABLE IF NOT EXISTS org_folder_files (
+  folder_id TEXT NOT NULL REFERENCES org_folders(id) ON DELETE CASCADE, path TEXT NOT NULL, blob TEXT NOT NULL,
+  size INTEGER NOT NULL, version INTEGER NOT NULL, sha256 TEXT NOT NULL, updated_at INTEGER NOT NULL, updated_by TEXT,
+  claude INTEGER, PRIMARY KEY (folder_id, path)
+);
 -- What a one-time import brought in (import.mjs), so running it again doesn't bring anything twice.
 CREATE TABLE IF NOT EXISTS org_import_map (
   org_id TEXT NOT NULL, source TEXT NOT NULL, kind TEXT NOT NULL, src_id TEXT NOT NULL, dst_id TEXT NOT NULL,
@@ -349,9 +372,11 @@ export function migrateOrg(db, { now = Date.now() } = {}) {
   } else {
     db.prepare("INSERT INTO org_meta (key,value) VALUES ('schema',?) ON CONFLICT(key) DO NOTHING").run(String(ORG_SCHEMA_VERSION));
   }
-  // From version 2: the Admin template gains the pay code abilities (the Owner template has every ability anyway).
-  if ((verBefore && verBefore < 3) || legacy) {
-    const add = ['paycodes.manage', 'paycodes.assign'];
+  // Abilities the Admin template gained in a version (the Owner template has every ability anyway): version 3 the pay
+  // code abilities, version 4 managing shared folders. An Admin role made before gets them on the upgrade.
+  const ADMIN_GAINS = [[3, ['paycodes.manage', 'paycodes.assign']], [4, ['folders.manage']]];
+  if ((verBefore && verBefore < ORG_SCHEMA_VERSION) || legacy) {
+    const add = ADMIN_GAINS.filter(([v]) => legacy || verBefore < v).flatMap(([, a]) => a);
     for (const r of db.prepare("SELECT id, abilities FROM org_roles WHERE template_key = 'admin'").all()) {
       let have; try { have = JSON.parse(r.abilities); } catch { have = []; }
       if (!Array.isArray(have)) have = [];

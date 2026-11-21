@@ -59,7 +59,8 @@ export const SETUP_FILE = 'setup.secret';
 // The Kea Hub's (KeaS 0.5) account routes, none of which a KeaS server has: answered 410 with movedTo once moved.
 const LEGACY_ROUTE = /^\/v1\/(auth\/(register|login|google|oauth|reset\/.*|token)|keys|terms(\/.*)?|me\/(password|totp\/.*|delete|export|verify\/.*|consent(\/.*)?|leaderboard|phone|birth-year)|consent\/.*|hosting(\/.*)?|classes(\/.*)?|invites\/.*|join|class-sessions\/.*|calendar|sets\/.*|course-sections\/.*|course-files?|scan(\/.*)?|support)$/;
 export const LEGACY_MESSAGE = 'Your Kea accounts are still here. Move them to your Kea account server, then this PC becomes your organization’s server.';
-const FEATURES = ['passes', 'orgs', 'orgRoles', 'orgClock', 'payCodes', 'payCodeRates', 'stubs', 'files'];
+// folders: shared work folders (org/folders.mjs; /v1/orgs/:id/folders and their files).
+const FEATURES = ['passes', 'orgs', 'orgRoles', 'orgClock', 'payCodes', 'payCodeRates', 'stubs', 'files', 'folders'];
 
 class HttpError extends Error { constructor(status, message, extra) { super(message); this.status = status; this.extra = extra; } }
 const bad = (m, extra) => { throw new HttpError(400, m, extra); };
@@ -197,6 +198,8 @@ export function createHub({
   if (!existsSync(orgDataKeyFile)) writeSecretFile(orgDataKeyFile, randomBytes(32).toString('hex'));
   const orgDataKey = readFileSync(orgDataKeyFile, 'utf8').trim();
   const filesDir = join(dataDir, 'member-files');
+  // Organizations' shared work folders (org/folders.mjs): their files, one folder per organization.
+  const folderDir = join(dataDir, 'shared-folders');
   let ownerKeyCache = { stamp: null, key: '' };
   const ownerKeyNow = () => {
     let st = null;
@@ -431,6 +434,14 @@ export function createHub({
     identity: passIdentity({ h, operatorId, getSetting }),
     operator: { autoApprove: () => getSetting('orgs', {}).autoApprove === true, setAutoApprove: (v) => setSetting('orgs', { ...getSetting('orgs', {}), autoApprove: v }) },
     kit: { HttpError, V, limit, normCode, rawOut },
+    // Shared folders: each organization's sharedFilesGb setting (the engine's default quota), with this server's
+    // file size limit, write rate limit and free-disk check.
+    folderDir,
+    folderLimits: { maxFileBytes },
+    folderCheck: ({ me, method, size, phase }) => {
+      if (phase === 'start' && method !== 'GET' && buckets.take(`wr:${me.id}`, L.writes[0], L.writes[1], Date.now()) > 0) throw new HttpError(429, 'Too many file changes at once. Slow down a little.', { retryAfter: 1 });
+      if (method === 'PUT' && phase !== 'saved') checkDisk(size);
+    },
   });
 
   // ---------- forgetting someone (they ask to leave this server, or the operator removes them) ----------
@@ -561,7 +572,7 @@ export function createHub({
     const f = from.shared || isLoopback(from.ip) ? SHARED_FACTOR : 1;
     if (buckets.take(`rps:${ipBucket(from.ip)}`, L.rps[0] * f, L.rps[1] * f, t0) > 0 || buckets.take('rps:*', L.rpsAll[0], L.rpsAll[1], t0) > 0) return send(res, 429, { error: 'Too many requests. Slow down.', retryAfter: 1 }, { 'retry-after': '1' });
     const url = new URL(req.url, 'http://localhost');
-    if (req.method !== 'PUT') { const tm = setTimeout(() => { if (!req.complete) req.socket.destroy(); }, 30_000); tm.unref?.(); res.once('close', () => clearTimeout(tm)); }
+    if (req.method !== 'PUT' || !/\/files\//.test(url.pathname)) { const tm = setTimeout(() => { if (!req.complete) req.socket.destroy(); }, 30_000); tm.unref?.(); res.once('close', () => clearTimeout(tm)); }
     let status = 200, payload;
     // An app that says it's older than this server serves gets 426 and where to update, never a half-working answer
     // (the health check still answers, so it can see why). An app that doesn't say its version is served as before.
@@ -579,7 +590,9 @@ export function createHub({
     try {
       const fileMatch = /^\/v1\/files\/(.+)$/.exec(url.pathname);
       const fileRoute = fileMatch && ['GET', 'PUT', 'DELETE'].includes(req.method);
-      const { r, params } = fileRoute ? { r: { auth: true }, params: {} } : api.find(req.method, url.pathname);
+      // A shared folder's file (org/folders.mjs), streamed by the org engine.
+      const folderFile = orgEngine.folderFiles?.match(req.method, url.pathname) ?? null;
+      const { r, params } = fileRoute || folderFile ? { r: { auth: true }, params: {} } : api.find(req.method, url.pathname);
       const auth = req.headers.authorization;
       const bearer = auth ? /^Bearer ([0-9a-f]{64})$/.exec(auth)?.[1] ?? null : null;
       if (auth && !bearer && r.auth) throw new HttpError(401, 'Sign in again.');
@@ -595,13 +608,18 @@ export function createHub({
         if (now() - s.last_seen > 3600_000) h.run('UPDATE keas_sessions SET last_seen = ? WHERE token_hash = ?', now(), s.token_hash);
         ctx.me = me; ctx.session = s;
       }
-      if (req.method === 'POST') {
+      if (req.method === 'POST' || req.method === 'PATCH' || (req.method === 'PUT' && !fileRoute && !folderFile)) {
         const raw = (await readRaw(req, ctx.me ? MAX_BODY : PRE_AUTH_BODY)).toString('utf8');
         let body = {};
         if (raw.trim()) { try { body = JSON.parse(raw); } catch { bad('Invalid JSON.'); } }
         ctx.body = V.obj(body);
       }
       if (fileRoute) return await handleFile(req, res, ctx, decodeURIComponent(fileMatch[1]), t0);
+      if (folderFile) {
+        const st = await orgEngine.folderFiles.handle(req, res, ctx.me, folderFile.orgId, folderFile.folderId, folderFile.path, t0);
+        hlog.request(req.method, '/v1/orgs/…/folders/…/files/…', st, Date.now() - t0);
+        return;
+      }
       const out = await r.handler(ctx);
       if (out && out.__raw) {
         res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': out.__raw.length, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...out.headers });

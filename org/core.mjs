@@ -24,6 +24,11 @@ export const ORG_DEFAULTS = {
   // Each member's files area on this KeaS server (documents and classes Kea syncs here), in GB. A member in several
   // organizations gets the biggest of theirs.
   filesQuotaGb: 1,
+  // Shared work folders (./folders.mjs): how much the organization's shared folders may hold together on this
+  // server, in GB (the owner sets it; a host can count shared folders its own way instead), and whether anyone in the
+  // organization may make a folder (otherwise only people with folders.manage).
+  sharedFilesGb: 5,
+  folders: { anyoneCreates: true },
 };
 export { TODO_KINDS };
 
@@ -41,7 +46,7 @@ export function makeCore({ h, now, audit, notify, identity, kit }) {
 
   const orgSettings = (o) => {
     const s = J(o.settings, {});
-    return { ...ORG_DEFAULTS, ...s, autofill: { ...ORG_DEFAULTS.autofill, ...(s.autofill || {}) }, todoKinds: { ...ORG_DEFAULTS.todoKinds, ...(s.todoKinds || {}) }, clock: { ...ORG_DEFAULTS.clock, ...(s.clock || {}) } };
+    return { ...ORG_DEFAULTS, ...s, autofill: { ...ORG_DEFAULTS.autofill, ...(s.autofill || {}) }, todoKinds: { ...ORG_DEFAULTS.todoKinds, ...(s.todoKinds || {}) }, clock: { ...ORG_DEFAULTS.clock, ...(s.clock || {}) }, folders: { ...ORG_DEFAULTS.folders, ...(s.folders || {}) } };
   };
   const loadOrg = (oid) => h.get('SELECT * FROM orgs WHERE id = ?', oid);
   const memberRow = (oid, aid) => h.get('SELECT * FROM org_members WHERE org_id = ? AND account_id = ?', oid, aid);

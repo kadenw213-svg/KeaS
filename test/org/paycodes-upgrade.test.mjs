@@ -27,14 +27,14 @@ test('a version 2 database: columns added, admins can manage pay codes, nothing 
 
   migrateOrg(db, { now: 5 });
   assert.ok(cols(db, 'org_shifts').includes('pay_code_id') && cols(db, 'org_punches').includes('pay_code_id'));
-  assert.equal(db.prepare("SELECT value FROM org_meta WHERE key = 'schema'").get().value, '3');
+  assert.equal(db.prepare("SELECT value FROM org_meta WHERE key = 'schema'").get().value, '4');
   const admin = JSON.parse(db.prepare("SELECT abilities FROM org_roles WHERE id = 'r-admin'").get().abilities);
-  assert.deepEqual(admin.sort(), ['paycodes.assign', 'paycodes.manage', 'rates.view', 'roles.assign']);
+  assert.deepEqual(admin.sort(), ['folders.manage', 'paycodes.assign', 'paycodes.manage', 'rates.view', 'roles.assign']);
   assert.equal(db.prepare("SELECT pay_code_id FROM org_shifts WHERE id = 's1'").get().pay_code_id, null, 'old shifts have no code (paid at the default)');
   assert.throws(() => db.exec('UPDATE org_punches SET at = 1'), /append-only/, 'still append-only');
   // Running it again changes nothing.
   migrateOrg(db, { now: 6 });
-  assert.equal(JSON.parse(db.prepare("SELECT abilities FROM org_roles WHERE id = 'r-admin'").get().abilities).length, 4);
+  assert.equal(JSON.parse(db.prepare("SELECT abilities FROM org_roles WHERE id = 'r-admin'").get().abilities).length, 5);
 });
 
 test('a host without an org data key: everything else works; pay codes say why they can’t be made', () => {

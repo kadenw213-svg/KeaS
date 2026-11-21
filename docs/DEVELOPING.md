@@ -46,6 +46,11 @@ passwords, two-step codes, sign-up, terms or personal storage of its own.
   `/:id/sign-out`, `/:id/forget`), `/owner/audit`, and the org engine's `/owner/orgs/*`.
 - **Members' files:** `/v1/files/*` as the Kea Hub had it (If-Match versions, paths checked), for members of an active
   organization; each organization's `settings.filesQuotaGb` (1 by default; the biggest of a member's organizations).
+- **Shared work folders** (`org/folders.mjs`, docs/protocol.md section 8): an organization's folders, shared with people,
+  roles or everyone as view, edit or manage. JSON routes under `/v1/orgs/:id/folders`; the files themselves
+  (`GET|PUT|DELETE /v1/orgs/:id/folders/:fid/files/<path>`) are streamed by the engine (`org.folderFiles.handle`), routed
+  beside `/v1/files`. Blobs in `<data folder>/shared-folders`; each organization's `settings.sharedFilesGb` (5 by
+  default, set by an owner) holds them all.
 - **Owner tools:** `node hub/owner.mjs console GET owner/stats | setup-code | rotate-key | server-id | where`.
 - **Backups:** `node hub/backup.mjs create <folder>` with `KEA_BACKUP_PASSPHRASE` (keas.db, a Kea Hub's hub.db if it's
   still there, and the keys). **Never tunnel port 4861.**

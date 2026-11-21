@@ -16,6 +16,11 @@
 // Options: O (the operator's console router, for approving organizations) with operator { autoApprove(),
 //   setAutoApprove(v) }; classes: true when the host has the Kea Hub's class tables; kit: { HttpError, V, limit,
 //   normCode, rawOut } to use the host's own error class, input checks, rate limits and file answers.
+// Shared work folders (./folders.mjs), when the host gives folderDir (where their files go): folderQuota(orgId) ->
+//   { limit, used } in bytes (default: the org's sharedFilesGb setting against what its folders hold), folderLimits
+//   { maxFileBytes, maxFilesPerFolder }, folderCheck({ me, orgId, folderId, method, size, phase }) for the host's own
+//   limits. The host routes GET/PUT/DELETE /v1/orgs/:id/folders/:fid/files/<path> (folderFiles.match) to
+//   folderFiles.handle and lists 'folders' in its features. Without folderDir, folderFiles is null.
 import { migrateOrg } from './schema.mjs';
 import { makeCore } from './core.mjs';
 import { OrgHttpError, makeValidators, defaultNormCode } from './kit.mjs';
@@ -25,14 +30,16 @@ import { mountClock } from './clock.mjs';
 import { importServerOrg } from './import.mjs';
 import { dataKeyFrom, makeRateSealer, makePayLogic, mountPayCodes } from './paycodes.mjs';
 import { mountStubs } from './stubs.mjs';
+import { mountFolders } from './folders.mjs';
 
 export { ABILITIES, ABILITY_LIST, TEMPLATES } from './roles.mjs';
 export { ORG_SCHEMA, ORG_SCHEMA_VERSION, migrateOrg } from './schema.mjs';
 export { staticIdentity, passIdentity } from './identity.mjs';
 export { OrgHttpError } from './kit.mjs';
 export { dataKeyFrom } from './paycodes.mjs';
+export { FOLDER_FILE_URL, matchFolderFile, checkFolderPath, ACCESS_LEVELS, FOLDER_KEEP_DAYS } from './folders.mjs';
 
-export function mountOrg({ R, h, now = () => Date.now(), audit = () => {}, notify = () => {}, identity, O = null, operator = null, classes = false, kit = {}, dataKey = null }) {
+export function mountOrg({ R, h, now = () => Date.now(), audit = () => {}, notify = () => {}, identity, O = null, operator = null, classes = false, kit = {}, dataKey = null, folderDir = null, folderQuota = null, folderLimits = {}, folderCheck = null }) {
   if (!identity?.who || !identity?.profiles) throw new Error('mountOrg needs an identity adapter (org/identity.mjs).');
   const HttpError = kit.HttpError ?? OrgHttpError;
   const fullKit = {
@@ -51,6 +58,7 @@ export function mountOrg({ R, h, now = () => Date.now(), audit = () => {}, notif
   mountRoleRoutes(core, { R: main.OR, deptRow: main.deptRow });
   const clock = mountClock(core, { R: main.OR, rulesFor: main.rulesFor, date: main.date, list: main.list });
   // (Pay code routes carry rates, so they go through the guard with rates allowed; SSNs and bank details still never.)
+  const folderFiles = folderDir ? mountFolders(core, { R: main.OR, folderDir, folderQuota, limits: folderLimits, check: folderCheck }) : null;
   const payCodes = mountPayCodes(core, { R: (m, p, fn, o) => main.OR(m, p, fn, { ...o, rates: true }), Rplain: main.OR, deptRow: main.deptRow, positionRow: main.positionRow, clock });
 
   /** Organizations where this account is the only owner and others are still members (it can't go yet). */
@@ -77,13 +85,23 @@ export function mountOrg({ R, h, now = () => Date.now(), audit = () => {}, notif
     for (const t of ['org_stubs', 'org_role_assignments', 'org_member_positions', 'org_member_pay_codes', 'org_punch_requests', 'org_timecard_approvals', 'org_time_off', 'org_certs', 'org_class_assignments', 'org_responses', 'org_response_changes', 'org_nudges', 'org_policy_acks', 'org_todo_snoozes', 'org_members'])
       h.run(`DELETE FROM ${t} WHERE account_id = ?`, aid);
     h.run('DELETE FROM org_swaps WHERE from_account = ? OR claimant = ?', aid, aid);
+    // Shared folders: their grants go; the files they changed stay, without their name.
+    h.run("DELETE FROM org_folder_access WHERE subject_kind = 'account' AND subject_id = ?", aid);
+    h.run('UPDATE org_folder_files SET updated_by = NULL WHERE updated_by = ?', aid);
+    h.run('UPDATE org_folders SET created_by = NULL WHERE created_by = ?', aid);
+    h.run('UPDATE org_folders SET deleted_by = NULL WHERE deleted_by = ?', aid);
   }
   /** One account's memberships, for the host's "export my data". */
   const membershipsOf = (aid) => h.all('SELECT org_id, status, joined_at FROM org_members WHERE account_id = ?', aid)
     .map((m) => ({ org_id: m.org_id, role: core.legacyFor(m.org_id, aid), roles: core.assignmentsOut(m.org_id, aid).map((r) => r.name), status: m.status, joined_at: m.joined_at }));
 
   return {
-    upgrade, core, todoFor: main.todoFor, soleOwnerOrgs, heirOf, forgetAccount, membershipsOf, computeTimecard: clock.computeTimecard,
+    upgrade, core, todoFor: main.todoFor,
+    /**
+     * Shared work folders (./folders.mjs), or null without folderDir: handle(req, res, me, orgId, folderId, path),
+     * match(method, pathname), forgetOrg(orgId) + removeOrgFiles(orgId) when an organization is deleted, bytesOf(orgId).
+     */
+    folderFiles, soleOwnerOrgs, heirOf, forgetAccount, membershipsOf, computeTimecard: clock.computeTimecard,
     /** What the payroll vault pays a period from (./paycodes.mjs payFeed): { from, to } local dates. */
     payFeed: payCodes.payFeed,
     /** The one-time import of an org server's people, shifts and punches (./import.mjs). */

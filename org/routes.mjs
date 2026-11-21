@@ -178,7 +178,8 @@ export function mountRoutes(core, { R, O = null, classes = false, operator = nul
     return { org: orgOut(x.o, x.m), me: { ...memberOut(core.withProfile(x.m, p), x), ...core.abilitiesOut(x.eff) } };
   });
   OR('POST', '/v1/orgs/:id', ({ me, params, body, ip }) => {
-    const { o, s } = asOrg(params.id, me, 'settings.edit', { dept: null });
+    const x = asOrg(params.id, me, 'settings.edit', { dept: null });
+    const { o, s } = x;
     const next = { ...J(o.settings, {}) };
     if (body.settings) {
       const b = V.obj(body.settings);
@@ -208,6 +209,17 @@ export function mountRoutes(core, { R, O = null, classes = false, operator = nul
         if ('needShift' in k) next.clock.needShift = V.bool(k.needShift, 'Clocking in needs a shift');
       }
       if ('filesQuotaGb' in b) { const g = b.filesQuotaGb; if (typeof g !== 'number' || !Number.isFinite(g) || g < 0 || g > 10_000) bad('Files per person must be 0 to 10000 GB.'); next.filesQuotaGb = Math.round(g * 100) / 100; }
+      if ('sharedFilesGb' in b) {
+        if (!x.owner) forbidden('Only an owner of the organization can change how much its shared folders hold.');
+        const g = b.sharedFilesGb;
+        if (typeof g !== 'number' || !Number.isFinite(g) || g < 0 || g > 100_000) bad('Shared folders must be 0 to 100000 GB.');
+        next.sharedFilesGb = Math.round(g * 1e6) / 1e6;
+      }
+      if ('folders' in b) {
+        const f = V.obj(b.folders);
+        next.folders = { ...s.folders };
+        if ('anyoneCreates' in f) next.folders.anyoneCreates = V.bool(f.anyoneCreates, 'Anyone can make a shared folder');
+      }
       if ('timeOffKinds' in b) next.timeOffKinds = [...new Set(list(b.timeOffKinds, 'Kinds of time off', 20).map((x) => V.str(x, 'Kind', { min: 1, max: 30 }).toLowerCase()))];
     }
     h.run('UPDATE orgs SET name = ?, kind = ?, tz = ?, state = ?, workweek_start = ?, settings = ? WHERE id = ?',

@@ -288,3 +288,44 @@ this server." on its routes and its join codes stop working; an org that isn't h
 - A data folder that was a Kea Hub, after `moved-to-keac.json` (`{ at, keacUrl, keacKeyKid }`, written by KeaC's
   migration or the KeaS app): the Kea Hub's account routes answer 410 `{ error: 'Kea accounts moved', movedTo,
   keacKeyKid }`. Kea follows `movedTo` only when that address lists the same `kid` at `/v1/keys`.
+
+## 8. Shared work folders (KeaS 0.10, KeaC 0.11; `features` has `folders`)
+
+An organization's shared folders, on whichever server runs it (a KeaS server, or KeaC for hosted orgs), with that
+server's org session. A server offers them when `GET /v1/health` lists `folders` in `features`; older servers answer
+404 on these routes.
+
+**Access** is `view`, `edit` or `manage`: the highest of the person's own grant, their roles' grants and the org-wide
+grant. Owners, and roles with `folders.manage` (org-wide; the Admin template has it), manage every folder. Someone who
+isn't an active member gets nothing. Whoever makes a folder gets a `manage` grant. A folder you can't see answers 404.
+
+| Method, path | Who | Answer |
+|---|---|---|
+| `GET /v1/orgs/:id/folders` | members | `{ folders: [Folder], canCreate, quota: { limit, used } }` (only folders you can see) |
+| `GET /v1/orgs/:id/folders?deleted=1` | owners | `{ folders: [Folder + deletedAt, purgeAt], quota }` (the bin, 30 days) |
+| `POST /v1/orgs/:id/folders` `{ name, claude? }` | `folders.manage`, or anyone while the org's `settings.folders.anyoneCreates` is on (default) | 201 `{ folder: Folder }`; 409 if the name is taken |
+| `PATCH /v1/orgs/:id/folders/:fid` `{ name?, claude? }` | manage | `{ folder }` |
+| `DELETE /v1/orgs/:id/folders/:fid` | manage | `{ ok, deletedAt, purgeAt }` (into the bin) |
+| `POST /v1/orgs/:id/folders/:fid/restore` | owners | `{ folder }`; 409 if a live folder has its name |
+| `GET /v1/orgs/:id/folders/:fid/access` | manage | Access |
+| `PUT /v1/orgs/:id/folders/:fid/access` `{ grants: [{ kind, id, access }] }` | manage | Access (replaces every grant; 400 if none would be `manage`) |
+| `GET /v1/orgs/:id/folders/:fid/files?since=&prefix=&limit=&after=` | view | `{ used, quota, now, folder: Folder, files: [File], next? }` (`next` only with `limit`) |
+| `PATCH /v1/orgs/:id/folders/:fid/files/claude` `{ path, claude: true \| false \| null }` | manage | `{ file: File }` |
+| `GET /v1/orgs/:id/folders/:fid/files/<path>` | view | the bytes; `etag: "<version>"`, `x-kea-sha256`, `x-kea-claude: 1 \| 0`; 304 with `If-None-Match` |
+| `PUT /v1/orgs/:id/folders/:fid/files/<path>` | edit | 201 (new) or 200 `{ path, version, size, sha256, claude }`, `etag`; 412 `{ error, version }` on `If-Match` / `If-None-Match: *` conflicts; 413 too big; 507 `{ error, storageFull: true, used, quota }` when full |
+| `DELETE /v1/orgs/:id/folders/:fid/files/<path>` | edit | `{ ok: true }` (`If-Match` checked like PUT) |
+
+- **Folder:** `{ id, orgId, name, access, claude, size, fileCount, updatedAt, createdAt, createdBy }`. `updatedAt`
+  moves on any change in the folder (files, name, Claude, access), so a client that sees it move can list again.
+- **File:** `{ path, size, version, sha256, updatedAt, updatedBy, updatedByName, claude, claudeOverride }`. `claude` is
+  resolved (`claudeOverride` if set, else the folder's); `claudeOverride` is `true`, `false` or `null`.
+- **Access:** `{ folderId, grants: [{ kind: 'account' | 'role' | 'org', id (null for 'org'), access, name, member? }],
+  alwaysManage: { owners: [{ id, name }], roles: [{ id, name }] } }`. `member: false` marks someone who left (their
+  grant does nothing).
+- Paths follow `/v1/files`' rules (at most 12 segments of letters, digits, spaces and `._()+@,'&!~-`; no `.`, `..`,
+  device names or `~hex~` escapes that decode to `/ \ :`), and names starting `.kea-` are kept for Kea. Every folder
+  file is downloadable whatever its Claude setting.
+- Storage: on a KeaS server, the org's `settings.sharedFilesGb` (5 by default; only an owner changes it) against
+  everything its folders hold, the bin included. On KeaC, the org owner's Kea storage, counted with their own files.
+- People who can see a folder get a `folder` notice (`data: { orgId, folderId, path }`) when a file is added: at most one
+  per folder per hour.

@@ -44,19 +44,22 @@ export const ABILITIES = {
   'timeoff.decide': 'Approve or deny time off',
   'clock.self': 'Clock in and out, and ask for missed punches to be fixed',
   'timeoff.request': 'Ask for time off',
+  'folders.manage': 'Manage every shared folder: who can see and change it, Claude, deleting it',
 };
 export const ABILITY_LIST = Object.keys(ABILITIES);
 /** Abilities about yourself only: a department scope means nothing for them. */
 export const SELF_ABILITIES = new Set(['clock.self', 'timeoff.request']);
 /** Abilities that only make sense for the whole organization (a department-scoped grant of one never counts). */
-export const ORG_ONLY = new Set(['roles.manage', 'structure.edit', 'settings.edit', 'certs.types', 'paycodes.manage']);
+export const ORG_ONLY = new Set(['roles.manage', 'structure.edit', 'settings.edit', 'certs.types', 'paycodes.manage', 'folders.manage']);
+/** Abilities added after KeaS 0.5's fixed roles: they don't change which 0.5 role name someone counts as (legacyRole). */
+const NOT_LEGACY = new Set(['folders.manage']);
 
 const MEMBER = ['clock.self', 'timeoff.request'];
 const MANAGER = [...MEMBER, 'people.view', 'people.approve', 'people.verify', 'people.edit', 'people.remove', 'codes.make', 'budgets.view',
   'certs.manage', 'classes.manage', 'forms.manage', 'schedule.view', 'schedule.edit', 'schedule.publish', 'swaps.decide', 'policies.manage',
   'timecards.view', 'timecards.approve', 'timeoff.decide'];
 const ADMIN = [...MANAGER, 'people.birthdate', 'roles.assign', 'roles.manage', 'structure.edit', 'settings.edit', 'rates.view', 'rates.assign',
-  'paycodes.manage', 'paycodes.assign', 'budgets.costs', 'budgets.edit', 'certs.types'];
+  'paycodes.manage', 'paycodes.assign', 'budgets.costs', 'budgets.edit', 'certs.types', 'folders.manage'];
 /** The templates, highest first. `key` is how KeaS 0.5 named the role (Kea 0.70 still reads and sends it). */
 export const TEMPLATES = [
   { key: 'owner', name: 'Owner', abilities: ABILITY_LIST },
@@ -132,7 +135,7 @@ export const outranks = (a, b) => a.owner || (!b.owner && covers(a, b) && !cover
  */
 export function legacyRole(eff) {
   if (eff.owner) return 'owner';
-  for (const t of TEMPLATES.slice(1)) if (t.abilities.every((a) => eff.map.get(a) === true || (SELF_ABILITIES.has(a) && eff.map.has(a)))) return t.key;
+  for (const t of TEMPLATES.slice(1)) if (t.abilities.every((a) => NOT_LEGACY.has(a) || eff.map.get(a) === true || (SELF_ABILITIES.has(a) && eff.map.has(a)))) return t.key;
   return 'member';
 }
 
