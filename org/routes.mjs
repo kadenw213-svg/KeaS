@@ -1445,6 +1445,13 @@ export function mountRoutes(core, { R, O = null, classes = false, operator = nul
         events.push({ id: `shift:${x.id}`, kind: 'shift', orgId: o.id, orgName: o.name, title: pn.get(x.position_id) ?? 'Shift', start: new Date(x.start_at).toISOString(), end: new Date(x.end_at).toISOString(), date: x.date });
       if (classes) for (const c of h.all("SELECT s.*, c.title AS class_title FROM class_sessions s JOIN org_classes oc ON oc.class_id = s.class_id JOIN classes c ON c.id = s.class_id JOIN class_members cm ON cm.class_id = s.class_id AND cm.account_id = ? WHERE oc.org_id = ? AND c.status = 'active' AND s.end_at >= ? AND s.start_at <= ?", me.id, o.id, from, to))
         events.push({ id: `class:${c.id}`, kind: 'class', orgId: o.id, orgName: o.name, title: c.title || c.class_title, classTitle: c.class_title, start: new Date(c.start_at).toISOString(), end: new Date(c.end_at).toISOString(), location: c.location, meetingUrl: c.meeting_url, date: localDate(c.start_at, o.tz) });
+      // My certifications' expiry dates (all-day), only for clients that ask (Kea 0.97+): older ones never see a kind
+      // they don't know.
+      if (query.certs === '1') {
+        const fromDay = localDate(from, o.tz), toDay = localDate(to, o.tz);
+        for (const c of h.all('SELECT c.id, c.expires_on, t.name FROM org_certs c JOIN org_cert_types t ON t.id = c.type_id WHERE c.org_id = ? AND c.account_id = ? AND c.expires_on IS NOT NULL AND c.expires_on >= ? AND c.expires_on <= ?', o.id, me.id, fromDay, toDay))
+          events.push({ id: `cert:${c.id}`, kind: 'cert', orgId: o.id, orgName: o.name, title: `${c.name} expires`, allDay: true, date: c.expires_on, start: `${c.expires_on}T00:00:00.000Z`, end: `${c.expires_on}T23:59:59.000Z` });
+      }
     }
     return { events: events.sort((a, b) => (a.start < b.start ? -1 : 1)) };
   });

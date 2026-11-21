@@ -166,6 +166,11 @@ test('certs: types per org, records with expiry and countdowns; org classes issu
   const benCert = ok(await call('POST', `/v1/orgs/${pool.id}/certs`, mgr.token, { accountId: ben.id, typeId: lgCert.id, issuedOn: '2024-11-26', expiresOn: '2026-11-25' }), 201).cert;
   assert.deepEqual([benCert.stage, benCert.daysLeft], ['30', 20]);
   ok(await call('POST', `/v1/orgs/${pool.id}/certs`, mgr.token, { accountId: kid.id, typeId: lgCert.id, issuedOn: '2026-05-01' }), 201);
+  // A certification's expiry is on the person's own calendar, only for clients that ask for it (certs=1).
+  const benCal = ok(await call('GET', '/v1/orgs-calendar?from=2026-11-01&to=2026-12-01&certs=1', ben.token)).events.filter((e) => e.kind === 'cert');
+  assert.deepEqual(benCal.map((e) => [e.title, e.date, e.allDay]), [['Lifeguard expires', '2026-11-25', true]]);
+  assert.equal(ok(await call('GET', '/v1/orgs-calendar?from=2026-11-01&to=2026-12-01', ben.token)).events.filter((e) => e.kind === 'cert').length, 0);
+  assert.equal(ok(await call('GET', '/v1/orgs-calendar?from=2026-11-01&to=2026-12-01&certs=1', ana.token)).events.filter((e) => e.kind === 'cert').length, 0, 'only my own');
   assert.equal((await call('POST', `/v1/orgs/${pool.id}/certs`, ana.token, { accountId: ana.id, typeId: lgCert.id })).status, 403);
   const mine = ok(await call('GET', `/v1/orgs/${pool.id}/certs`, ana.token));
   assert.ok(mine.certs.every((c) => c.accountId === ana.id), 'members see only their own certs');
